@@ -1,7 +1,29 @@
-import pandas as pd, numpy as np, json, time, warnings, datetime
+"""
+Modeler script: LightGBM with problem-type-aware CV + Optuna tuning.
+CV splitter is chosen from profile.json:
+  tabular_regression + group_cols  → GroupKFold(n_splits=min(5, n_unique_groups))
+  tabular_regression, no groups    → RepeatedKFold(n_splits=5, n_repeats=3)
+  classification                   → StratifiedKFold(n_splits=5)
+  panel_forecasting / other        → KFold(n_splits=5, shuffle=True)
+"""
+import pandas as pd
+import numpy as np
+import json
+import time
+import warnings
+import datetime
+import os
+
 import lightgbm as lgb
+from sklearn.model_selection import KFold, GroupKFold, RepeatedKFold
 from sklearn.metrics import mean_absolute_error
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
+
+BASE_DIR = r"C:\Users\isaac\OneDrive\Desktop\award_B"
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 start_time = time.time()
 
@@ -10,304 +32,350 @@ print("MODELER SUB-AGENT STARTING")
 print(f"Start time: {datetime.datetime.now().isoformat()}")
 print("=" * 60)
 
-# ------------------------------------------------------------------ #
-# Step 1 - Load feature metadata
-# ------------------------------------------------------------------ #
-with open("reports/features.json") as f:
+# ── Step 1: Load feature metadata + profile ───────────────────────────────────
+feat_path = os.path.join(REPORTS_DIR, "features.json")
+with open(feat_path) as f:
     feat_meta = json.load(f)
 
-target_col = feat_meta["target_col"]
-group_cols = feat_meta["group_cols"]
-time_col   = feat_meta["time_col"]
-problem_type = feat_meta.get("problem_type", "panel_forecasting")
+profile_path = os.path.join(REPORTS_DIR, "profile.json")
+with open(profile_path) as f:
+    profile = json.load(f)
 
-print(f"Problem type: {problem_type}")
-print(f"Target: {target_col}")
-print(f"Groups: {group_cols}")
-print(f"Time: {time_col}")
+target_col   = feat_meta["target_col"]
+# profile.json is authoritative for problem_type and group_cols (set by schema_analyst)
+problem_type = profile.get("problem_type") or feat_meta.get("problem_type", "tabular_regression")
+group_cols   = profile.get("group_cols") or feat_meta.get("group_cols", [])
+time_col     = profile.get("time_col") or feat_meta.get("time_col")
 
-# ------------------------------------------------------------------ #
-# Step 2 - Load parquet files
-# ------------------------------------------------------------------ #
-print("\n--- Loading parquet files ---")
-train_df = pd.read_parquet("data/features_train.parquet")
-val_df   = pd.read_parquet("data/features_val.parquet")
+print(f"Problem type : {problem_type}")
+print(f"Target       : {target_col}")
+print(f"Groups       : {group_cols}")
+print(f"Time col     : {time_col}")
 
-print(f"Train shape: {train_df.shape}")
-print(f"Val shape:   {val_df.shape}")
+# ── Step 2: Load parquet files ─────────────────────────────────────────────────
+train_df = pd.read_parquet(os.path.join(DATA_DIR, "features_train.parquet"))
+val_df   = pd.read_parquet(os.path.join(DATA_DIR, "features_val.parquet"))
 
-# Build feature list (exclude group/time/target and helper columns)
-exclude = set(group_cols + [time_col, target_col, "timestamp_ord"])
-feature_cols = [c for c in train_df.columns if c not in exclude]
+print(f"\nTrain shape : {train_df.shape}")
+print(f"Val shape   : {val_df.shape}")
+print(f"Train cols  : {list(train_df.columns)}")
 
-print(f"Number of features: {len(feature_cols)}")
-print(f"Features: {feature_cols}")
+# ── Step 3: Define feature columns ────────────────────────────────────────────
+# Exclude identifiers, target, group/time cols, and 'horizon' (panel artifact)
+ALWAYS_EXCLUDE = {"horizon", "timestamp_ord"}
+exclude_set = ALWAYS_EXCLUDE | set(group_cols) | {target_col}
+if time_col:
+    exclude_set.add(time_col)
 
-# ------------------------------------------------------------------ #
-# Step 3 - Prepare data
-# ------------------------------------------------------------------ #
-print("\n--- Preparing data ---")
+# patient_id is an id column — keep it for output but not for features
+id_cols_in_train = [c for c in ["patient_id"] if c in train_df.columns]
+exclude_set.update(id_cols_in_train)
+
+feature_cols = [c for c in train_df.columns if c not in exclude_set]
+print(f"\nFeature cols ({len(feature_cols)}): {feature_cols}")
+
+# NaN fill with training medians
 fill_vals = train_df[feature_cols].median()
+
+# ── Step 4: Build CV splits based on problem_type ────────────────────────────
+
+def build_cv_splits(problem_type, group_cols, X, y, df, n_splits=5):
+    """Return (splits, cv_scheme).
+
+    splits: list of (train_indices, val_indices) positional arrays (iloc-compatible).
+    Rows may appear in multiple val sets for RepeatedKFold; average predictions accordingly.
+    """
+    if problem_type == "tabular_regression":
+        if group_cols:
+            gc = group_cols[0]
+            if gc in df.columns:
+                groups = df[gc].values
+                n_unique = len(np.unique(groups))
+                actual_splits = max(2, min(n_splits, n_unique))
+                gkf = GroupKFold(n_splits=actual_splits)
+                splits = list(gkf.split(X, y, groups=groups))
+                return splits, f"GroupKFold(n_splits={actual_splits}, group_col='{gc}')"
+        rkf = RepeatedKFold(n_splits=n_splits, n_repeats=3, random_state=42)
+        splits = list(rkf.split(X, y))
+        return splits, f"RepeatedKFold(n_splits={n_splits}, n_repeats=3)"
+    elif problem_type == "classification":
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(skf.split(X, y))
+        return splits, f"StratifiedKFold(n_splits={n_splits})"
+    else:
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(kf.split(X, y))
+        return splits, f"KFold(n_splits={n_splits}, shuffle=True)"
+
+n = len(train_df)
 X_full = train_df[feature_cols].fillna(fill_vals)
+y_full = train_df[target_col].values
 X_val  = val_df[feature_cols].fillna(fill_vals)
-y_full_raw = train_df[target_col].values
 
-print(f"Target stats: min={y_full_raw.min():.2f}, max={y_full_raw.max():.2f}, mean={y_full_raw.mean():.2f}")
-print(f"X_full NaN count: {X_full.isna().sum().sum()}")
-print(f"X_val NaN count: {X_val.isna().sum().sum()}")
+print(f"\nX_full NaN : {X_full.isna().sum().sum()}")
+print(f"X_val NaN  : {X_val.isna().sum().sum()}")
+print(f"y_full     : min={y_full.min()}, max={y_full.max()}, mean={y_full.mean():.3f}")
 
-# ------------------------------------------------------------------ #
-# Step 4 - Walk-forward split for tuning (80/20)
-# ------------------------------------------------------------------ #
-print("\n--- Creating walk-forward split ---")
-all_times = sorted(train_df[time_col].unique())
-cutoff_idx = int(len(all_times) * 0.8)
-cutoff_time = all_times[cutoff_idx]
+cv_splits, cv_scheme = build_cv_splits(problem_type, group_cols, X_full, y_full, train_df.reset_index(drop=True))
+print(f"\nCV scheme : {cv_scheme}")
+print(f"Folds     : {len(cv_splits)}")
 
-wf_train = train_df[train_df[time_col] < cutoff_time].copy()
-wf_val   = train_df[train_df[time_col] >= cutoff_time].copy()
+# ── Step 5: 80/20 random split for Optuna probe (fast) ───────────────────────
+np.random.seed(42)
+perm = np.random.permutation(n)
+split = int(n * 0.8)
+probe_tr_idx, probe_va_idx = perm[:split], perm[split:]
 
-wf_fill_vals = wf_train[feature_cols].median()
-X_wf_train = wf_train[feature_cols].fillna(wf_fill_vals)
-y_wf_train = wf_train[target_col].values
-X_wf_val   = wf_val[feature_cols].fillna(wf_fill_vals)
-y_wf_val   = wf_val[target_col].values
+X_ptr = X_full.iloc[probe_tr_idx].reset_index(drop=True)
+y_ptr = y_full[probe_tr_idx]
+X_pva = X_full.iloc[probe_va_idx].reset_index(drop=True)
+y_pva = y_full[probe_va_idx]
+# Re-fill on probe subset
+ptr_fill = X_ptr.median()
+X_ptr = X_ptr.fillna(ptr_fill)
+X_pva = X_pva.fillna(ptr_fill)
 
-print(f"Walk-forward train: {X_wf_train.shape}, val: {X_wf_val.shape}")
-print(f"Cutoff time: {cutoff_time}")
+print(f"\nProbe train: {X_ptr.shape}, probe val: {X_pva.shape}")
 
-# ------------------------------------------------------------------ #
-# Step 5 - Use pre-tuned Optuna best_params
-# ------------------------------------------------------------------ #
-print("\n--- Using pre-tuned Optuna params (15 trials, best WF-MAE=31.4450) ---")
-best_params = {
-    "learning_rate": 0.015994837682273198,
-    "num_leaves": 86,
-    "min_child_samples": 41,
-    "feature_fraction": 0.8376317529609937,
-    "bagging_fraction": 0.9971571567707618,
-}
-optuna_trials = 15
-print(f"Best params: {best_params}")
+# ── Step 6: Optuna hyperparameter tuning (up to 30 trials, 20-min deadline) ───
+TUNING_DEADLINE = start_time + 20 * 60
 
-# ------------------------------------------------------------------ #
-# Step 6 - Build final hyperparameters and probe n_estimators
-# ------------------------------------------------------------------ #
-print("\n--- Building final hyperparameters ---")
+def objective(trial):
+    if time.time() > TUNING_DEADLINE:
+        raise optuna.exceptions.TrialPruned()
+    params = {
+        "objective": "regression_l1",
+        "metric": "mae",
+        "n_estimators": 1000,
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 8, 63),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        "bagging_freq": 5,
+        "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+        "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 1.0),
+        "verbose": -1,
+        "n_jobs": -1,
+    }
+    maes = []
+    for seed in [42, 7, 123]:
+        m = lgb.LGBMRegressor(**{**params, "random_state": seed})
+        m.fit(
+            X_ptr, y_ptr,
+            eval_set=[(X_pva, y_pva)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)]
+        )
+        preds = np.clip(m.predict(X_pva), 0, None)
+        maes.append(mean_absolute_error(y_pva, preds))
+    return float(np.mean(maes))
+
+try:
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=30, timeout=20 * 60, catch=(Exception,))
+    best_params = study.best_params
+    optuna_trials = len(study.trials)
+    optuna_succeeded = True
+    print(f"\nOptuna: {optuna_trials} trials, best MAE={study.best_value:.4f}")
+    print(f"Best params: {best_params}")
+except Exception as e:
+    print(f"Optuna failed ({e}), using defaults")
+    best_params = {}
+    optuna_trials = 0
+    optuna_succeeded = False
+
+# ── Step 6: Merge tuned + fixed params, probe n_estimators ───────────────────
 default_params = {
     "learning_rate": 0.05,
-    "num_leaves": 63,
+    "num_leaves": 31,
     "min_child_samples": 20,
     "feature_fraction": 0.8,
     "bagging_fraction": 0.8,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.1,
 }
 final_hparams = {**default_params, **best_params}
-print(f"Final hyperparams: {final_hparams}")
 
-probe_params = {
+probe_fit_params = {
     "objective": "regression_l1",
     "metric": "mae",
     "n_estimators": 3000,
     "bagging_freq": 5,
-    "reg_alpha": 0.1,
-    "reg_lambda": 0.1,
     "verbose": -1,
     "n_jobs": -1,
     "random_state": 42,
+    **final_hparams,
 }
-probe_params.update(final_hparams)
-
-print("Probing for optimal n_estimators via early stopping...")
-probe = lgb.LGBMRegressor(**probe_params)
-probe.fit(
-    X_wf_train, y_wf_train,
-    eval_set=[(X_wf_val, y_wf_val)],
-    callbacks=[lgb.early_stopping(150, verbose=False), lgb.log_evaluation(500)]
+probe_model = lgb.LGBMRegressor(**probe_fit_params)
+probe_model.fit(
+    X_ptr, y_ptr,
+    eval_set=[(X_pva, y_pva)],
+    callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(500)]
 )
-best_iter = probe.best_iteration_ if probe.best_iteration_ else 500
+best_iter = probe_model.best_iteration_ if probe_model.best_iteration_ else 300
 best_n_estimators = max(int(best_iter * 1.1), 200)
+probe_mae = mean_absolute_error(y_pva, np.clip(probe_model.predict(X_pva), 0, None))
+print(f"\nProbe MAE: {probe_mae:.4f}, best_iter={best_iter}, n_estimators={best_n_estimators}")
 
-preds_probe = np.clip(probe.predict(X_wf_val), 0, None)
-wf_mae = mean_absolute_error(y_wf_val, preds_probe)
-print(f"Walk-forward MAE: {wf_mae:.4f}, best_iteration: {probe.best_iteration_}, n_estimators: {best_n_estimators}")
-print(f"Elapsed after probe: {time.time()-start_time:.1f}s")
-
-# ------------------------------------------------------------------ #
-# Step 7a - Retrain on full training data with 5 seeds
-# ------------------------------------------------------------------ #
-print("\n--- Training final ensemble (5 seeds) ---")
+# ── Step 7: CV with problem-type-aware splitter for OOF predictions ───────────
 final_params = {
     "objective": "regression_l1",
     "metric": "mae",
     "n_estimators": best_n_estimators,
     "bagging_freq": 5,
-    "reg_alpha": 0.1,
-    "reg_lambda": 0.1,
     "verbose": -1,
     "n_jobs": -1,
+    **final_hparams,
 }
-final_params.update(final_hparams)
 
-seed_preds = []
+# Accumulate: rows may appear in multiple val folds (RepeatedKFold)
+oof_accum = np.zeros(n)
+oof_count = np.zeros(n, dtype=int)
+oof_folds = np.full(n, -1, dtype=int)  # last fold assignment (for oof_predictions.csv)
+fold_maes = []
+
+print(f"\n--- {cv_scheme} ---")
+for fold_idx, (tr_idx, va_idx) in enumerate(cv_splits):
+    X_tr = X_full.iloc[tr_idx]
+    y_tr = y_full[tr_idx]
+    X_va = X_full.iloc[va_idx]
+    y_va = y_full[va_idx]
+
+    fold_fill = X_tr.median()
+    X_tr = X_tr.fillna(fold_fill)
+    X_va = X_va.fillna(fold_fill)
+
+    fold_seed_preds = []
+    for seed in [42, 7, 123]:
+        m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
+        m.fit(X_tr, y_tr, callbacks=[lgb.log_evaluation(-1)])
+        fold_seed_preds.append(np.clip(m.predict(X_va), 0, None))
+
+    fold_pred = np.mean(fold_seed_preds, axis=0)
+    oof_accum[va_idx] += fold_pred
+    oof_count[va_idx] += 1
+    oof_folds[va_idx] = fold_idx  # last assignment wins for oof_predictions.csv
+
+    fmae = mean_absolute_error(y_va, fold_pred)
+    fold_maes.append(fmae)
+    print(f"  Fold {fold_idx+1}: MAE={fmae:.4f}")
+
+# Average across repeats (handles RepeatedKFold where count > 1 per row)
+oof_preds = np.where(oof_count > 0, oof_accum / oof_count, float(y_full.mean()))
+oof_mae = mean_absolute_error(y_full, oof_preds)
+print(f"\nOOF MAE ({cv_scheme}): {oof_mae:.4f}")
+print(f"Per-fold MAEs: {[round(m, 4) for m in fold_maes]}")
+
+# ── Step 8: Retrain on full data with 5 seeds ─────────────────────────────────
+print("\n--- Training on full data (5 seeds) ---")
+seed_val_preds = []
 for seed in [42, 7, 123, 2024, 999]:
-    print(f"  Training seed {seed}...")
     m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
-    m.fit(X_full, y_full_raw, callbacks=[lgb.log_evaluation(-1)])
-    raw_p = np.clip(m.predict(X_val), 0, None)
-    seed_preds.append(raw_p)
-    print(f"  Seed {seed}: min={raw_p.min():.2f}, max={raw_p.max():.2f}, mean={raw_p.mean():.2f}")
+    m.fit(X_full, y_full, callbacks=[lgb.log_evaluation(-1)])
+    p = np.clip(m.predict(X_val), 0, None)
+    seed_val_preds.append(p)
+    print(f"  Seed {seed}: mean={p.mean():.3f}")
 
-ensemble_preds = np.mean(seed_preds, axis=0)
-ensemble_preds = np.clip(ensemble_preds, 0, None)
+ensemble_preds = np.mean(seed_val_preds, axis=0)
 print(f"\nEnsemble: min={ensemble_preds.min():.2f}, max={ensemble_preds.max():.2f}, mean={ensemble_preds.mean():.2f}")
-print(f"NaN predictions: {np.isnan(ensemble_preds).sum()}")
+print(f"NaN count: {np.isnan(ensemble_preds).sum()}")
 last_model = m
 
-# Use ensemble_preds as final (no quantile blending for electricity — MAE objective already optimal)
-final_preds = ensemble_preds.copy()
+# ── Step 9: Write reports/predictions.csv ────────────────────────────────────
+# Identifier columns: the id col + any group/time cols present in val_df
+id_candidates = ([profile.get("id_col")] if profile.get("id_col") else []) + group_cols + ([time_col] if time_col else [])
+id_output = [c for c in id_candidates if c and c in val_df.columns]
+if not id_output:  # fallback: first non-feature column
+    id_output = [c for c in val_df.columns if c not in feature_cols][:1]
 
-# ------------------------------------------------------------------ #
-# Step 7c - Out-of-fold predictions (4-fold expanding walk-forward)
-# ------------------------------------------------------------------ #
-print("\n--- Generating out-of-fold predictions (4-fold walk-forward) ---")
-N_OOF_FOLDS = 4
-oof_mae_val = None
-oof_records = []
-oof_fold_maes = []
-
-try:
-    total_t = len(all_times)
-    min_train_t = max(1, total_t // (N_OOF_FOLDS + 1))
-    fold_step_t  = max(1, (total_t - min_train_t) // N_OOF_FOLDS)
-
-    for fold_idx in range(N_OOF_FOLDS):
-        val_start_idx = min_train_t + fold_idx * fold_step_t
-        val_end_idx   = min(val_start_idx + fold_step_t, total_t)
-        if val_start_idx >= total_t:
-            break
-
-        val_times_set   = set(all_times[val_start_idx:val_end_idx])
-        train_end_idx   = max(0, val_start_idx - 1)
-        train_times_set = set(all_times[:train_end_idx])
-
-        fold_tr = train_df[train_df[time_col].isin(train_times_set)]
-        fold_vl = train_df[train_df[time_col].isin(val_times_set)]
-        if len(fold_tr) == 0 or len(fold_vl) == 0:
-            continue
-
-        fold_fill = fold_tr[feature_cols].median()
-        X_ft = fold_tr[feature_cols].fillna(fold_fill)
-        y_ft = fold_tr[target_col].values
-        X_fv = fold_vl[feature_cols].fillna(fold_fill)
-
-        fold_model = lgb.LGBMRegressor(**{**final_params, "random_state": 42})
-        fold_model.fit(X_ft, y_ft, callbacks=[lgb.log_evaluation(-1)])
-        fold_preds_raw = np.clip(fold_model.predict(X_fv), 0, None)
-
-        rec = fold_vl[group_cols + [time_col]].copy().reset_index(drop=True)
-        rec["fold"]             = fold_idx
-        rec["predicted_target"] = fold_preds_raw
-        oof_records.append(rec)
-
-        fold_mae_i = float(mean_absolute_error(fold_vl[target_col].values, fold_preds_raw))
-        oof_fold_maes.append(fold_mae_i)
-        print(f"  Fold {fold_idx}: train={len(fold_tr)}, val={len(fold_vl)}, mae={fold_mae_i:.4f}")
-
-    if oof_records:
-        oof_df = pd.concat(oof_records, ignore_index=True)
-        oof_df.to_csv("reports/oof_predictions.csv", index=False)
-        oof_mae_val = float(np.mean(oof_fold_maes))
-        print(f"Written reports/oof_predictions.csv: {oof_df.shape}, OOF MAE={oof_mae_val:.4f}")
-    else:
-        print("WARNING: no OOF folds generated")
-
-except Exception as e:
-    print(f"WARNING: OOF generation failed ({e})")
-
-print(f"Elapsed after OOF: {time.time()-start_time:.1f}s")
-
-# ------------------------------------------------------------------ #
-# Step 8 - Write reports/predictions.csv
-# ------------------------------------------------------------------ #
-print("\n--- Writing reports/predictions.csv ---")
-preds_df = val_df[group_cols + [time_col]].copy().reset_index(drop=True)
+preds_df = val_df[id_output].copy().reset_index(drop=True)
 preds_df.insert(0, "row_id", range(len(preds_df)))
-preds_df["predicted_target"] = final_preds
+preds_df["predicted_target"] = ensemble_preds
 
 nan_count = preds_df["predicted_target"].isna().sum()
 if nan_count > 0:
-    global_mean = float(train_df[target_col].mean())
-    preds_df["predicted_target"] = preds_df["predicted_target"].fillna(global_mean)
-    print(f"WARNING: filled {nan_count} NaN predictions with global mean {global_mean:.2f}")
+    gm = float(y_full.mean())
+    preds_df["predicted_target"] = preds_df["predicted_target"].fillna(gm)
+    print(f"WARNING: filled {nan_count} NaN predictions with global mean {gm:.2f}")
 
 assert preds_df["predicted_target"].isna().sum() == 0, "NaN predictions remain!"
 
-preds_df.to_csv("reports/predictions.csv", index=False)
-print(f"Written reports/predictions.csv: {preds_df.shape}")
+pred_path = os.path.join(REPORTS_DIR, "predictions.csv")
+preds_df.to_csv(pred_path, index=False)
+print(f"\nWritten {pred_path}: {preds_df.shape}")
 print(f"Columns: {list(preds_df.columns)}")
-print(preds_df.head(10).to_string())
+print(preds_df.head(5).to_string())
 
-saved_preds = pd.read_csv("reports/predictions.csv")["predicted_target"].values
-print(f"\nSaved stats: min={saved_preds.min():.2f}, max={saved_preds.max():.2f}, mean={saved_preds.mean():.2f}, std={saved_preds.std():.2f}")
+# ── Step 10: Write reports/oof_predictions.csv ───────────────────────────────
+oof_id_cols = [c for c in id_output if c in train_df.columns]
+oof_df = train_df[oof_id_cols].copy().reset_index(drop=True)
+oof_df["fold"] = oof_folds
+oof_df["predicted_target"] = oof_preds
 
-# ------------------------------------------------------------------ #
-# Step 9 - Write reports/model_results.json
-# ------------------------------------------------------------------ #
-print("\n--- Writing reports/model_results.json ---")
+oof_path = os.path.join(REPORTS_DIR, "oof_predictions.csv")
+oof_df.to_csv(oof_path, index=False)
+print(f"\nWritten {oof_path}: {oof_df.shape}")
+print(f"OOF MAE: {oof_mae:.4f}")
 
+# ── Step 11: Write reports/model_results.json ─────────────────────────────────
 feat_imp = pd.Series(last_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-top10 = [{"feature": str(k), "importance": int(v)} for k, v in feat_imp.head(10).items()]
-all_imp = [{"feature": str(k), "importance": int(v)} for k, v in feat_imp.items()]
+top10    = [{"feature": str(k), "importance": int(v)} for k, v in feat_imp.head(10).items()]
+all_imp  = [{"feature": str(k), "importance": int(v)} for k, v in feat_imp.items()]
 
 training_time = int(time.time() - start_time)
 
 results = {
     "algorithm": "LightGBM",
     "objective": final_params["objective"],
-    "best_params": {k: (float(v) if isinstance(v, (np.floating, float)) else int(v) if isinstance(v, (np.integer, int)) else v)
+    "best_params": {k: (float(v) if isinstance(v, (float, np.floating)) else int(v) if isinstance(v, (int, np.integer)) else v)
                     for k, v in final_hparams.items()},
     "n_estimators": int(best_n_estimators),
     "n_seeds": 5,
-    "seed_aggregation": "mean",
-    "walk_forward_mae": float(wf_mae),
-    "walk_forward_val_period": f"timestamps from index {cutoff_idx}+",
-    "walk_forward_cv_scheme": "single 80/20 time split",
-    "oof_mae": float(oof_mae_val) if oof_mae_val is not None else None,
-    "oof_cv_scheme": f"{N_OOF_FOLDS}-fold expanding walk-forward (1-period embargo)" if oof_mae_val is not None else None,
+    "cv_scheme": cv_scheme,
+    "oof_mae": float(oof_mae),
+    "oof_cv_scheme": cv_scheme,
+    "per_fold_maes": [float(m) for m in fold_maes],
+    "probe_mae_80_20": float(probe_mae),
     "feature_importance_top10": top10,
     "feature_importance_all": all_imp,
     "training_time_seconds": training_time,
     "optuna_trials_completed": int(optuna_trials),
+    "optuna_succeeded": bool(optuna_succeeded),
     "val_prediction_stats": {
-        "min": float(saved_preds.min()),
-        "max": float(saved_preds.max()),
-        "mean": float(saved_preds.mean()),
-        "std": float(saved_preds.std()),
+        "min": float(ensemble_preds.min()),
+        "max": float(ensemble_preds.max()),
+        "mean": float(ensemble_preds.mean()),
+        "std": float(ensemble_preds.std()),
     },
     "n_features": len(feature_cols),
-    "n_train_rows": len(train_df),
-    "n_val_rows": len(val_df),
+    "n_train_rows": int(len(train_df)),
+    "n_val_rows": int(len(val_df)),
 }
 
-with open("reports/model_results.json", "w") as f:
+results_path = os.path.join(REPORTS_DIR, "model_results.json")
+with open(results_path, "w") as f:
     json.dump(results, f, indent=2)
-print("Written reports/model_results.json")
-print(json.dumps({k: v for k, v in results.items() if k not in ("feature_importance_all", "feature_importance_top10")}, indent=2))
+print(f"\nWritten {results_path}")
 
-# ------------------------------------------------------------------ #
-# Step 10 - Write marker file
-# ------------------------------------------------------------------ #
-print("\n--- Writing reports/modeler_was_here.txt ---")
-with open("reports/modeler_was_here.txt", "w") as f:
+# Pretty-print summary (no giant lists)
+summary = {k: v for k, v in results.items() if k not in ("feature_importance_all", "feature_importance_top10")}
+print(json.dumps(summary, indent=2))
+
+# ── Step 12: Write marker file ────────────────────────────────────────────────
+marker_path = os.path.join(REPORTS_DIR, "modeler_was_here.txt")
+with open(marker_path, "w") as f:
     f.write(f"modeler sub-agent executed at {datetime.datetime.now().isoformat()}\n")
-    f.write(f"Wall-clock time: {training_time} seconds\n")
-    f.write(f"Walk-forward MAE: {wf_mae:.4f}\n")
-    f.write(f"OOF MAE: {oof_mae_val}\n")
+    f.write(f"OOF MAE ({cv_scheme}): {oof_mae:.4f}\n")
+    f.write(f"Probe MAE (80/20): {probe_mae:.4f}\n")
+    f.write(f"Training time: {training_time}s\n")
     f.write(f"Optuna trials: {optuna_trials}\n")
     f.write(f"n_estimators: {best_n_estimators}\n")
+print(f"Written {marker_path}")
 
-print("Written reports/modeler_was_here.txt")
 print("\n" + "=" * 60)
-print("MODELER SUB-AGENT COMPLETE")
-print(f"Total wall-clock: {int(time.time() - start_time)} seconds")
+print("MODELER COMPLETE")
+print(f"OOF MAE : {oof_mae:.4f}")
+print(f"Val mean: {ensemble_preds.mean():.3f}")
+print(f"Time    : {training_time}s")
 print("=" * 60)

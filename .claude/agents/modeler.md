@@ -52,16 +52,64 @@ print(f"Target: {target_col}")
 fill_vals = train_df[feature_cols].median()
 ```
 
-### Step 3 — Choose modeling recipe based on problem_type
-Read problem_type from reports/features.json:
-- `panel_forecasting` → LightGBM with `regression_l1` (MAE) objective, direct multi-step training using horizon indicator feature
-- `tabular_regression` → LightGBM with `regression_l2` objective
-- `classification` → LightGBM with `binary` or `multiclass` objective
+### Step 3 — Choose modeling recipe and CV strategy based on problem_type
+Read `problem_type` from **reports/profile.json** (authoritative) and fall back to reports/features.json if missing.
 
-### Step 4 — Walk-forward split for Optuna tuning
+**Objective**:
+- `panel_forecasting` → `regression_l1` (MAE)
+- `tabular_regression` → `regression_l1` (MAE)
+- `classification` → `binary` or `multiclass`
+
+**CV splitter** — always use the splitter that matches the problem type so the modeler's reported OOF MAE is comparable to the validator's strict MAE:
+
+```python
+from sklearn.model_selection import KFold, GroupKFold, RepeatedKFold
+
+def build_cv_splits(problem_type, group_cols, X, y, df, n_splits=5):
+    """Return (splits, cv_scheme).
+
+    splits: list of (train_indices, val_indices) positional arrays.
+    Rows may appear multiple times in val for RepeatedKFold; average predictions.
+    """
+    if problem_type == "tabular_regression":
+        if group_cols:
+            gc = group_cols[0]
+            if gc in df.columns:
+                groups = df[gc].values
+                n_unique = len(np.unique(groups))
+                actual_splits = max(2, min(n_splits, n_unique))
+                gkf = GroupKFold(n_splits=actual_splits)
+                splits = list(gkf.split(X, y, groups=groups))
+                return splits, f"GroupKFold(n_splits={actual_splits}, group_col='{gc}')"
+        rkf = RepeatedKFold(n_splits=n_splits, n_repeats=3, random_state=42)
+        splits = list(rkf.split(X, y))
+        return splits, f"RepeatedKFold(n_splits={n_splits}, n_repeats=3)"
+    elif problem_type == "classification":
+        from sklearn.model_selection import StratifiedKFold
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(skf.split(X, y))
+        return splits, f"StratifiedKFold(n_splits={n_splits})"
+    else:
+        # panel_forecasting: walk-forward is used for tuning; KFold is fallback
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        splits = list(kf.split(X, y))
+        return splits, f"KFold(n_splits={n_splits}, shuffle=True)"
+
+cv_splits, cv_scheme = build_cv_splits(
+    problem_type, group_cols, X_full, y_full, train_df.reset_index(drop=True)
+)
+print(f"CV scheme: {cv_scheme}, folds: {len(cv_splits)}")
+```
+
+**Rule of thumb**:
+- `tabular_regression` + group_cols in profile.json → `GroupKFold` on the first group col; n_splits capped to min(5, n_unique_groups)
+- `tabular_regression`, no group cols → `RepeatedKFold(n_splits=5, n_repeats=3)` for stability
+- `classification` → `StratifiedKFold`
+- `panel_forecasting` → walk-forward split (see Step 4 below); KFold is never used
+
+### Step 4 — Walk-forward split for Optuna tuning (panel_forecasting) / 80/20 probe (tabular)
 ```python
 # For panel_forecasting: train on first 80% of weeks, validate on last 20%
-# Identify the cutoff week
 all_weeks = sorted(train_df[time_col].unique())
 cutoff_idx = int(len(all_weeks) * 0.8)
 cutoff_week = all_weeks[cutoff_idx]
@@ -77,6 +125,16 @@ y_wf_val   = wf_val[target_col]
 
 print(f"Walk-forward train: {X_wf_train.shape}, val: {X_wf_val.shape}")
 print(f"Cutoff week: {cutoff_week}")
+
+# For tabular_regression / classification: 80/20 random split for Optuna (fast)
+np.random.seed(42)
+perm = np.random.permutation(n)
+split_pt = int(n * 0.8)
+probe_tr_idx, probe_va_idx = perm[:split_pt], perm[split_pt:]
+X_ptr = X_full.iloc[probe_tr_idx].fillna(X_full.iloc[probe_tr_idx].median())
+y_ptr = y_full[probe_tr_idx]
+X_pva = X_full.iloc[probe_va_idx].fillna(X_full.iloc[probe_tr_idx].median())
+y_pva = y_full[probe_va_idx]
 ```
 
 ### Step 5 — Optuna hyperparameter tuning (10–15 trials, abort after 25 minutes)
@@ -172,12 +230,16 @@ wf_mae = mean_absolute_error(y_wf_val, np.clip(probe.predict(X_wf_val), 0, None)
 print(f"Walk-forward MAE: {wf_mae:.4f}, best_iteration: {probe.best_iteration_}, using n_estimators: {best_n_estimators}")
 ```
 
-### Step 7 — Retrain on full training data with 5 seeds, average predictions
-```python
-X_full = train_df[feature_cols].fillna(fill_vals)
-y_full = train_df[target_col]
-X_val  = val_df[feature_cols].fillna(fill_vals)
+### Step 7 — OOF CV (tabular/classification) or walk-forward MAE (panel)
 
+**For `panel_forecasting`**: The walk-forward MAE computed in Step 6 (`wf_mae`) is already
+the honest OOF metric — skip the OOF loop below. Set `oof_mae = wf_mae`. Jump to Step 7b.
+
+**For `tabular_regression` and `classification`**: Run the OOF CV loop with the splitter
+from `build_cv_splits` to compute an honest `oof_mae`. Then do Step 7b.
+
+```python
+# ── 7a: OOF CV loop (tabular_regression / classification only) ─────────────
 final_params = {
     "objective": "regression_l1",
     "metric": "mae",
@@ -190,15 +252,52 @@ final_params = {
     **final_hparams,
 }
 
+# Accumulate OOF — rows can appear multiple times with RepeatedKFold
+oof_accum = np.zeros(n)
+oof_count = np.zeros(n, dtype=int)
+oof_folds = np.full(n, -1, dtype=int)  # last fold assignment per row
+fold_maes = []
+
+print(f"\n--- {cv_scheme} ---")
+for fold_idx, (tr_idx, va_idx) in enumerate(cv_splits):
+    X_tr = X_full.iloc[tr_idx].fillna(X_full.iloc[tr_idx].median())
+    y_tr = y_full[tr_idx]
+    X_va = X_full.iloc[va_idx].fillna(X_full.iloc[tr_idx].median())
+    y_va = y_full[va_idx]
+
+    fold_seed_preds = []
+    for seed in [42, 7, 123]:
+        m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
+        m.fit(X_tr, y_tr, callbacks=[lgb.log_evaluation(-1)])
+        fold_seed_preds.append(np.clip(m.predict(X_va), 0, None))
+
+    fold_pred = np.mean(fold_seed_preds, axis=0)
+    oof_accum[va_idx] += fold_pred
+    oof_count[va_idx] += 1
+    oof_folds[va_idx] = fold_idx  # last assignment wins for oof_predictions.csv
+
+    fmae = mean_absolute_error(y_va, fold_pred)
+    fold_maes.append(fmae)
+    print(f"  Fold {fold_idx+1}: MAE={fmae:.4f}")
+
+oof_preds = np.where(oof_count > 0, oof_accum / oof_count, float(y_full.mean()))
+oof_mae = mean_absolute_error(y_full, oof_preds)
+print(f"\nOOF MAE ({cv_scheme}): {oof_mae:.4f}")
+
+# ── 7b: Retrain on full data with 5 seeds ──────────────────────────────────
+X_full_filled = train_df[feature_cols].fillna(fill_vals)
+y_full = train_df[target_col]
+X_val  = val_df[feature_cols].fillna(fill_vals)
+
 seed_preds = []
 for seed in [42, 7, 123, 2024, 999]:
     m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
-    m.fit(X_full, y_full, callbacks=[lgb.log_evaluation(-1)])
+    m.fit(X_full_filled, y_full, callbacks=[lgb.log_evaluation(-1)])
     seed_preds.append(np.clip(m.predict(X_val), 0, None))
 
 ensemble_preds = np.mean(seed_preds, axis=0)
-print(f"Ensemble predictions: min={ensemble_preds.min():.2f}, max={ensemble_preds.max():.2f}, mean={ensemble_preds.mean():.2f}")
-print(f"NaN predictions: {np.isnan(ensemble_preds).sum()}")
+print(f"Ensemble: min={ensemble_preds.min():.2f}, max={ensemble_preds.max():.2f}, mean={ensemble_preds.mean():.2f}")
+print(f"NaN count: {np.isnan(ensemble_preds).sum()}")
 
 # Use last model for feature importances
 last_model = m
@@ -245,9 +344,15 @@ results = {
     "best_params": final_hparams,
     "n_estimators": best_n_estimators,
     "n_seeds": 5,
-    "walk_forward_mae": float(wf_mae),
-    "walk_forward_val_period": f"weeks {int(cutoff_week)}+",
+    "cv_scheme": cv_scheme,
+    "oof_mae": float(oof_mae),
+    "oof_cv_scheme": cv_scheme,
+    "per_fold_maes": [float(m) for m in fold_maes],
+    # walk_forward_mae: for panel_forecasting use wf_mae; for others use oof_mae
+    # (validator tries walk_forward_mae first, then oof_mae — set both consistently)
+    "walk_forward_mae": float(wf_mae if problem_type == "panel_forecasting" else oof_mae),
     "feature_importance_top10": top10,
+    "feature_importance_all": all_imp,
     "training_time_seconds": training_time,
     "optuna_trials_completed": optuna_trials,
     "val_prediction_stats": {

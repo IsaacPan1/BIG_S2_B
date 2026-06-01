@@ -129,9 +129,15 @@ def _grouped_strict_splits(
     group_col: str,
     n_folds: int,
 ) -> list[tuple[pd.Index, pd.Index]]:
-    """Return list of (train_idx, val_idx) for grouped K-fold CV."""
-    gkf = GroupKFold(n_splits=n_folds)
+    """Return list of (train_idx, val_idx) for grouped K-fold CV.
+
+    If the group column has fewer unique values than n_folds, automatically
+    reduces n_splits to the number of unique groups (minimum 2).
+    """
     groups = train_df[group_col].values
+    n_unique = len(np.unique(groups))
+    actual_folds = max(2, min(n_folds, n_unique))
+    gkf = GroupKFold(n_splits=actual_folds)
     splits = []
     for tr_iloc, vl_iloc in gkf.split(train_df, groups=groups):
         splits.append((train_df.index[tr_iloc], train_df.index[vl_iloc]))
@@ -167,7 +173,8 @@ def compute_strict_cv(
         gc = group_cols[0] if group_cols else None
         if gc and gc in train_df.columns:
             splits = _grouped_strict_splits(train_df, gc, N_STRICT_FOLDS)
-            scheme = f"{N_STRICT_FOLDS}-fold purged GroupKFold on '{gc}'"
+            actual_folds = len(splits)
+            scheme = f"{actual_folds}-fold purged GroupKFold on '{gc}'"
         else:
             # Fallback: plain sequential split
             n = len(train_df)
@@ -376,12 +383,21 @@ def main() -> None:
         "bagging_fraction": 0.8,
     })
     n_estimators   = int(model_results.get("n_estimators", 500))
-    reported_cv_mae = float(model_results.get("walk_forward_mae", float("nan")))
+    # Try several candidate key names for the reported CV MAE
+    reported_cv_mae = float(
+        model_results.get("walk_forward_mae")
+        or model_results.get("oof_mae")
+        or model_results.get("cv_mae")
+        or float("nan")
+    )
 
     # ── Load training features ───────────────────────────────────────
     train_df = pd.read_parquet(data / "features_train.parquet")
     exclude  = set(group_cols + ([time_col] if time_col else []) + [target_col])
-    feature_cols = [c for c in train_df.columns if c not in exclude]
+    # Only keep numeric columns — string/categorical columns cannot be
+    # median-filled or fed directly into LightGBM as float arrays.
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    feature_cols = [c for c in numeric_cols if c not in exclude]
     fill_vals = train_df[feature_cols].median()
 
     print(f"problem_type: {problem_type}")

@@ -75,6 +75,8 @@ Key: `feature_families` is a **dict** (family_name → list or dict of feature s
   "best_params": {"learning_rate": 0.01, "num_leaves": 153, ...},
   "n_estimators": 638,
   "n_seeds": 5,
+  "oof_mae": 0.130,
+  "oof_cv_scheme": "GroupKFold(n_splits=2, group_col='sex')",
   "walk_forward_mae": 7.13,
   "training_time_seconds": 169,
   "optuna_trials_completed": 15,
@@ -187,7 +189,10 @@ objective      = model_res.get("objective", "Unknown")
 best_params    = model_res.get("best_params", {})
 n_estimators   = model_res.get("n_estimators", "Unknown")
 n_seeds        = model_res.get("n_seeds", 1)
-mae            = model_res.get("walk_forward_mae", None)
+# oof_mae is the headline metric (honest CV MAE from the correct splitter).
+# Fall back to walk_forward_mae for older panel_forecasting runs that predate the field.
+mae            = model_res.get("oof_mae") or model_res.get("walk_forward_mae", None)
+cv_scheme_label = model_res.get("oof_cv_scheme") or model_res.get("cv_scheme") or "Walk-forward MAE"
 train_time     = model_res.get("training_time_seconds", "Unknown")
 n_trials       = model_res.get("optuna_trials_completed", model_res.get("n_trials", None))
 feat_imp       = model_res.get("feature_importance_top10", [])
@@ -263,7 +268,7 @@ if not REPORTLAB_AVAILABLE:
         "AUTONOMOUS DATA ANALYSIS REPORT",
         f"Generated: {timestamp}",
         f"Problem: {problem_type} | Target: {target_col}",
-        f"Algorithm: {algorithm} | Walk-forward MAE: {fmt(mae,3)}",
+        f"Algorithm: {algorithm} | CV MAE: {fmt(mae,3)} ({cv_scheme_label})",
         f"Submission rows: {fmt(sub_row_count)} | Validation passed: {fmt_bool(sub_passed)}",
         "",
         "NOTE: reportlab unavailable — plain text fallback.",
@@ -319,7 +324,7 @@ else:
         f"transformations ({total_features} features across {n_families} families). A "
         f"<b>{algorithm}</b> model (objective: {objective}) was trained with Optuna "
         f"hyperparameter search ({n_trials} trials) and a {n_seeds}-seed median ensemble. "
-        f"Walk-forward MAE on the held-out validation period: <b>{mae_str}</b>. "
+        f"CV MAE ({cv_scheme_label}): <b>{mae_str}</b>. "
         f"The final submission contained {fmt(sub_row_count)} rows and passed all "
         f"validation checks: <b>{fmt_bool(sub_passed)}</b>.",
         BODY
@@ -439,7 +444,7 @@ else:
         ["Number of estimators", str(n_estimators)],
         ["Number of seeds",      str(n_seeds)],
         ["Optuna trials",        str(n_trials) if n_trials else "N/A"],
-        ["Walk-forward MAE",     mae_str],
+        [f"CV MAE ({cv_scheme_label})", mae_str],
         ["Training time",        f"{train_time} s"],
     ]
     story.append(tbl(["Parameter", "Value"], model_rows, widths=[5*cm, 11*cm]))
@@ -489,7 +494,7 @@ else:
             "a statistically significant shift between train and validation distributions. "
             "While the feature set includes difference features to partially compensate, "
             "the model may underperform in the tails of the shifted covariate range. "
-            "Impact is bounded by the walk-forward MAE reported above."
+            "Impact is bounded by the CV MAE reported above."
         )
 
     lims.append(
