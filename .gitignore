@@ -8,8 +8,10 @@ __pycache__/
 venv/
 
 # Data and reports (regenerated each run)
-data/
-reports/
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
 *.pdf
 submission.csv
 
