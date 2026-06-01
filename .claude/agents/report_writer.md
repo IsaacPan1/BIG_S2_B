@@ -308,6 +308,16 @@ else:
     META = ParagraphStyle('Meta', fontName='Helvetica',        fontSize=9,  spaceAfter=12, textColor=colors.grey)
     BOLD = ParagraphStyle('Bold', fontName='Helvetica-Bold',   fontSize=10, spaceAfter=6)
 
+    # Cell styles — give every table cell a Paragraph so long text word-wraps
+    _CS = ParagraphStyle('CellText', fontName='Helvetica',      fontSize=9, leading=11, spaceAfter=0, spaceBefore=0)
+    _CH = ParagraphStyle('CellHdr',  fontName='Helvetica-Bold', fontSize=9, leading=11, spaceAfter=0, spaceBefore=0, textColor=colors.white)
+
+    def _wrap_cell(content, hdr=False):
+        st = _CH if hdr else _CS
+        if content is None:
+            return Paragraph('', st)
+        return Paragraph(str(content), st)
+
     TS = TableStyle([
         ('BACKGROUND',   (0,0), (-1,0),  colors.HexColor('#2C3E50')),
         ('TEXTCOLOR',    (0,0), (-1,0),  colors.white),
@@ -324,7 +334,9 @@ else:
     ])
 
     def tbl(headers, rows, widths=None):
-        t = Table([headers] + rows, colWidths=widths, hAlign='LEFT')
+        wrapped = [[_wrap_cell(h, hdr=True) for h in headers]]
+        wrapped += [[_wrap_cell(c) for c in row] for row in rows]
+        t = Table(wrapped, colWidths=widths, hAlign='LEFT', repeatRows=1)
         t.setStyle(TS)
         return t
 
@@ -515,23 +527,20 @@ else:
             ck_name    = ck.get("name", "")
             ck_status  = ck.get("status", "")
             ck_details = ck.get("details", "")
-            check_rows.append([ck_name, ck_status, ck_details])
+            status_hex = ("#1a9641" if ck_status == "PASS"
+                          else "#d7191c" if ck_status == "CRITICAL"
+                          else "#e08200")
+            _st_style = ParagraphStyle(
+                f'CellSt_{ck_status}', fontName='Helvetica-Bold',
+                fontSize=9, leading=11, textColor=colors.HexColor(status_hex)
+            )
+            check_rows.append([_wrap_cell(ck_name), Paragraph(ck_status, _st_style), _wrap_cell(ck_details)])
         critic_tbl = Table(
-            [["Check", "Status", "Details"]] + check_rows,
+            [[_wrap_cell("Check", hdr=True), _wrap_cell("Status", hdr=True), _wrap_cell("Details", hdr=True)]] + check_rows,
             colWidths=[4*cm, 2*cm, 10*cm],
             hAlign="LEFT",
         )
-        # Base style from TS, then override status-cell colours
         critic_tbl.setStyle(TS)
-        for row_idx, ck in enumerate(critic_checks, start=1):
-            ck_status = ck.get("status", "PASS")
-            cell_color = (colors.HexColor("#1a9641") if ck_status == "PASS"
-                          else colors.HexColor("#d7191c") if ck_status == "CRITICAL"
-                          else colors.HexColor("#e08200"))
-            critic_tbl.setStyle(TableStyle([
-                ("TEXTCOLOR", (1, row_idx), (1, row_idx), cell_color),
-                ("FONTNAME",  (1, row_idx), (1, row_idx), "Helvetica-Bold"),
-            ]))
         story.append(critic_tbl)
     else:
         story.append(Paragraph("No checks recorded (critic did not run or produced empty checks).", BODY))

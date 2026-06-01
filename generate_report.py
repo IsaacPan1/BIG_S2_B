@@ -32,6 +32,16 @@ doc = SimpleDocTemplate(
 styles = getSampleStyleSheet()
 story = []
 
+# Cell styles for word-wrap inside table cells
+_CS = ParagraphStyle('CellText', fontName='Helvetica',      fontSize=9, leading=11, spaceAfter=0, spaceBefore=0)
+_CH = ParagraphStyle('CellHdr',  fontName='Helvetica-Bold', fontSize=9, leading=11, spaceAfter=0, spaceBefore=0, textColor=colors.white)
+
+def _wrap_cell(content, hdr=False):
+    st = _CH if hdr else _CS
+    if content is None:
+        return Paragraph('', st)
+    return Paragraph(str(content), st)
+
 title_style = ParagraphStyle(
     "Title", parent=styles["Title"],
     fontSize=18, spaceAfter=12, alignment=TA_CENTER
@@ -50,7 +60,8 @@ body_style = ParagraphStyle(
 )
 
 def add_table(data, col_widths=None):
-    t = Table(data, colWidths=col_widths)
+    wrapped = [[_wrap_cell(c, hdr=(ri == 0)) for c in row] for ri, row in enumerate(data)]
+    t = Table(wrapped, colWidths=col_widths, repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#4472C4")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
