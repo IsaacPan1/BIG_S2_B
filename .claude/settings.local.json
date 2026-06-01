@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cd \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\"; if \\(-not \\(Test-Path \"reports\"\\)\\) { New-Item -ItemType Directory -Path \"reports\" }; python tools/profile_data.py --data-dir data/ --output reports/profile.json)",
+      "PowerShell(if \\(-not \\(Test-Path \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\\\\reports\\\\schema_analysis.md\"\\)\\) { New-Item -ItemType File -Path \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\\\\reports\\\\schema_analysis.md\" })",
+      "PowerShell(cd \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\"; if \\(-not \\(Test-Path \"reports\"\\)\\) { New-Item -ItemType Directory -Path \"reports\" }; Write-Host \"reports dir ready\")",
+      "PowerShell(cd \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\"; python verify_outputs.py 2>&1; if \\(-not \\(Test-Path verify_outputs.py\\)\\) { Write-Host \"writing script first\" })",
+      "PowerShell(New-Item *)",
+      "PowerShell(Write-Host \"=== VERIFICATION ===\"; Test-Path \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\\\\reports\\\\profile.json\"; Test-Path \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\\\\reports\\\\schema_analysis.md\"; $p = Get-Content \"C:\\\\Users\\\\isaac\\\\OneDrive\\\\Desktop\\\\award_B\\\\reports\\\\profile.json\" | ConvertFrom-Json; Write-Host \"problem_type: $\\($p.problem_type\\)\"; Write-Host \"target_col: $\\($p.target_col\\)\"; Write-Host \"group_cols: $\\($p.group_cols -join ', '\\)\"; Write-Host \"time_col: $\\($p.time_col\\)\"; Write-Host \"n_train_rows: $\\($p.n_train_rows\\)\"; Write-Host \"n_val_rows: $\\($p.n_val_rows\\)\")",
+      "PowerShell(\\(Get-Content \"reports\\\\predictions.csv\" | Measure-Object -Line\\).Lines)"
+    ]
+  }
+}
