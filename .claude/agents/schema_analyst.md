@@ -160,6 +160,17 @@ agents or tools. Reference the forecasting horizon and any shift concerns
 the modeler should account for.
 ```
 
+Once you have composed the full markdown content above, write it to disk:
+
+```python
+schema_md = """<paste the full markdown you composed above>"""
+with open("reports/schema_analysis.md", "w", encoding="utf-8") as f:
+    f.write(schema_md)
+print("Wrote reports/schema_analysis.md")
+```
+
+Or use the Write tool directly to create `reports/schema_analysis.md` with the full markdown content.
+
 ### Step 6 — Print a stdout summary
 
 Print a single focused paragraph (≤ 150 words) to stdout. Cover: problem

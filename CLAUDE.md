@@ -12,25 +12,15 @@ all within **2 hours wall-clock** and **1,000,000 tokens** (input + output combi
 ## Trigger phrases
 
 Start the workflow immediately when the user says any of:
-- "Do the data analysis"
-- "Analyze the data"
-- "Run the pipeline"
-- "Start the analysis"
-- any close paraphrase of the above
-
-Examples of acceptable triggers:
 - "Do the data analysis" (most common)
-- "Run the data analysis"
+- "Run the data analysis" / "Run the pipeline"
 - "Analyze the data"
 - "Perform the data analysis"
-- "Execute the pipeline"
-- "Begin the analysis"
-- "Process the data"
-- Any natural language expression of intent to run the autonomous 
-  data analysis pipeline
+- "Execute the pipeline" / "Execute the analysis"
+- "Start the analysis" / "Begin the analysis"
+- Any natural language expression of intent to run the autonomous data analysis pipeline
 
-Do not ask clarifying questions. Do not wait. Begin at Step 1 of 
-the workflow.
+Do not ask clarifying questions. Do not wait. Begin at Step 1 of the workflow.
 
 ---
 
@@ -78,7 +68,7 @@ one-page `report.pdf` explaining the failure, then stop.
 
 ### Step 2 — feature_engineer
 
-After schema_analyst completes, invoke the feature_engineer sub-agent using the Agent tool.
+After schema_analyst completes, invoke the feature_engineer sub-agent using the Task tool.
 Wait for it to write `reports/features.json` before proceeding.
 
 ```
@@ -99,7 +89,7 @@ Log the fallback in stdout and continue to the modeler with whatever feature fil
 
 ### Step 3 — modeler
 
-Invoke the modeler sub-agent via the Agent tool. Wait for it to write
+Invoke the modeler sub-agent via the Task tool. Wait for it to write
 `reports/model_results.json`, `reports/predictions.csv`, AND
 `reports/modeler_was_here.txt`. Do not proceed until the marker file exists.
 Do NOT perform modeling inline — always delegate to the modeler sub-agent.
@@ -126,7 +116,7 @@ using Python directly (do not invoke another agent), log the fallback, and conti
 
 ### Step 3.5 — validator
 
-Invoke the validator sub-agent via the Agent tool after modeler completes.
+Invoke the validator sub-agent via the Task tool after modeler completes.
 Wait for it to write `reports/validator_review.json` AND
 `reports/validator_was_here.txt`. Do not proceed until the marker file exists.
 Do NOT perform validation inline — always delegate to the validator sub-agent.
@@ -193,7 +183,7 @@ If this step fails: write a minimal `reports/critic_review.json` with
 
 ### Step 4 — submission_writer
 
-Invoke the submission_writer sub-agent via the Agent tool. Wait for it to write
+Invoke the submission_writer sub-agent via the Task tool. Wait for it to write
 `submission.csv` AND `reports/submission_writer_was_here.txt`. Do not proceed until
 the marker file exists. Do NOT write submission.csv inline — always delegate to the
 submission_writer sub-agent.
@@ -217,7 +207,7 @@ logged to stdout.
 
 ### Step 5 — report_writer
 
-Invoke the report_writer sub-agent via the Agent tool. Wait for it to write
+Invoke the report_writer sub-agent via the Task tool. Wait for it to write
 `report.pdf` AND `reports/report_writer_was_here.txt`. Do not proceed until
 the marker file exists. Do NOT generate report.pdf inline — always delegate to
 the report_writer sub-agent. Verify the marker file exists; if missing, the
@@ -254,7 +244,9 @@ final metric from `reports/model_results.json`.
 | submission_writer | 10 min | Should be fast; escalate if it stalls |
 | report_writer | 20 min | Reduce to text-only PDF if time is short |
 | Buffer | 15 min | Reserved for retries and fallback logic |
-| **Total** | **140 min** | Hard limit: 120 min; 20 min slack in buffer |
+| **Total** | **140 min** | Nominal total assuming no retune cycle; phases must compress if falling behind the 120-minute wall-clock limit |
+
+If critic triggers a retune, modeler + validator + critic re-run, adding ~75 minutes. Subsequent phases must reduce to their fallback variants if this happens.
 
 **Self-pacing rule**: After each phase, estimate remaining wall-clock time.
 If ≥ 75 % of the token budget or time budget is consumed and fewer than
@@ -265,11 +257,15 @@ fallback variants immediately.
 
 ## Tools available
 
-| Tool | Usage |
-|------|-------|
-| `tools/profile_data.py` | Profiles a data directory; outputs `profile.json` with problem type, group/time/target columns, per-column stats, KS shift flags, and image detection. Run with `--data-dir data/ --output reports/profile.json`. |
-
-Additional tools will be documented here as they are built.
+| Tool | Invoked by | Usage |
+|------|------------|-------|
+| `tools/profile_data.py` | schema_analyst | Profiles a data directory; outputs `reports/profile.json` with problem type, group/time/target columns, per-column stats, KS shift flags, and image detection. Run with `--data-dir data/ --output reports/profile.json`. |
+| `tools/feature_engineering.py` | feature_engineer | Dataset-agnostic panel feature engineering. Reads `reports/profile.json` for schema; adapts lag/rolling depths to available training history. Writes `data/features_train.parquet`, `data/features_val.parquet`, `reports/features.json`, `reports/feature_engineer_was_here.txt`. |
+| `tools/run_modeler.py` | modeler | LightGBM training with problem-type-aware CV (GroupKFold, StratifiedKFold, or KFold) and Optuna hyperparameter tuning. Writes `reports/model_results.json`, `reports/predictions.csv`, `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`. |
+| `tools/validate.py` | validator | CV integrity and leakage audit. Computes purged walk-forward MAE and compares to reported CV MAE. Writes `reports/validator_review.json`, `reports/validator_was_here.txt`. Run with `--repo-root PATH`. |
+| `tools/run_critic.py` | critic | 5-check quality review covering CV gap, prediction bias/variance, feature concentration, and walk-forward plausibility. Writes `reports/critic_review.json`, `reports/critic_was_here.txt`, and optionally `reports/critic_retune_requested.json`. |
+| `tools/build_submission.py` | submission_writer | Validates predictions against `data/sample_submission.csv` and writes `submission.csv` at the repo root. Renames `predicted_target` to the actual target column name. Run with `--repo-root PATH`. |
+| `tools/generate_report.py` | report_writer | Assembles `report.pdf` from `reports/` artefacts using reportlab. Includes methodology, feature importance, prediction diagnostics, and limitations sections. |
 
 ---
 
@@ -335,9 +331,10 @@ Non-fatal. Write a minimal report directly.
 
 ## What NOT to do
 
-- **Do not improvise sub-agents** not registered in `.claude/agents/`.
-  If a sub-agent file does not exist, implement its logic as inline Python/bash
-  and note the gap — do not invent a new `.md` agent on the fly.
+- **Do not create new sub-agent definitions** (`.md` files in `.claude/agents/`) for
+  tasks not already registered. If a registered sub-agent fails or is missing, implement
+  its fallback logic inline using Python or bash — this is allowed and expected. What is
+  forbidden is inventing and registering a novel agent on the fly to handle a gap.
 - **Do not write `submission.csv` directly** without going through `submission_writer`.
   The submission_writer validates column names, row counts, and value ranges.
   The only exception is the fatal-failure fallback described above.
