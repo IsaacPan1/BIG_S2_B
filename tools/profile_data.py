@@ -263,6 +263,60 @@ def build_val_df(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(list(frames.values()), ignore_index=True)
 
 
+def build_file_paths(
+    train_files: list[str],
+    val_files: list[str],
+    submission_files: list[str],
+    target_col: str | None,
+    csvs: dict[str, pd.DataFrame],
+) -> dict:
+    """Determine which file serves each role in the pipeline.
+
+    Returns a dict understood by all downstream tools:
+      train_data        — primary file with training features (may also contain target)
+      train_target      — file that has the target column; equals train_data when the
+                          dataset uses a combined-file convention (e.g. energy_load)
+      val_features      — validation feature file (no target column)
+      sample_submission — submission template
+      train_target_in_combined_file — True when target lives in the same file as the
+                          training covariates (combined convention)
+      target_column     — copy of target_col for downstream convenience
+    """
+    target_files  = [
+        f for f in train_files
+        if target_col and target_col in csvs.get(f, pd.DataFrame()).columns
+    ]
+    cov_only_files = [f for f in train_files if f not in target_files]
+
+    if cov_only_files:
+        # Split convention: separate covariate and target files
+        train_data   = cov_only_files[0]
+        train_target = target_files[0] if target_files else train_files[0]
+        combined     = False
+    elif target_files:
+        # Combined convention: single file holds features + target
+        train_data   = target_files[0]
+        train_target = target_files[0]
+        combined     = True
+    elif train_files:
+        train_data   = train_files[0]
+        train_target = train_files[0]
+        combined     = True
+    else:
+        train_data   = None
+        train_target = None
+        combined     = True
+
+    return {
+        "train_data":                    train_data,
+        "train_target":                  train_target,
+        "val_features":                  val_files[0] if val_files else None,
+        "sample_submission":             submission_files[0] if submission_files else None,
+        "train_target_in_combined_file": combined,
+        "target_column":                 target_col,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 3.  Target column inference (fallback when DATA_DESCRIPTION.md is silent)
 # ---------------------------------------------------------------------------
@@ -875,7 +929,16 @@ def main() -> None:
         all_dfs = list(train_frames.values()) + list(val_frames.values())
         img_info["linkage_column"] = find_linkage_column(all_dfs, img_basenames)
 
-    # 12. Assemble profile
+    # 12. Build file_paths section
+    file_paths = build_file_paths(
+        file_split["train_files"],
+        file_split["val_files"],
+        file_split.get("submission_files", []),
+        target_col,
+        csvs,
+    )
+
+    # 13. Assemble profile
     profile: dict[str, Any] = {
         "data_description_parsed": {
             k: v for k, v in desc.items() if k != "found"
@@ -901,14 +964,15 @@ def main() -> None:
         "n_val_rows":               len(val_df),
         "train_files":              file_split["train_files"],
         "val_files":                file_split["val_files"],
+        "file_paths":               file_paths,
         "image_data":               img_info,
         "warnings":                 warns,
     }
 
-    # 13. Print summary
+    # 14. Print summary
     print_summary(profile)
 
-    # 14. Write JSON
+    # 15. Write JSON
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:

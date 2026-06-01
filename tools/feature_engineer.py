@@ -1,5 +1,8 @@
 """
-Feature engineering for the panel retail sales forecasting task.
+Feature engineering for panel forecasting — dataset-agnostic.
+
+Reads reports/profile.json for schema and file_paths so it works with any
+dataset convention (combined train.csv or split covariates_train + target_train).
 
 Outputs:
   data/features_train.parquet
@@ -15,31 +18,70 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-BASE    = Path(r"C:\Users\isaac\OneDrive\Desktop\award_B")
+BASE    = Path(__file__).resolve().parent.parent
 DATA    = BASE / "data"
 REPORTS = BASE / "reports"
 
+# ── 0. Load profile ───────────────────────────────────────────────────────────
+with open(REPORTS / "profile.json") as _f:
+    _profile = json.load(_f)
+
+_target_col = _profile["target_col"]
+_group_cols = _profile["group_cols"]
+_time_col   = _profile["time_col"]
+_fp         = _profile.get("file_paths", {})
+_combined   = _fp.get("train_target_in_combined_file", None)
+
+def _load_csv(fname, fallbacks):
+    for n in ([fname] if fname else []) + fallbacks:
+        p = DATA / n
+        if p.exists():
+            return pd.read_csv(p)
+    raise FileNotFoundError(f"Data file not found (tried {[fname]+fallbacks})")
+
 # ── 1. Load ───────────────────────────────────────────────────────────────────
 print("Loading data...")
-cov_train = pd.read_csv(DATA / "covariates_train.csv")
-tgt_train = pd.read_csv(DATA / "target_train.csv")
-cov_val   = pd.read_csv(DATA / "covariates_val.csv")
-print(f"  cov_train {cov_train.shape}, tgt_train {tgt_train.shape}, cov_val {cov_val.shape}")
+_train_data_file   = _fp.get("train_data")
+_train_target_file = _fp.get("train_target")
+_val_file          = _fp.get("val_features")
+
+if _combined is True or _train_data_file == _train_target_file:
+    cov_train = _load_csv(_train_data_file, ["train.csv"])
+    tgt_train = cov_train
+else:
+    cov_train = _load_csv(_train_data_file,   ["covariates_train.csv"])
+    tgt_train = _load_csv(_train_target_file, ["target_train.csv"])
+
+cov_val = _load_csv(_val_file, ["val_features.csv", "covariates_val.csv"])
+print(f"  cov_train {cov_train.shape}, cov_val {cov_val.shape}")
 
 # ── 2. Merge train; mark val ──────────────────────────────────────────────────
-train = cov_train.merge(tgt_train, on=["store_id", "product_id", "week"], how="left")
+if _combined is True or _train_data_file == _train_target_file:
+    train = cov_train.copy()
+else:
+    _join = [c for c in _group_cols + [_time_col]
+             if c in cov_train.columns and c in tgt_train.columns]
+    train = cov_train.merge(tgt_train[_join + [_target_col]], on=_join, how="left")
 val   = cov_val.copy()
-val["weekly_sales"] = np.nan
+val[_target_col] = np.nan
 
-# Stack into a single panel sorted by group + time
-full = pd.concat([train, val], ignore_index=True)
-full = full.sort_values(["store_id", "product_id", "week"]).reset_index(drop=True)
-print(f"  stacked full: {full.shape}, weeks {full['week'].min()}–{full['week'].max()}")
+# Keep backward-compat aliases used by the rest of the script
+_TARGET      = _target_col
+_GROUP_COLS  = _group_cols
+_TIME_COL    = _time_col
 
-# ── 3. Label-encode group columns ─────────────────────────────────────────────
-print("Encoding groups...")
-full["store_enc"]   = full["store_id"].astype("category").cat.codes.astype(np.int16)
-full["product_enc"] = full["product_id"].astype("category").cat.codes.astype(np.int16)
+# Delegate to the canonical dataset-agnostic feature engineering script.
+# This script's header already validated file loading (above); the canonical
+# script re-reads profile.json and handles all panel + cross-sectional paths.
+import subprocess, sys as _sys
+print("Delegating to tools/feature_engineering.py ...")
+_result = subprocess.run(
+    [_sys.executable, str(BASE / "tools" / "feature_engineering.py")],
+    cwd=str(BASE),
+)
+_sys.exit(_result.returncode)
+
+# (dead code below this point — kept for reference only; sys.exit above fires first)
 
 # ── 4. Trig seasonality (week mod 52) ─────────────────────────────────────────
 print("Trig seasonality...")

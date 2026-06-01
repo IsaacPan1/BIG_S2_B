@@ -12,25 +12,46 @@ warnings.filterwarnings('ignore')
 
 os.makedirs('reports', exist_ok=True)
 
-# ─── Load data ────────────────────────────────────────────────────────────────
-print("Loading data...")
-cov_train  = pd.read_csv('data/covariates_train.csv')
-target_trn = pd.read_csv('data/target_train.csv')
-cov_val    = pd.read_csv('data/covariates_val.csv')
-
+# ─── Load profile ─────────────────────────────────────────────────────────────
 with open('reports/profile.json') as f:
     profile = json.load(f)
 
-TARGET    = profile['target_col']      # 'weekly_sales'
-GRP_COLS  = profile['group_cols']      # ['store_id', 'product_id']
-TIME_COL  = profile['time_col']        # 'week'
-N_VAL     = profile['n_val_rows']      # 15000
+TARGET   = profile['target_col']
+GRP_COLS = profile['group_cols']
+TIME_COL = profile['time_col']
+N_VAL    = profile['n_val_rows']
+fp       = profile.get('file_paths', {})
 
-train = cov_train.merge(
-    target_trn[GRP_COLS + [TIME_COL, TARGET]],
-    on=GRP_COLS + [TIME_COL], how='left'
-)
-train = train.sort_values(GRP_COLS + [TIME_COL]).reset_index(drop=True)
+# ─── Load data (dataset-agnostic: handles combined or split file conventions) ─
+print("Loading data...")
+
+def _read(fname, fallbacks):
+    for n in ([fname] if fname else []) + fallbacks:
+        if n and os.path.exists(f'data/{n}'):
+            return pd.read_csv(f'data/{n}')
+    raise FileNotFoundError(f"Data file not found (tried {[fname]+fallbacks})")
+
+combined = fp.get('train_target_in_combined_file', None)
+if combined is True or fp.get('train_data') == fp.get('train_target'):
+    _train_raw = _read(fp.get('train_data'), ['train.csv'])
+    cov_train  = _train_raw
+    target_trn = _train_raw
+else:
+    cov_train  = _read(fp.get('train_data'),   ['covariates_train.csv'])
+    target_trn = _read(fp.get('train_target'), ['target_train.csv'])
+
+cov_val = _read(fp.get('val_features'), ['covariates_val.csv', 'val_features.csv'])
+
+# Build merged training frame
+if combined is True or fp.get('train_data') == fp.get('train_target'):
+    train = cov_train.copy()
+else:
+    train = cov_train.merge(
+        target_trn[GRP_COLS + [TIME_COL, TARGET]],
+        on=GRP_COLS + [TIME_COL], how='left'
+    )
+
+train   = train.sort_values(GRP_COLS + [TIME_COL]).reset_index(drop=True)
 cov_val = cov_val.sort_values(GRP_COLS + [TIME_COL]).reset_index(drop=True)
 print(f"Train: {train.shape}, Val: {cov_val.shape}")
 

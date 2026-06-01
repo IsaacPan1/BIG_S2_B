@@ -36,6 +36,36 @@ import pytest
 REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO / "tools"))
 
+
+# ── Convention-detection helper ──────────────────────────────────────────────
+
+def _load_train_df(dataset_dir: Path, target_col: str,
+                   id_cols: list[str]) -> pd.DataFrame:
+    """Load training features + target for a practice dataset.
+
+    Handles both conventions:
+      - split: covariates_train.csv + target_train.csv (retail_sales, medical_imaging)
+      - combined: train.csv with target embedded (energy_load)
+    """
+    target_csv   = dataset_dir / "target_train.csv"
+    combined_csv = dataset_dir / "train.csv"
+    cov_csv      = dataset_dir / "covariates_train.csv"
+
+    if combined_csv.exists():
+        df = pd.read_csv(combined_csv)
+        if target_col in df.columns:
+            return df
+
+    if cov_csv.exists() and target_csv.exists():
+        cov = pd.read_csv(cov_csv)
+        tgt = pd.read_csv(target_csv)
+        join_cols = [c for c in id_cols if c in cov.columns and c in tgt.columns]
+        return cov.merge(tgt[join_cols + [target_col]], on=join_cols, how="left")
+
+    raise FileNotFoundError(
+        f"Cannot assemble training DataFrame for {dataset_dir}"
+    )
+
 from validate import (  # noqa: E402  (module is in tools/)
     CV_GAP_CRITICAL_PCT,
     CV_GAP_WARNING_PCT,
@@ -532,9 +562,7 @@ class TestRetailSalesValidator:
     def retail_review(self, tmp_path_factory):
         tmp = tmp_path_factory.mktemp("retail_validate")
         data = PRACTICE / "retail_sales"
-        cov   = pd.read_csv(data / "covariates_train.csv")
-        tgt   = pd.read_csv(data / "target_train.csv")
-        train = cov.merge(tgt, on=["store_id", "product_id", "week"])
+        train = _load_train_df(data, "weekly_sales", ["store_id", "product_id", "week"])
 
         num_cols = ["price", "promotion_active", "holiday_flag", "weather_index"]
         train_feat = train[["store_id", "product_id", "week", "weekly_sales"] + num_cols].copy()
@@ -649,9 +677,7 @@ class TestMedicalImagingValidator:
     def medical_review(self, tmp_path_factory):
         tmp = tmp_path_factory.mktemp("medical_validate")
         data = PRACTICE / "medical_imaging"
-        cov  = pd.read_csv(data / "covariates_train.csv")
-        tgt  = pd.read_csv(data / "target_train.csv")
-        train = cov.merge(tgt, on="patient_id")
+        train = _load_train_df(data, "hospitalization_days", ["patient_id"])
 
         num_cols = ["age", "prior_admissions", "comorbidity_score"]
         train_feat = train[["patient_id", "hospitalization_days"] + num_cols].copy()

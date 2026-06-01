@@ -388,15 +388,42 @@ final_hparams = {"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 2
 optuna_trials = 0
 ```
 
-If even LightGBM fails: fall back to group-mean predictions (still use `predicted_target`):
+If even LightGBM fails: fall back to group-mean predictions (still use `predicted_target`).
+Read file paths from `profile["file_paths"]` so this works for any dataset convention
+(combined train.csv like energy_load, or split files like retail_sales):
 ```python
+import os
 with open("reports/profile.json") as f:
     profile = json.load(f)
-train_raw = pd.read_csv("data/target_train.csv")
-val_ids   = pd.read_csv("data/covariates_val.csv")[profile["group_cols"] + [profile["time_col"]]]
+fp = profile.get("file_paths", {})
+
+# Load training target — use file_paths if available, else detect by convention
+_train_file = fp.get("train_target") or fp.get("train_data")
+if _train_file and os.path.exists(f"data/{_train_file}"):
+    train_raw = pd.read_csv(f"data/{_train_file}")
+elif os.path.exists("data/target_train.csv"):
+    train_raw = pd.read_csv("data/target_train.csv")
+elif os.path.exists("data/train.csv"):
+    train_raw = pd.read_csv("data/train.csv")
+else:
+    raise FileNotFoundError("Cannot find training data for group-mean fallback")
+
+# Load validation features — use file_paths if available, else detect by convention
+_val_file = fp.get("val_features")
+if _val_file and os.path.exists(f"data/{_val_file}"):
+    val_df = pd.read_csv(f"data/{_val_file}")
+elif os.path.exists("data/covariates_val.csv"):
+    val_df = pd.read_csv("data/covariates_val.csv")
+elif os.path.exists("data/val_features.csv"):
+    val_df = pd.read_csv("data/val_features.csv")
+else:
+    raise FileNotFoundError("Cannot find validation features for group-mean fallback")
+
+val_id_cols = profile["group_cols"] + ([profile["time_col"]] if profile.get("time_col") else [])
+val_ids = val_df[val_id_cols]
 group_mean = train_raw.groupby(profile["group_cols"])[profile["target_col"]].mean().rename("predicted_target").reset_index()
 preds_df = val_ids.merge(group_mean, on=profile["group_cols"], how="left")
-global_mean = train_raw[profile["target_col"]].mean()
+global_mean = float(train_raw[profile["target_col"]].mean()) if len(train_raw) > 0 else 0.0
 preds_df["predicted_target"] = preds_df["predicted_target"].fillna(global_mean)
 preds_df = preds_df.reset_index(drop=True)
 preds_df.insert(0, "row_id", range(len(preds_df)))

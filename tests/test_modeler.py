@@ -33,6 +33,42 @@ from sklearn.preprocessing import LabelEncoder
 REPO     = Path(__file__).parent.parent
 PRACTICE = REPO / "practice_data"
 
+
+# ---------------------------------------------------------------------------
+# Convention-detection helper
+# ---------------------------------------------------------------------------
+
+def _load_train_target_series(dataset_dir: Path, target_col: str) -> pd.Series:
+    """Load the training target column regardless of file convention.
+
+    Supports:
+      - split convention: target_train.csv (retail_sales, medical_imaging)
+      - combined convention: train.csv with target embedded (energy_load)
+    """
+    target_csv = dataset_dir / "target_train.csv"
+    if target_csv.exists():
+        df = pd.read_csv(target_csv)
+        if target_col in df.columns:
+            return df[target_col]
+
+    combined_csv = dataset_dir / "train.csv"
+    if combined_csv.exists():
+        df = pd.read_csv(combined_csv)
+        if target_col in df.columns:
+            return df[target_col]
+
+    # Last resort: scan all CSVs in the directory
+    for csv_path in sorted(dataset_dir.glob("*.csv")):
+        if "submission" in csv_path.name or "val" in csv_path.name:
+            continue
+        df = pd.read_csv(csv_path)
+        if target_col in df.columns and df[target_col].notna().any():
+            return df[target_col]
+
+    raise FileNotFoundError(
+        f"Cannot find training target column '{target_col}' in {dataset_dir}"
+    )
+
 # ---------------------------------------------------------------------------
 # Per-dataset thresholds
 # Derived by running the current pipeline on each practice dataset;
@@ -171,7 +207,7 @@ def retail_truth():
 
 @pytest.fixture(scope="class")
 def retail_train_target():
-    return pd.read_csv(PRACTICE / "retail_sales" / "target_train.csv")["weekly_sales"]
+    return _load_train_target_series(PRACTICE / "retail_sales", "weekly_sales")
 
 
 class TestRetailSalesModeler:
@@ -316,7 +352,7 @@ def energy_predictions_and_truth():
 
 @pytest.fixture(scope="class")
 def energy_train_target():
-    return pd.read_csv(PRACTICE / "energy_load" / "train.csv")["load_mw"]
+    return _load_train_target_series(PRACTICE / "energy_load", "load_mw")
 
 
 class TestEnergyLoadPipeline:
@@ -446,9 +482,7 @@ def medical_predictions_and_truth():
 
 @pytest.fixture(scope="class")
 def medical_train_target():
-    return pd.read_csv(PRACTICE / "medical_imaging" / "target_train.csv")[
-        "hospitalization_days"
-    ]
+    return _load_train_target_series(PRACTICE / "medical_imaging", "hospitalization_days")
 
 
 class TestMedicalImagingPipeline:
