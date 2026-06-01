@@ -301,9 +301,10 @@ preds_df.to_csv("reports/predictions.csv", index=False)
 ALWAYS write reports/predictions.csv with valid (non-NaN) values for all validation rows, even if the model is degenerate. ALWAYS write reports/modeler_was_here.txt.
 
 ## Output
-Three files:
+Four files:
 - `reports/predictions.csv` — columns: `row_id`, identifier columns, `predicted_target` (NEVER the raw target name)
-- `reports/model_results.json`
+- `reports/oof_predictions.csv` — out-of-fold predictions on training set: identifier columns, `fold`, `predicted_target` (written by Step 7c; required by validator)
+- `reports/model_results.json` — includes `feature_importance_all` (all features, not just top 10), `oof_mae`, `oof_cv_scheme`
 - `reports/modeler_was_here.txt`
 
 ## What you do NOT do
