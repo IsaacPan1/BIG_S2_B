@@ -313,6 +313,27 @@ except (ValueError, TypeError):
 
 _tc = _time_col_numeric if _is_datetime_time else time_col
 
+# ── Detect time granularity ────────────────────────────────────────────────────
+def _detect_granularity() -> str:
+    """Return 'hourly', 'daily', 'weekly', or 'monthly' from median inter-obs step."""
+    ref = train.sort_values(group_cols + [_tc]) if group_cols else train.sort_values(_tc)
+    if group_cols:
+        steps = ref.groupby(group_cols)[_tc].diff().dropna().abs()
+    else:
+        steps = ref[_tc].diff().dropna().abs()
+    med = float(steps.median()) if len(steps) > 0 else 1.0
+    if _is_datetime_time:
+        # _tc units are hours since epoch
+        if med < 2:    return "hourly"
+        if med < 48:   return "daily"
+        if med < 216:  return "weekly"
+        return "monthly"
+    # Integer time column (e.g. retail week numbers) — assume weekly cadence
+    return "weekly"
+
+_granularity = _detect_granularity()
+print(f"Detected time granularity: {_granularity}")
+
 train_time_max = int(train[_tc].max())
 min_periods    = int(train.groupby(group_cols)[_tc].count().min()) if group_cols else len(train)
 print(f"min_periods per group: {min_periods}   train_time_max: {train_time_max}")
@@ -380,6 +401,87 @@ else:
     full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD) / PERIOD)
 _reg("seasonality", [f"{time_col}_sin", f"{time_col}_cos",
                      f"{time_col}_sin2", f"{time_col}_cos2"])
+
+# ── 2b. Granularity-specific seasonality (adds to existing, does not replace) ──
+if _granularity == "hourly" and _is_datetime_time:
+    _dt = pd.to_datetime(full[time_col])
+    _hod = _dt.dt.hour.astype(float)
+    _dow_g = _dt.dt.dayofweek.astype(float)
+    if "hour_sin" not in full.columns:
+        full["hour_sin"]  = np.sin(2 * np.pi * _hod / 24)
+        full["hour_cos"]  = np.cos(2 * np.pi * _hod / 24)
+        full["hour_sin2"] = np.sin(4 * np.pi * _hod / 24)
+        full["hour_cos2"] = np.cos(4 * np.pi * _hod / 24)
+        _reg("seasonality", ["hour_sin", "hour_cos", "hour_sin2", "hour_cos2"])
+    if "dow_sin" not in full.columns:
+        full["dow_sin"] = np.sin(2 * np.pi * _dow_g / 7)
+        full["dow_cos"] = np.cos(2 * np.pi * _dow_g / 7)
+        _reg("seasonality", ["dow_sin", "dow_cos"])
+    print("Added hourly seasonality: hour_sin/cos/sin2/cos2 + dow_sin/cos")
+
+    # Per-(group, hour_of_day) and per-(group, day_of_week) target baselines.
+    # These encode the time-of-day pattern per entity from training data, giving
+    # the model strong signal even when lag features are imputed for far-out val rows.
+    _dt_train_aug = pd.to_datetime(train[time_col])
+    _tr_aug = train.copy()
+    _tr_aug["_hod"] = _dt_train_aug.dt.hour.values
+    _tr_aug["_dow"] = _dt_train_aug.dt.dayofweek.values
+    full["_hod"] = _dt.dt.hour.values
+    full["_dow"] = _dt.dt.dayofweek.values
+
+    for _g in group_cols:
+        _hod_mc = f"{_g}_hour_mean_{target_col}"
+        _hod_sc = f"{_g}_hour_std_{target_col}"
+        _dow_mc = f"{_g}_dow_mean_{target_col}"
+        _dow_sc = f"{_g}_dow_std_{target_col}"
+        if _hod_mc not in full.columns:
+            _hod_stats = (_tr_aug.groupby([_g, "_hod"])[target_col]
+                         .agg(**{_hod_mc: "mean", _hod_sc: "std"})
+                         .reset_index())
+            full = full.merge(_hod_stats[[_g, "_hod", _hod_mc, _hod_sc]],
+                              on=[_g, "_hod"], how="left")
+            _reg("group_baselines", [_hod_mc, _hod_sc])
+        if _dow_mc not in full.columns:
+            _dow_stats = (_tr_aug.groupby([_g, "_dow"])[target_col]
+                         .agg(**{_dow_mc: "mean", _dow_sc: "std"})
+                         .reset_index())
+            full = full.merge(_dow_stats[[_g, "_dow", _dow_mc, _dow_sc]],
+                              on=[_g, "_dow"], how="left")
+            _reg("group_baselines", [_dow_mc, _dow_sc])
+
+    full.drop(columns=["_hod", "_dow"], inplace=True)
+    print(f"Added hourly group baselines: (group×hour) and (group×dow) mean/std")
+
+elif _granularity == "daily" and _is_datetime_time:
+    _dt = pd.to_datetime(full[time_col])
+    _dow_g = _dt.dt.dayofweek.astype(float)
+    _moy = _dt.dt.month.astype(float)
+    _woy = _dt.dt.isocalendar().week.astype(float).values
+    if "dow_sin" not in full.columns:
+        full["dow_sin"] = np.sin(2 * np.pi * _dow_g / 7)
+        full["dow_cos"] = np.cos(2 * np.pi * _dow_g / 7)
+        _reg("seasonality", ["dow_sin", "dow_cos"])
+    if "month_sin" not in full.columns:
+        full["month_sin"] = np.sin(2 * np.pi * _moy / 12)
+        full["month_cos"] = np.cos(2 * np.pi * _moy / 12)
+        _reg("seasonality", ["month_sin", "month_cos"])
+    if "woy_sin" not in full.columns:
+        full["woy_sin"] = np.sin(2 * np.pi * _woy / 52)
+        full["woy_cos"] = np.cos(2 * np.pi * _woy / 52)
+        _reg("seasonality", ["woy_sin", "woy_cos"])
+    print("Added daily seasonality: dow + month + woy sin/cos")
+
+elif _granularity == "monthly" and _is_datetime_time:
+    _dt = pd.to_datetime(full[time_col])
+    _moy = _dt.dt.month.astype(float)
+    if "month_sin" not in full.columns:
+        full["month_sin"] = np.sin(2 * np.pi * _moy / 12)
+        full["month_cos"] = np.cos(2 * np.pi * _moy / 12)
+        _reg("seasonality", ["month_sin", "month_cos"])
+    if "quarter" not in full.columns:
+        full["quarter"] = _dt.dt.quarter.astype(np.int8)
+        _reg("seasonality", ["quarter"])
+    print("Added monthly seasonality: month_sin/cos + quarter")
 
 # ── 3. Time-derived features (week_of_year, quarter, month, linear trend) ─────
 t_num = full[_tc]   # always numeric
@@ -503,8 +605,8 @@ if _hourly_extra_lags:
     LAG_PERIODS = LAG_PERIODS + _hourly_extra_lags
     _reg("lags", [f"lag_{k}" for k in _hourly_extra_lags])
 
-# Cyclical encoding of hour_of_day (24-hour cycle)
-if "hour_of_day" in full.columns:
+# Cyclical encoding of hour_of_day (24-hour cycle) — skipped if already added by 2b
+if "hour_of_day" in full.columns and "hour_sin" not in full.columns:
     h = full["hour_of_day"]
     full["hour_sin"] = np.sin(2 * np.pi * h / 24)
     full["hour_cos"] = np.cos(2 * np.pi * h / 24)
@@ -512,8 +614,8 @@ if "hour_of_day" in full.columns:
     full["hour_cos2"] = np.cos(4 * np.pi * h / 24)
     _reg("seasonality", ["hour_sin", "hour_cos", "hour_sin2", "hour_cos2"])
 
-# Cyclical encoding of day_of_week (7-day cycle)
-if "day_of_week" in full.columns:
+# Cyclical encoding of day_of_week (7-day cycle) — skipped if already added by 2b
+if "day_of_week" in full.columns and "dow_sin" not in full.columns:
     d = full["day_of_week"]
     full["dow_sin"] = np.sin(2 * np.pi * d / 7)
     full["dow_cos"] = np.cos(2 * np.pi * d / 7)
@@ -531,25 +633,71 @@ if len(group_cols) == 1:
     full[std_col] = full[g0].map(train.groupby(g0)[target_col].std())
     _reg("group_baselines", [std_col])
 
-# ── 13. Fill val NaN lags/roll with last-known training value per group ────────
-print("Filling val NaN lag/roll features with last-known training value…")
+# ── 13. Fill val NaN lags/roll features ──────────────────────────────────────
+print("Filling val NaN lag/roll features…")
 last_known = (full.loc[full[_tc] == train_time_max, group_cols + [target_col]]
               .rename(columns={target_col: "_lk"})
               .set_index(group_cols))
 full = full.join(last_known, on=group_cols)
 
-fill_mean_cols = [f"lag_{k}" for k in LAG_PERIODS] + [f"roll_mean_{w}" for w in ROLL_WINDOWS]
-# LAG_PERIODS may have been extended by the hourly supplement — ensure all are included
-for col in fill_mean_cols:
-    mask = vl_mask & full[col].isna()
-    if mask.sum():
-        full.loc[mask, col] = full.loc[mask, "_lk"]
-        print(f"  {col}: filled {int(mask.sum())} NaN")
+# For hourly panel data: impute NaN lag_k with mean(target | group, hour=(h-k)%24)
+# This is far more accurate than using the last training value when predicting many
+# hours ahead, because it preserves the intra-day load pattern in the imputations.
+if _granularity == "hourly" and _is_datetime_time and len(group_cols) == 1:
+    _g0 = group_cols[0]
+    _tr_hod_v = pd.to_datetime(train[time_col]).dt.hour.values
+    _full_hod_v = pd.to_datetime(full[time_col]).dt.hour.values
+    _full_grp_v = full[_g0].values
+    # Build (group_val, hod) → mean target dict from training only
+    _hod_lists: dict = {}
+    for _gv, _h, _tv in zip(train[_g0].values, _tr_hod_v, train[target_col].values):
+        _hk = (_gv, int(_h))
+        _hod_lists.setdefault(_hk, []).append(_tv)
+    _hod_mean_d: dict = {k: float(np.mean(v)) for k, v in _hod_lists.items()}
+    _lk_arr = full["_lk"].values
 
-for col in [f"roll_std_{w}" for w in ROLL_WINDOWS]:
-    mask = vl_mask & full[col].isna()
-    if mask.sum():
-        full.loc[mask, col] = 0.0
+    for k in LAG_PERIODS:
+        lag_col = f"lag_{k}"
+        if lag_col not in full.columns:
+            continue
+        nan_mask_bool = (vl_mask & full[lag_col].isna()).values
+        if not nan_mask_bool.any():
+            continue
+        nan_idx = np.where(nan_mask_bool)[0]
+        fill_vals = np.array([
+            _hod_mean_d.get(
+                (_full_grp_v[i], int((_full_hod_v[i] - k) % 24)),
+                float(_lk_arr[i]) if not np.isnan(_lk_arr[i]) else 0.0
+            )
+            for i in nan_idx
+        ])
+        full.iloc[nan_idx, full.columns.get_loc(lag_col)] = fill_vals
+        print(f"  {lag_col}: filled {len(nan_idx)} NaN (hour-aware)")
+
+    for w in ROLL_WINDOWS:
+        col = f"roll_mean_{w}"
+        mask = vl_mask & full[col].isna()
+        if mask.sum():
+            full.loc[mask, col] = full.loc[mask, "_lk"]
+            print(f"  {col}: filled {int(mask.sum())} NaN")
+    for col in [f"roll_std_{w}" for w in ROLL_WINDOWS]:
+        mask = vl_mask & full[col].isna()
+        if mask.sum():
+            full.loc[mask, col] = 0.0
+
+else:
+    fill_mean_cols = ([f"lag_{k}" for k in LAG_PERIODS]
+                      + [f"roll_mean_{w}" for w in ROLL_WINDOWS])
+    # LAG_PERIODS may have been extended by the hourly supplement
+    for col in fill_mean_cols:
+        mask = vl_mask & full[col].isna()
+        if mask.sum():
+            full.loc[mask, col] = full.loc[mask, "_lk"]
+            print(f"  {col}: filled {int(mask.sum())} NaN")
+    for col in [f"roll_std_{w}" for w in ROLL_WINDOWS]:
+        mask = vl_mask & full[col].isna()
+        if mask.sum():
+            full.loc[mask, col] = 0.0
 
 full.drop(columns=["_lk"], inplace=True)
 
