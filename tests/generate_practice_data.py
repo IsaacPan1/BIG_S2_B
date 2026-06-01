@@ -362,8 +362,86 @@ def make_medical_imaging() -> None:
     print(f"  images/          : {N_PATIENTS} x {IMG_SIZE}x{IMG_SIZE} PNGs")
 
 
+def make_kaggle_style() -> None:
+    """Kaggle subfolder convention: train/ and test/ subdirectories."""
+    print("\nGenerating kaggle_style ...")
+
+    N_PATIENTS = 5
+    N_TRAIN = 10   # time steps 0-9
+    N_VAL = 2      # time steps 10-11
+
+    out = Path("practice_data/kaggle_style")
+    (out / "train").mkdir(parents=True, exist_ok=True)
+    (out / "test").mkdir(parents=True, exist_ok=True)
+    (out / "_truth").mkdir(exist_ok=True)
+
+    patient_ids = [f"p{i+1:03d}" for i in range(N_PATIENTS)]
+    patient_offsets = RNG.uniform(-5, 5, N_PATIENTS)
+
+    rows_train: list[dict] = []
+    rows_val:   list[dict] = []
+    for i, pid in enumerate(patient_ids):
+        for t in range(N_TRAIN):
+            temp = round(36.5 + float(RNG.normal(0, 0.3)), 2)
+            hr = int(70 + RNG.normal(0, 5))
+            dose = round(20 + 0.5*temp + 0.1*hr + patient_offsets[i]
+                         + float(RNG.normal(0, 0.5)), 2)
+            rows_train.append({"patient_id": pid, "time_step": t,
+                               "temperature": temp, "heart_rate": hr, "dose_sys": dose})
+        for t in range(N_TRAIN, N_TRAIN + N_VAL):
+            temp = round(36.5 + float(RNG.normal(0, 0.3)), 2)
+            hr = int(70 + RNG.normal(0, 5))
+            dose = round(20 + 0.5*temp + 0.1*hr + patient_offsets[i]
+                         + float(RNG.normal(0, 0.5)), 2)
+            rows_val.append({"patient_id": pid, "time_step": t,
+                             "temperature": temp, "heart_rate": hr, "dose_sys": dose})
+
+    tr = pd.DataFrame(rows_train)
+    vl = pd.DataFrame(rows_val)
+
+    tr[["patient_id", "time_step", "temperature", "heart_rate"]].to_csv(
+        out / "train" / "covariates.csv", index=False)
+    tr[["patient_id", "time_step", "dose_sys"]].to_csv(
+        out / "train" / "dose_sys_train.csv", index=False)
+    vl[["patient_id", "time_step", "temperature", "heart_rate"]].to_csv(
+        out / "test" / "covariates.csv", index=False)
+
+    sub = vl[["patient_id", "time_step", "dose_sys"]].copy()
+    sub["dose_sys"] = float("nan")
+    sub.to_csv(out / "sample_submission.csv", index=False)
+
+    vl[["patient_id", "time_step", "dose_sys"]].to_csv(
+        out / "_truth" / "val_truth.csv", index=False)
+
+    print(f"  train/covariates.csv     : {len(tr)} rows")
+    print(f"  train/dose_sys_train.csv : {len(tr)} rows")
+    print(f"  test/covariates.csv      : {len(vl)} rows")
+    print(f"  sample_submission.csv    : {len(sub)} rows")
+    print(f"  _truth/val_truth.csv     : {len(vl)} rows")
+
+    # Write DATA_DESCRIPTION.md (idempotent)
+    md = out / "DATA_DESCRIPTION.md"
+    if not md.exists():
+        md.write_text(
+            "# Dose Prediction Dataset\n\n"
+            "Predict systolic dose `dose_sys` for each patient-timestep pair "
+            "in the test set.\n\n"
+            "## Columns\n\n"
+            "| Column | Type | Description |\n"
+            "|--------|------|-------------|\n"
+            "| `patient_id` | string | Patient identifier |\n"
+            "| `time_step` | int | Time step (0-indexed) |\n"
+            "| `temperature` | float | Body temperature (°C) |\n"
+            "| `heart_rate` | int | Heart rate (bpm) |\n"
+            "| `dose_sys` | float | TARGET: Systolic dose (mg) |\n\n"
+            "Predict `dose_sys` for each row in `test/covariates.csv`.\n",
+            encoding="utf-8",
+        )
+
+
 if __name__ == "__main__":
     make_retail_sales()
     make_energy_load()
     make_medical_imaging()
+    make_kaggle_style()
     print("\nAll practice data written.")

@@ -66,10 +66,19 @@ _DATASET_META = {
         "target_col": "hospitalization_days",
         "key_cols": ["patient_id"],
     },
+    "kaggle_style": {
+        "target_col": "dose_sys",
+        "key_cols": ["patient_id", "time_step"],
+    },
 }
 
 
-def run_dataset(dataset: str, verbose: bool = True, run_modeler: bool = True) -> dict:
+def run_dataset(
+    dataset: str,
+    verbose: bool = True,
+    run_modeler: bool = True,
+    run_build_submission: bool = False,
+) -> dict:
     src = PRACTICE_DIR / dataset
     if not src.exists():
         print(f"ERROR: practice_data/{dataset} not found")
@@ -173,7 +182,26 @@ def run_dataset(dataset: str, verbose: bool = True, run_modeler: bool = True) ->
                 if any(kw in line for kw in ["MAE", "OOF", "CV", "val", "COMPLETE", "Trial"]):
                     print(f"  MOD >> {line}")
 
-        # ── Step 4: Score against truth ───────────────────────────────────────
+        # ── Step 4 (optional): build_submission.py ────────────────────────────
+        if run_build_submission:
+            r = subprocess.run(
+                [sys.executable, str(tmp_path / "tools" / "build_submission.py"),
+                 "--repo-root", str(tmp_path)],
+                capture_output=True, text=True, cwd=str(tmp_path), timeout=60,
+            )
+            if r.returncode != 0:
+                print(f"  build_submission.py FAILED:\n{r.stdout[-1000:]}\n{r.stderr[-500:]}")
+                result["error"] = "build_submission failed"
+                return result
+            sub_csv = tmp_path / "submission.csv"
+            if not sub_csv.exists():
+                result["error"] = "submission.csv not produced"
+                return result
+            result["submission_produced"] = True
+            if verbose:
+                print(f"  submission.csv   : {sub_csv.stat().st_size} bytes")
+
+        # ── Step 5: Score against truth ───────────────────────────────────────
         pred_csv = tmp_path / "reports" / "predictions.csv"
         truth_csv = src / "_truth" / "val_truth.csv"
         if not pred_csv.exists():
@@ -181,6 +209,11 @@ def run_dataset(dataset: str, verbose: bool = True, run_modeler: bool = True) ->
             return result
 
         meta = _DATASET_META[dataset]
+        if not truth_csv.exists():
+            if verbose:
+                print(f"  (no _truth/ dir — skipping MAE scoring)")
+            return result
+
         try:
             mae = _score(pred_csv, truth_csv, meta["target_col"], meta["key_cols"])
             result["mae"] = round(mae, 4)
@@ -198,6 +231,8 @@ def main() -> None:
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--features-only", action="store_true",
                         help="Skip modeler, just check feature engineering")
+    parser.add_argument("--build-submission", action="store_true",
+                        help="Also run build_submission.py and verify submission.csv")
     args = parser.parse_args()
 
     datasets = (
@@ -206,7 +241,10 @@ def main() -> None:
 
     results = []
     for ds in datasets:
-        r = run_dataset(ds, verbose=True, run_modeler=not args.features_only)
+        # kaggle_style always runs build_submission to verify the full pipeline
+        do_sub = args.build_submission or ds == "kaggle_style"
+        r = run_dataset(ds, verbose=True, run_modeler=not args.features_only,
+                        run_build_submission=do_sub and not args.features_only)
         results.append(r)
 
     print("\n" + "=" * 60)
@@ -215,7 +253,8 @@ def main() -> None:
     for r in results:
         status = "ERROR" if "error" in r else "OK"
         mae_str = f"  MAE={r['mae']:.4f}" if "mae" in r else ""
-        print(f"  {r['dataset']:25s}: {status}  features={r.get('total_features','?')}{mae_str}")
+        sub_str = "  submission=yes" if r.get("submission_produced") else ""
+        print(f"  {r['dataset']:25s}: {status}  features={r.get('total_features','?')}{mae_str}{sub_str}")
     print("=" * 60)
 
 

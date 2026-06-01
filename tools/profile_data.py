@@ -150,6 +150,95 @@ def load_top_level_csvs(data_dir: Path) -> dict[str, pd.DataFrame]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# 2b.  Kaggle subfolder convention helpers
+# ---------------------------------------------------------------------------
+
+def _detect_convention(data_dir: Path) -> str:
+    """Return 'kaggle_subfolder' if train/ and test/ (or val/) subdirs exist."""
+    if (data_dir / "train").is_dir():
+        if (data_dir / "test").is_dir() or (data_dir / "val").is_dir():
+            return "kaggle_subfolder"
+    return "flat"
+
+
+def _load_csvs_in_dir(directory: Path) -> dict[str, pd.DataFrame]:
+    """Load all *.csv files from a single directory (non-recursive)."""
+    result: dict[str, pd.DataFrame] = {}
+    for p in sorted(directory.glob("*.csv")):
+        try:
+            result[p.name] = pd.read_csv(p)
+        except Exception as exc:
+            _warnings.warn(f"Could not load {directory.name}/{p.name}: {exc}")
+    return result
+
+
+def _discover_kaggle_target_file(
+    train_dir: Path,
+    target_col: str | None,
+    desc: dict,
+) -> str | None:
+    """Discover the target-bearing file inside train/.
+
+    Priority:
+    a. DATA_DESCRIPTION.md mentions a file (by base name) in train/ that has target_col.
+    b. Any *.csv in train/ (other than covariates.csv) that contains target_col.
+    c. Any *.csv in train/ that is not covariates.csv.
+    """
+    # a. Mentioned files in description — try just the basename in case the
+    #    description included subdirectory prefix
+    if target_col:
+        for raw_name in desc.get("mentioned_files", []):
+            fname = Path(raw_name).name   # strip any leading path component
+            p = train_dir / fname
+            if p.exists() and fname.lower() != "covariates.csv":
+                try:
+                    if target_col in pd.read_csv(p, nrows=5).columns:
+                        return fname
+                except Exception:
+                    pass
+
+    # b. Scan all CSVs in train/ for the target column
+    if target_col:
+        for p in sorted(train_dir.glob("*.csv")):
+            if p.name.lower() == "covariates.csv":
+                continue
+            try:
+                if target_col in pd.read_csv(p, nrows=5).columns:
+                    return p.name
+            except Exception:
+                pass
+
+    # c. Any non-covariates CSV
+    for p in sorted(train_dir.glob("*.csv")):
+        if p.name.lower() != "covariates.csv":
+            return p.name
+
+    return None
+
+
+def _build_file_paths_kaggle(
+    train_dir: Path,
+    val_dir: Path,
+    target_file: str | None,
+    data_dir: Path,
+    submission_files: list[str],
+    target_col: str | None,
+) -> dict:
+    """Build file_paths dict for the Kaggle subfolder convention."""
+    td = train_dir.relative_to(data_dir).as_posix()   # "train"
+    vd = val_dir.relative_to(data_dir).as_posix()     # "test" or "val"
+    return {
+        "convention":                    "kaggle_subfolder",
+        "train_data":                    f"{td}/covariates.csv",
+        "train_target":                  f"{td}/{target_file}" if target_file else None,
+        "val_features":                  f"{vd}/covariates.csv",
+        "sample_submission":             submission_files[0] if submission_files else None,
+        "train_target_in_combined_file": False,
+        "target_column":                 target_col,
+    }
+
+
 def identify_files(
     csvs: dict[str, pd.DataFrame],
     target_col: str | None,
@@ -308,6 +397,7 @@ def build_file_paths(
         combined     = True
 
     return {
+        "convention":                    "split" if not combined else "combined",
         "train_data":                    train_data,
         "train_target":                  train_target,
         "val_features":                  val_files[0] if val_files else None,
@@ -866,17 +956,52 @@ def main() -> None:
         warns.append("DATA_DESCRIPTION.md not found — relying on heuristics only.")
     target_col: str | None = desc.get("target_col")
 
-    # 2. Load CSVs
-    csvs = load_top_level_csvs(data_dir)
-    if not csvs:
-        sys.exit(f"ERROR: no CSV files found in {data_dir}")
+    # 2. Detect data-layout convention and load CSVs
+    convention = _detect_convention(data_dir)
 
-    # 3. Classify CSV files into buckets
-    file_split = identify_files(csvs, target_col, desc)
+    if convention == "kaggle_subfolder":
+        _kag_train_dir = data_dir / "train"
+        _kag_val_dir   = (data_dir / "test") if (data_dir / "test").is_dir() \
+                         else (data_dir / "val")
+        top_csvs     = load_top_level_csvs(data_dir)
+        _train_csvs  = _load_csvs_in_dir(_kag_train_dir)
+        _val_csvs    = _load_csvs_in_dir(_kag_val_dir)
+        if not _train_csvs:
+            sys.exit(f"ERROR: no CSV files found in {_kag_train_dir}")
+        _td = _kag_train_dir.name   # "train"
+        _vd = _kag_val_dir.name     # "test" or "val"
+        _train_frames: dict[str, pd.DataFrame] = {
+            f"{_td}/{k}": v for k, v in _train_csvs.items()
+        }
+        _val_frames: dict[str, pd.DataFrame] = {
+            f"{_vd}/{k}": v for k, v in _val_csvs.items()
+        }
+        _sub_files = [
+            n for n in top_csvs
+            if "submission" in n.lower() or "sample" in n.lower()
+        ]
+        csvs: dict[str, pd.DataFrame] = {
+            **top_csvs,
+            **_train_frames,
+            **_val_frames,
+        }
+        file_split: dict[str, Any] = {
+            "train_files":      list(_train_frames),
+            "val_files":        list(_val_frames),
+            "submission_files": _sub_files,
+            "train_frames":     _train_frames,
+            "val_frames":       _val_frames,
+        }
+    else:
+        # Flat convention (split or combined)
+        csvs = load_top_level_csvs(data_dir)
+        if not csvs:
+            sys.exit(f"ERROR: no CSV files found in {data_dir}")
+        file_split = identify_files(csvs, target_col, desc)
+
+    # 3. Build merged DataFrames
     train_frames = file_split["train_frames"]
     val_frames   = file_split["val_frames"]
-
-    # 4. Build merged DataFrames
     train_df = build_train_df(train_frames, target_col)
     val_df   = build_val_df(val_frames)
 
@@ -929,14 +1054,35 @@ def main() -> None:
         all_dfs = list(train_frames.values()) + list(val_frames.values())
         img_info["linkage_column"] = find_linkage_column(all_dfs, img_basenames)
 
-    # 12. Build file_paths section
-    file_paths = build_file_paths(
-        file_split["train_files"],
-        file_split["val_files"],
-        file_split.get("submission_files", []),
-        target_col,
-        csvs,
-    )
+    # 12. Build file_paths section (convention-aware)
+    if convention == "kaggle_subfolder":
+        _target_file = _discover_kaggle_target_file(_kag_train_dir, target_col, desc)
+        file_paths = _build_file_paths_kaggle(
+            _kag_train_dir,
+            _kag_val_dir,
+            _target_file,
+            data_dir,
+            file_split["submission_files"],
+            target_col,
+        )
+    else:
+        file_paths = build_file_paths(
+            file_split["train_files"],
+            file_split["val_files"],
+            file_split.get("submission_files", []),
+            target_col,
+            csvs,
+        )
+
+    # Add images_dir (relative to data_dir) for all conventions
+    if img_info.get("present"):
+        _img_abs = Path(img_info["directory"])
+        try:
+            file_paths["images_dir"] = _img_abs.relative_to(data_dir).as_posix()
+        except ValueError:
+            file_paths["images_dir"] = img_info["directory"]
+    else:
+        file_paths["images_dir"] = None
 
     # 13. Assemble profile
     profile: dict[str, Any] = {

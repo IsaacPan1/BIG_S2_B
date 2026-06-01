@@ -215,3 +215,99 @@ class TestPanelForecasting:
             assert len(profile["covariate_cols"]) >= 1, (
                 f"{dataset}: expected at least one covariate_col"
             )
+
+
+# ---------------------------------------------------------------------------
+# Kaggle subfolder convention
+# ---------------------------------------------------------------------------
+
+class TestKaggleSubfolderConvention:
+    """profile_data.py on the kaggle_style fixture (train/ + test/ subdirs)."""
+
+    def test_convention_detected(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["convention"] == "kaggle_subfolder"
+
+    def test_train_data_path(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["train_data"] == "train/covariates.csv"
+
+    def test_train_target_path(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["train_target"] == "train/dose_sys_train.csv"
+
+    def test_val_features_path(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["val_features"] == "test/covariates.csv"
+
+    def test_target_column(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["target_col"] == "dose_sys"
+        assert profile["file_paths"]["target_column"] == "dose_sys"
+
+    def test_not_combined(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["train_target_in_combined_file"] is False
+
+    def test_images_dir_null(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["file_paths"]["images_dir"] is None
+
+    def test_problem_type(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["problem_type"] == "panel_forecasting"
+
+    def test_problem_type_confidence(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["problem_type_confidence"] == "high"
+
+    def test_train_rows(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["n_train_rows"] == 50
+
+    def test_val_rows(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["n_val_rows"] == 10
+
+    def test_group_cols(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert "patient_id" in profile["group_cols"]
+
+    def test_time_col(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert profile["time_col"] == "time_step"
+
+    def test_train_files_have_subdir_prefix(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert all(f.startswith("train/") for f in profile["train_files"])
+
+    def test_val_files_have_subdir_prefix(self, tmp_path):
+        profile = run_profiler("practice_data/kaggle_style", tmp_path)
+        assert all(f.startswith("test/") for f in profile["val_files"])
+
+
+# ---------------------------------------------------------------------------
+# Backward compat: existing conventions now expose 'convention' + 'images_dir'
+# ---------------------------------------------------------------------------
+
+class TestExistingConventionBackcompat:
+
+    def test_retail_sales_convention(self, tmp_path):
+        profile = run_profiler("practice_data/retail_sales", tmp_path)
+        assert profile["file_paths"]["convention"] == "split"
+
+    def test_energy_load_convention(self, tmp_path):
+        profile = run_profiler("practice_data/energy_load", tmp_path)
+        assert profile["file_paths"]["convention"] == "combined"
+
+    def test_medical_imaging_convention(self, tmp_path):
+        profile = run_profiler("practice_data/medical_imaging", tmp_path)
+        assert profile["file_paths"]["convention"] == "split"
+
+    def test_retail_images_dir_null(self, tmp_path):
+        profile = run_profiler("practice_data/retail_sales", tmp_path)
+        assert profile["file_paths"]["images_dir"] is None
+
+    def test_medical_imaging_images_dir(self, tmp_path):
+        profile = run_profiler("practice_data/medical_imaging", tmp_path)
+        assert profile["file_paths"]["images_dir"] == "images"
