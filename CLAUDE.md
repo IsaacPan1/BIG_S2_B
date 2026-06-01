@@ -18,7 +18,19 @@ Start the workflow immediately when the user says any of:
 - "Start the analysis"
 - any close paraphrase of the above
 
-Do not ask clarifying questions. Do not wait. Begin at Step 1 of the workflow.
+Examples of acceptable triggers:
+- "Do the data analysis" (most common)
+- "Run the data analysis"
+- "Analyze the data"
+- "Perform the data analysis"
+- "Execute the pipeline"
+- "Begin the analysis"
+- "Process the data"
+- Any natural language expression of intent to run the autonomous 
+  data analysis pipeline
+
+Do not ask clarifying questions. Do not wait. Begin at Step 1 of 
+the workflow.
 
 ---
 
@@ -143,6 +155,42 @@ If this step fails: write a minimal `reports/validator_review.json` with
 `verdict="WARNING"` and `notes` explaining the failure. Always continue to
 `submission_writer` — a missing validator review never blocks submission.
 
+### Step 3.6 — Critic Review
+
+Invoke the critic sub-agent via the Task tool. Wait for
+reports/critic_was_here.txt and reports/critic_review.json.
+
+```
+Use the critic sub-agent to review the validator output and modeler predictions.
+```
+
+- Reads: `reports/validator_review.json`, `reports/model_results.json`,
+         `reports/predictions.csv`, `reports/features.json`,
+         `reports/profile.json`, `data/features_train.parquet`
+- Writes: `reports/critic_review.json`, `reports/critic_was_here.txt`,
+          optionally `reports/critic_retune_requested.json` and
+          `reports/critic_retune_attempted.txt`
+- Budget: **5 minutes**
+
+If reports/critic_retune_requested.json exists AND
+reports/critic_retune_attempted.txt was just created in this run:
+- Re-invoke modeler (it will read critic_retune_requested.json
+  and apply the suggested change)
+- Then re-invoke validator (it audits the new modeler output)
+- Then re-invoke critic (it will detect critic_retune_attempted.txt
+  and accept the second result regardless of remaining concerns)
+
+Maximum one retune cycle per pipeline run. Do NOT generate critic
+review inline; always delegate to the critic sub-agent.
+
+Verify after completion:
+- `reports/critic_was_here.txt` exists (proves the sub-agent ran, not inline work)
+- `reports/critic_review.json` exists with a `status` field
+
+If this step fails: write a minimal `reports/critic_review.json` with
+`status="accepted"` and a warning note. Always continue to
+`submission_writer` — a missing critic review never blocks submission.
+
 ### Step 4 — submission_writer
 
 Invoke the submission_writer sub-agent via the Agent tool. Wait for it to write
@@ -202,9 +250,10 @@ final metric from `reports/model_results.json`.
 | feature_engineer | 15 min | Reduce feature complexity if falling behind |
 | modeler | 60 min | Cap Optuna at 30 trials if time is short |
 | validator | 10 min | Diagnostic only; never blocks submission |
+| critic | 5 min | Advisory + retune; never blocks submission |
 | submission_writer | 10 min | Should be fast; escalate if it stalls |
 | report_writer | 20 min | Reduce to text-only PDF if time is short |
-| Buffer | 20 min | Reserved for retries and fallback logic |
+| Buffer | 15 min | Reserved for retries and fallback logic |
 | **Total** | **140 min** | Hard limit: 120 min; 20 min slack in buffer |
 
 **Self-pacing rule**: After each phase, estimate remaining wall-clock time.
@@ -232,6 +281,7 @@ Additional tools will be documented here as they are built.
 | `feature_engineer` | `reports/schema_analysis.md`, `reports/profile.json`, `data/` | `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` |
 | `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt` |
 | `validator` | `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json`, `reports/validator_was_here.txt` |
+| `critic` | `reports/validator_review.json`, `reports/model_results.json`, `reports/predictions.csv`, `reports/features.json`, `reports/profile.json`, `data/features_train.parquet` | `reports/critic_review.json`, `reports/critic_was_here.txt`, optionally `reports/critic_retune_requested.json` and `reports/critic_retune_attempted.txt` |
 | `submission_writer` | `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv` | `submission.csv` (repo root), `reports/submission_summary.json`, `reports/submission_writer_was_here.txt` — renames `predicted_target` → actual target column name from `DATA_DESCRIPTION.md` |
 | `report_writer` | `reports/` (all files), `data/DATA_DESCRIPTION.md` | `report.pdf` (repo root), `reports/report_writer_was_here.txt`, optional `.png` charts |
 
@@ -335,5 +385,6 @@ transparency, beyond the minimum competition requirements.
 | `feature_engineer.md` | `feature_engineer` | **exists** | Step 2 — after schema_analyst succeeds |
 | `modeler.md` | `modeler` | **exists** | Step 3 — after feature_engineer succeeds or falls back |
 | `validator.md` | `validator` | **exists** | Step 3.5 — after modeler produces predictions; diagnostic only |
-| `submission_writer.md` | `submission_writer` | **exists** | Step 4 — after validator completes (or fails gracefully) |
+| `critic.md` | `critic` | **exists** | Step 3.6 — after validator completes; advisory + retune; never blocks submission |
+| `submission_writer.md` | `submission_writer` | **exists** | Step 4 — after critic completes (or fails gracefully) |
 | `report_writer.md` | `report_writer` | **exists** | Step 5 — after submission.csv is written |

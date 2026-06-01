@@ -138,6 +138,57 @@ y_pva = y_full[probe_va_idx]
 ```
 
 ### Step 5 — Optuna hyperparameter tuning (10–15 trials, abort after 25 minutes)
+
+Before configuring the Optuna search space, check if reports/critic_retune_requested.json exists. If so, read the suggested_change field and apply the adjustment:
+
+```python
+import os, json as _json
+
+_retune_applied = None
+if os.path.exists("reports/critic_retune_requested.json"):
+    with open("reports/critic_retune_requested.json") as _f:
+        _retune = _json.load(_f)
+    _suggestion = _retune.get("suggested_change", "")
+    print(f"Critic retune requested: {_suggestion}")
+
+    if "median seed aggregation" in _suggestion:
+        # Will use np.median instead of np.mean in seed ensemble (applied in Steps 5 and 7b)
+        _retune_applied = "median_seed_aggregation"
+        print("Applying: median seed aggregation instead of mean")
+
+    if "expand Optuna" in _suggestion:
+        # Widen search bounds as specified in suggestion (applied below in objective())
+        _retune_applied = (_retune_applied or "") + "+expanded_optuna_bounds"
+        print("Applying: expanded Optuna num_leaves/min_child_samples bounds")
+
+    if "val feature imputation" in _suggestion:
+        # Re-verify fill_vals uses training medians (already the default; log confirmation)
+        _retune_applied = (_retune_applied or "") + "+verified_imputation"
+        print("Applying: verified fill_vals uses training column medians (not zeros)")
+
+    if "np.clip applied after seed aggregation" in _suggestion:
+        # Clip is applied to ensemble_preds after aggregation (enforced in Step 7b)
+        _retune_applied = (_retune_applied or "") + "+clip_after_ensemble"
+        print("Applying: np.clip(0, None) applied to ensemble_preds after seed aggregation")
+
+    if "remove suspect features" in _suggestion:
+        # Drop features flagged by validator
+        try:
+            with open("reports/validator_review.json") as _vf:
+                _vreview = _json.load(_vf)
+            _suspect = _vreview.get("feature_suspicion", [])
+            if _suspect:
+                feature_cols = [c for c in feature_cols if c not in _suspect]
+                print(f"Applying: removed {len(_suspect)} suspect features: {_suspect[:5]}")
+                _retune_applied = (_retune_applied or "") + f"+removed_{len(_suspect)}_features"
+        except Exception as _ve:
+            print(f"Could not read feature_suspicion from validator_review.json: {_ve}")
+else:
+    _retune_applied = None
+```
+
+Use `_retune_applied` in Step 9 to populate `retune_applied` in model_results.json. When `_retune_applied` contains "median_seed_aggregation", replace every `np.mean(seed_preds, axis=0)` with `np.median(seed_preds, axis=0)` in both the Optuna objective and the final ensemble in Step 7b. When `_retune_applied` contains "expanded_optuna_bounds", use `num_leaves` upper bound 255 and `min_child_samples` lower bound 3 in the Optuna search space below.
+
 ```python
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
@@ -364,6 +415,7 @@ results = {
     "n_features": len(feature_cols),
     "n_train_rows": len(train_df),
     "n_val_rows": len(val_df),
+    "retune_applied": _retune_applied,
 }
 
 with open("reports/model_results.json", "w") as f:

@@ -155,6 +155,8 @@ profile      = load_json("reports/profile.json")
 features     = load_json("reports/features.json")
 model_res    = load_json("reports/model_results.json")
 sub_summary  = load_json("reports/submission_summary.json")
+critic_rev   = load_json("reports/critic_review.json")
+val_rev      = load_json("reports/validator_review.json")
 schema_text  = load_text("reports/schema_analysis.md")
 data_desc    = load_text("data/DATA_DESCRIPTION.md")
 
@@ -207,6 +209,23 @@ sub_std        = pred_stats.get("std", None)
 sub_nan        = pred_stats.get("n_nan", 0)
 sub_neg        = pred_stats.get("n_negative", 0)
 sub_passed     = sub_summary.get("validation_checks_passed", None)
+
+# validator_review.json fields
+val_verdict        = val_rev.get("verdict", "N/A")
+val_reported_mae   = val_rev.get("reported_cv_mae") or val_rev.get("honest_cv_mae")
+val_strict_mae     = val_rev.get("strict_cv_mae")
+val_gap_frac       = val_rev.get("cv_gap_pct", 0.0)
+val_gap_pct        = val_gap_frac * 100          # stored as fraction, display as %
+val_cv_scheme      = val_rev.get("strict_cv_scheme", "N/A")
+val_feature_susp   = val_rev.get("feature_suspicion", [])
+val_notes          = val_rev.get("notes", "")
+
+# critic_review.json fields
+critic_status      = critic_rev.get("status", "N/A")
+critic_cycle       = critic_rev.get("cycle", 1)
+critic_checks      = critic_rev.get("checks", [])
+critic_retune      = critic_rev.get("retune_attempted", False)
+critic_rationale   = critic_rev.get("decision_rationale", "")
 
 def fmt(v, d=0):
     if v is None or v == "Unknown":
@@ -463,8 +482,83 @@ else:
 
     story.append(PageBreak())
 
+    # ── Section 5: Cross-Validation and Integrity Checking ────────────────
+    story.append(Paragraph("Section 5 — Cross-Validation and Integrity Checking", H2))
+
+    # Subsection A: Validator Audit
+    story.append(Paragraph("<b>A. Validator Audit</b>", BOLD))
+    val_rows = [
+        ["CV scheme used",    val_cv_scheme],
+        ["Reported CV MAE",   fmt(val_reported_mae, 4) if val_reported_mae is not None else "N/A"],
+        ["Strict CV MAE",     fmt(val_strict_mae, 4)   if val_strict_mae   is not None else "N/A"],
+        ["CV gap (%)",        f"{val_gap_pct:.1f}%"],
+        ["Verdict",           val_verdict],
+        ["Suspect features",  ", ".join(str(f) for f in val_feature_susp) if val_feature_susp else "None flagged"],
+    ]
+    story.append(tbl(["Property", "Value"], val_rows, widths=[5*cm, 11*cm]))
+    if val_notes:
+        # Summarise notes to ≤ 300 chars to avoid overflowing the section
+        notes_short = val_notes[:300] + ("…" if len(val_notes) > 300 else "")
+        story.append(Paragraph(notes_short, BODY))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Subsection B: Critic Review — 5-check table
+    story.append(Paragraph("<b>B. Critic Review</b>", BOLD))
+    if critic_checks:
+        status_color = {
+            "PASS": colors.HexColor("#1a9641"),
+            "WARNING": colors.HexColor("#d7191c"),
+            "CRITICAL": colors.HexColor("#d7191c"),
+        }
+        check_rows = []
+        for ck in critic_checks:
+            ck_name    = ck.get("name", "")
+            ck_status  = ck.get("status", "")
+            ck_details = ck.get("details", "")
+            check_rows.append([ck_name, ck_status, ck_details])
+        critic_tbl = Table(
+            [["Check", "Status", "Details"]] + check_rows,
+            colWidths=[4*cm, 2*cm, 10*cm],
+            hAlign="LEFT",
+        )
+        # Base style from TS, then override status-cell colours
+        critic_tbl.setStyle(TS)
+        for row_idx, ck in enumerate(critic_checks, start=1):
+            ck_status = ck.get("status", "PASS")
+            cell_color = (colors.HexColor("#1a9641") if ck_status == "PASS"
+                          else colors.HexColor("#d7191c") if ck_status == "CRITICAL"
+                          else colors.HexColor("#e08200"))
+            critic_tbl.setStyle(TableStyle([
+                ("TEXTCOLOR", (1, row_idx), (1, row_idx), cell_color),
+                ("FONTNAME",  (1, row_idx), (1, row_idx), "Helvetica-Bold"),
+            ]))
+        story.append(critic_tbl)
+    else:
+        story.append(Paragraph("No checks recorded (critic did not run or produced empty checks).", BODY))
+    story.append(Spacer(1, 0.2*cm))
+    story.append(Paragraph(
+        f"Critic status: <b>{critic_status}</b>. "
+        f"Retune attempted: <b>{'Yes' if critic_retune else 'No'}</b>. "
+        + (f"Rationale: {critic_rationale}" if critic_rationale else ""),
+        BODY,
+    ))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Subsection C: Threshold Documentation
+    story.append(Paragraph("<b>C. Threshold Documentation</b>", BOLD))
+    story.append(Paragraph(
+        "The validator's WARNING threshold for CV gap is 10%; its CRITICAL threshold is 25%. "
+        "The critic's acceptance threshold is 15%, intentionally set between these so that "
+        "validator WARNINGs pass through to documentation while validator CRITICALs trigger "
+        "modeler retunes. This design ensures that mild optimism in the reported CV estimate "
+        "is visible in the report without blocking submission, while severe CV inflation "
+        "(which would indicate leakage or methodology error) always forces a corrective retune.",
+        BODY,
+    ))
+    story.append(PageBreak())
+
     # ── Section 6: Predictions and Submission ─────────────────────────────
-    story.append(Paragraph("Section 5 — Predictions and Submission", H2))
+    story.append(Paragraph("Section 6 — Predictions and Submission", H2))
     sub_rows = [
         ["Row count",                fmt(sub_row_count)],
         ["Min prediction",           fmt(sub_min, 2)],
@@ -484,7 +578,7 @@ else:
     story.append(PageBreak())
 
     # ── Section 7: Limitations and Risks ──────────────────────────────────
-    story.append(Paragraph("Section 6 — Limitations and Risks", H2))
+    story.append(Paragraph("Section 7 — Limitations and Risks", H2))
 
     lims = []
 
@@ -535,6 +629,12 @@ else:
         except Exception:
             pass
 
+    # Critic review: warnings_for_report bubbled up as Limitations bullets
+    critic_warnings = critic_rev.get("warnings_for_report", [])
+    for cw in critic_warnings:
+        if cw and not any(cw in lim for lim in lims):
+            lims.append(f"<b>Quality check warning (critic review):</b> {cw}")
+
     for lim in lims:
         story.append(Paragraph(lim, BODY))
         story.append(Spacer(1, 0.15*cm))
@@ -542,13 +642,15 @@ else:
     story.append(PageBreak())
 
     # ── Section 8: Methodology Notes ──────────────────────────────────────
-    story.append(Paragraph("Section 7 — Methodology Notes", H2))
+    story.append(Paragraph("Section 8 — Methodology Notes", H2))
 
     failed_agents = []
     for marker, agent in [
         ("reports/schema_analyst_was_here.txt",      "schema_analyst"),
         ("reports/feature_engineer_was_here.txt",    "feature_engineer"),
         ("reports/modeler_was_here.txt",             "modeler"),
+        ("reports/validator_was_here.txt",           "validator"),
+        ("reports/critic_was_here.txt",              "critic"),
         ("reports/submission_writer_was_here.txt",   "submission_writer"),
     ]:
         if not os.path.exists(marker):
@@ -574,7 +676,7 @@ else:
     # ── Build ──────────────────────────────────────────────────────────────
     doc.build(story)
     sz = os.path.getsize("report.pdf")
-    print(f"report.pdf written: {sz:,} bytes, 7 sections, {len(story)} story elements")
+    print(f"report.pdf written: {sz:,} bytes, 8 sections, {len(story)} story elements")
 
 # ── Marker file ───────────────────────────────────────────────────────────
 ts_iso = datetime.utcnow().isoformat() + "Z"
