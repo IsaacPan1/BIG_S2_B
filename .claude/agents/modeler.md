@@ -9,7 +9,9 @@ You are the modeler. Your job: train an adaptive ensemble of models on the engin
 
 ## Adaptive ensemble selection
 
-The modeler selects its ensemble composition from `profile.json` before any training begins:
+The modeler makes **two independent adaptive decisions** from `profile.json` before any training begins.
+
+### Axis 1 — Dataset size (gates XGBoost)
 
 | Branch | Condition | Families |
 |--------|-----------|----------|
@@ -21,7 +23,52 @@ The modeler selects its ensemble composition from `profile.json` before any trai
 
 **Reasoning**: Branches 1 and 3 add XGBoost when there is enough data (≥ 1000 rows) for its broader hyperparameter space to find good values without overfitting noise. Ridge provides paradigm diversity (linear vs. tree) and is especially useful when distribution-shift-aware features are informative. Small datasets (< 1000 rows) skip XGBoost because its 15-trial search risks overfitting.
 
-**Final predictions** are the median across all included families' validation predictions.
+### Axis 2 — Distribution shift severity (weights Ridge)
+
+After selecting families, compute the maximum KS statistic across all covariates in `profile.json`'s `distribution_shifts` list:
+
+```python
+_dist_shifts = profile.get("distribution_shifts", [])
+_max_ks = max((d.get("ks_statistic", 0.0) for d in _dist_shifts if isinstance(d, dict)), default=0.0)
+```
+
+| Condition | Ensemble weighting |
+|-----------|-------------------|
+| max_ks > 0.40 | `ridge_weighted_1.5x`: Ridge weight=1.5, all others weight=1.0; final = weighted average |
+| max_ks <= 0.40 | `equal_median`: equal-weight median (current default behaviour) |
+
+**Reasoning**: When severe distribution shift is detected, tree models can extrapolate aggressively into shifted regions, producing overconfident predictions. Ridge's bias toward conservative predictions (staying closer to the training mean) is more reliable when the true validation distribution is unknown. A 1.5× weight shifts the ensemble's centre of gravity toward Ridge without discarding the tree-model signal entirely.
+
+**Competence check** (applied after all families have trained, before aggregation): Ridge weighting is only applied if Ridge's OOF MAE is within 50% of the best family's OOF MAE:
+
+```
+ridge_oof <= 1.5 * best_oof   →  keep ridge_weighted_1.5x
+ridge_oof >  1.5 * best_oof   →  downgrade to equal_median
+```
+
+If Ridge is substantially worse than the tree models (ratio > 1.5×), upweighting it would pull the ensemble toward worse predictions, negating the shift-hedging benefit. In that case the ensemble falls back to equal-weight median and the downgrade is logged in `weighting_reason`.
+
+**Note**: If Ridge was excluded from the ensemble by its sanity checks (e.g., pred_max > 5×train_max), the weighting decision is still logged but has no effect (no Ridge predictions available to upweight).
+
+### Final predictions
+
+- `equal_median`: `np.median(stack, axis=0)` across included families
+- `ridge_weighted_1.5x` (after competence check passes): `np.average(stack, axis=0, weights=[1.5 if ridge else 1.0, ...])` across included families
+
+Both decisions (plus the competence-check outcome) are logged in `model_results.json` under `adaptive_choice`. Example when shift triggers but Ridge passes competence:
+```json
+{
+  "ensemble_weighting": "ridge_weighted_1.5x",
+  "weighting_reason": "max_ks=0.67 > 0.40 threshold, ridge_oof=7.42 within 1.5x best_oof=7.13; ridge_weighted_1.5x applied"
+}
+```
+Example when shift triggers but Ridge fails competence:
+```json
+{
+  "ensemble_weighting": "equal_median",
+  "weighting_reason": "max_ks=0.56 > 0.40 threshold, ridge_oof=1.377 > 1.5x best_oof=0.788; using equal_median instead"
+}
+```
 
 ## Ridge sanity checks before ensembling
 

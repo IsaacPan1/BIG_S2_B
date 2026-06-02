@@ -57,6 +57,8 @@ The modeler picks its ensemble based on `problem_type` and training set size rea
 
 Ridge predictions pass sanity checks (range and bias tests) before inclusion — excluded if systematically biased or out-of-range. Final prediction is the median across families that survive selection.
 
+**Shift-weighted ensembling with competence check.** When any covariate has distribution shift severity (KS statistic) above 0.40, the modeler considers weighting Ridge 1.5x in the final ensemble — Ridge's conservative predictions hedge against tree models extrapolating into shifted regions. This weighting is applied only when Ridge is competitive (Ridge OOF MAE within 1.5x of the best family's OOF MAE). If Ridge is significantly worse, the ensemble falls back to equal-median to avoid pulling predictions toward the underperforming family. The decision and OOF comparison are logged in `model_results.json` under `adaptive_choice` for full transparency.
+
 ## Distribution-Shift-Aware Features
 
 `feature_engineer` tests each covariate for distribution shift between training and validation using the Kolmogorov-Smirnov statistic. Covariates with KS > 0.15 receive five additional derived features: z-score normalization, rolling z-score, percentile rank, group-level deviation, and time interaction. These supplement standard features rather than replace them. Datasets with no detected shift are unaffected.

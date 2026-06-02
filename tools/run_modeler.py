@@ -121,6 +121,25 @@ families_plan = ens_info["families"]
 print(f"\nEnsemble: branch={ens_info['branch']} families={families_plan}")
 print(f"Reason: {ens_info['reasoning']}")
 
+# ── 5b. Shift-severity weighting decision (Axis 2) ────────────────────────────
+_dist_shifts = profile.get("distribution_shifts", [])
+_max_ks = 0.0
+if _dist_shifts:
+    _max_ks = max((d.get("ks_statistic", 0.0) for d in _dist_shifts if isinstance(d, dict)), default=0.0)
+print(f"Distribution shift: max_ks={_max_ks:.4f} (threshold=0.40)")
+
+_KS_THRESHOLD = 0.40
+if _max_ks > _KS_THRESHOLD:
+    _ensemble_weighting = "ridge_weighted_1.5x"
+    _weighting_reason   = (f"max_ks={_max_ks:.2f} > {_KS_THRESHOLD} threshold; "
+                           "weighting Ridge to hedge against severe shift")
+else:
+    _ensemble_weighting = "equal_median"
+    _weighting_reason   = (f"max_ks={_max_ks:.2f} <= {_KS_THRESHOLD} threshold; "
+                           "equal-weight median")
+print(f"Ensemble weighting: {_ensemble_weighting}")
+print(f"Weighting reason: {_weighting_reason}")
+
 # ── 6. Split setup ─────────────────────────────────────────────────────────────
 cv_splits   = None
 all_periods = None
@@ -586,8 +605,37 @@ if len(_included) == 0:
     print("WARNING: no family produced valid predictions — using global mean")
     _included = {"lightgbm": np.full(len(val_df), train_target_mean)}
 
+# ── Competence check: only apply Ridge weighting if Ridge is competitive ──────
+if _ensemble_weighting == "ridge_weighted_1.5x" and "ridge" in _included:
+    _oof_maes = {k: all_family_results[k]["oof_mae"]
+                 for k in _included
+                 if all_family_results.get(k, {}).get("oof_mae") is not None}
+    if _oof_maes:
+        _best_oof  = min(_oof_maes.values())
+        _ridge_oof = _oof_maes.get("ridge")
+        if _ridge_oof is not None and _ridge_oof <= 1.5 * _best_oof:
+            _weighting_reason = (
+                f"max_ks={_max_ks:.2f} > {_KS_THRESHOLD} threshold, "
+                f"ridge_oof={_ridge_oof:.3f} within 1.5x best_oof={_best_oof:.3f}; "
+                "ridge_weighted_1.5x applied"
+            )
+            print(f"Competence PASS: ridge_oof={_ridge_oof:.3f} <= 1.5*best={1.5*_best_oof:.3f}; keeping ridge_weighted_1.5x")
+        else:
+            _ensemble_weighting = "equal_median"
+            _weighting_reason = (
+                f"max_ks={_max_ks:.2f} > {_KS_THRESHOLD} threshold, "
+                f"ridge_oof={_ridge_oof:.3f} > 1.5x best_oof={_best_oof:.3f}; "
+                "using equal_median instead"
+            )
+            print(f"Competence FAIL: ridge_oof={_ridge_oof:.3f} > 1.5*best={1.5*_best_oof:.3f}; downgrading to equal_median")
+
 if len(_included) == 1:
     ensemble_preds = next(iter(_included.values()))
+elif _ensemble_weighting == "ridge_weighted_1.5x" and "ridge" in _included:
+    _weights = np.array([1.5 if k == "ridge" else 1.0 for k in _included.keys()])
+    _stacked = np.stack(list(_included.values()), axis=0)
+    ensemble_preds = np.average(_stacked, axis=0, weights=_weights)
+    print(f"Ridge-weighted avg: weights={dict(zip(_included.keys(), _weights.tolist()))}")
 else:
     ensemble_preds = np.median(np.stack(list(_included.values()), axis=0), axis=0)
 
@@ -682,6 +730,8 @@ results = {
         "families_selected": families_plan,
         "families_included_in_ensemble": _fam_names,
         "reasoning": ens_info["reasoning"],
+        "ensemble_weighting": _ensemble_weighting,
+        "weighting_reason": _weighting_reason,
     },
     "families": {
         "lightgbm": all_family_results.get("lightgbm", {}),

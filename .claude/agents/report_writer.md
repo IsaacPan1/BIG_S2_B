@@ -75,7 +75,9 @@ Key: `feature_families` is a **dict** (family_name → list or dict of feature s
     "branch": 1,
     "families_selected": ["lightgbm", "xgboost", "ridge"],
     "families_included_in_ensemble": ["lightgbm", "xgboost", "ridge"],
-    "reasoning": "panel_forecasting, n_train=135000>=1000: full 3-family ensemble"
+    "reasoning": "panel_forecasting, n_train=135000>=1000: full 3-family ensemble",
+    "ensemble_weighting": "ridge_weighted_1.5x",
+    "weighting_reason": "max_ks=0.56 > 0.40 threshold; weighting Ridge to hedge against severe shift"
   },
   "families": {
     "lightgbm": {"best_params": {...}, "oof_mae": 9.3, "training_time_seconds": 120,
@@ -218,6 +220,13 @@ cv_scheme_label = model_res.get("oof_cv_scheme") or model_res.get("cv_scheme") o
 train_time     = model_res.get("training_time_seconds", "Unknown")
 n_trials       = model_res.get("optuna_trials_completed", model_res.get("n_trials", None))
 feat_imp       = model_res.get("feature_importance_top10", [])
+
+# adaptive_choice: two-axis adaptive decisions
+_ac             = model_res.get("adaptive_choice", {})
+ens_branch      = _ac.get("branch", "N/A")
+ens_reasoning   = _ac.get("reasoning", "N/A")
+ens_weighting   = _ac.get("ensemble_weighting", "equal_median")
+weighting_reason = _ac.get("weighting_reason", "")
 
 # submission_summary.json: stats nested under prediction_stats
 pred_stats     = sub_summary.get("prediction_stats", {})
@@ -491,6 +500,8 @@ else:
     model_rows = [
         ["Algorithm",            algorithm],
         ["Objective",            objective],
+        ["Adaptive branch (Axis 1)", f"Branch {ens_branch} — {ens_reasoning}"],
+        ["Ensemble weighting (Axis 2)", f"{ens_weighting}" + (f" — {weighting_reason}" if weighting_reason else "")],
         ["Best hyperparameters", params_str],
         ["Number of estimators", str(n_estimators)],
         ["Number of seeds",      str(n_seeds)],
@@ -500,6 +511,20 @@ else:
     ]
     story.append(tbl(["Parameter", "Value"], model_rows, widths=[5*cm, 11*cm]))
     story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph(
+        f"The modeler made two adaptive decisions based on the dataset profile. "
+        f"<b>(1) Axis 1 — dataset size:</b> Branch {ens_branch} was selected "
+        f"({ens_reasoning}). "
+        f"<b>(2) Axis 2 — shift severity:</b> Ensemble weighting set to "
+        f"<b>{ens_weighting}</b>. "
+        + (f"{weighting_reason}. " if weighting_reason else "No covariate shift detected above threshold. ")
+        + ("Ridge's conservative predictions hedge against tree-model overextrapolation "
+           "into shifted regions."
+           if ens_weighting == "ridge_weighted_1.5x"
+           else "Equal-weight median used as no severe distribution shift was detected."),
+        BODY
+    ))
+    story.append(Spacer(1, 0.2*cm))
 
     if feat_imp:
         story.append(Paragraph("Top 10 Feature Importances", H2))
