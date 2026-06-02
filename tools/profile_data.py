@@ -34,6 +34,14 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 )
 
+CODEBOOK_CANDIDATES: tuple[str, ...] = (
+    "period_id_codebook.json",
+    "period_codebook.json",
+    "period_id.json",
+    "dates.json",
+    "time_codebook.json",
+)
+
 # ---------------------------------------------------------------------------
 # 1.  DATA_DESCRIPTION.md parsing
 # ---------------------------------------------------------------------------
@@ -863,7 +871,104 @@ def find_linkage_column(
 
 
 # ---------------------------------------------------------------------------
-# 10.  Human-readable summary
+# 10.  Codebook detection (maps opaque time IDs to real dates)
+# ---------------------------------------------------------------------------
+
+def _fraction_parseable_as_dates(strings: list[str]) -> float:
+    """Return fraction of strings that pandas can parse as dates."""
+    if not strings:
+        return 0.0
+    parsed = pd.to_datetime(strings, errors="coerce")
+    return float(parsed.notna().mean())
+
+
+def detect_time_codebook(
+    data_dir: Path,
+    train_df: pd.DataFrame,
+    time_col: str | None,
+) -> dict:
+    """Search data_dir for a JSON codebook mapping opaque time IDs to dates.
+
+    Checks CODEBOOK_CANDIDATES in order; returns the first valid one.
+    Any failure silently returns available=False rather than crashing.
+
+    The returned dict always has these keys:
+        available, path, n_entries, direction_detected, sample_mappings
+    """
+    _empty: dict = {
+        "available": False,
+        "path": None,
+        "n_entries": None,
+        "direction_detected": None,
+        "sample_mappings": None,
+    }
+
+    if time_col is None or time_col not in train_df.columns:
+        return _empty
+
+    train_time_vals = set(train_df[time_col].dropna().astype(str).unique())
+    if not train_time_vals:
+        return _empty
+
+    try:
+        for fname in CODEBOOK_CANDIDATES:
+            candidate = data_dir / fname
+            if not candidate.exists():
+                continue
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            if not isinstance(raw, dict) or len(raw) < 10:
+                continue
+
+            sample_items = list(raw.items())[:20]
+            keys_sample  = [str(k) for k, _ in sample_items]
+            vals_sample  = [str(v) for _, v in sample_items]
+
+            keys_are_dates = _fraction_parseable_as_dates(keys_sample) > 0.8
+            vals_are_dates = _fraction_parseable_as_dates(vals_sample) > 0.8
+
+            if not keys_are_dates and not vals_are_dates:
+                continue
+
+            # Which non-date side appears in the training time column?
+            vals_in_train = (
+                len(train_time_vals & set(vals_sample)) / max(len(vals_sample), 1)
+            )
+            keys_in_train = (
+                len(train_time_vals & set(keys_sample)) / max(len(keys_sample), 1)
+            )
+
+            if keys_are_dates and vals_in_train > 0.3:
+                # {date: id} mapping
+                direction   = "date_to_id"
+                id_to_date  = {str(v): str(k) for k, v in raw.items()}
+            elif vals_are_dates and keys_in_train > 0.3:
+                # {id: date} mapping
+                direction   = "id_to_date"
+                id_to_date  = {str(k): str(v) for k, v in raw.items()}
+            else:
+                continue
+
+            sample_pairs = dict(list(id_to_date.items())[:5])
+
+            return {
+                "available":           True,
+                "path":                fname,  # relative to data_dir
+                "n_entries":           len(raw),
+                "direction_detected":  direction,
+                "sample_mappings":     sample_pairs,
+            }
+    except Exception:
+        pass
+
+    return _empty
+
+
+# ---------------------------------------------------------------------------
+# 11.  Human-readable summary
 # ---------------------------------------------------------------------------
 
 def print_summary(profile: dict) -> None:
@@ -1024,6 +1129,9 @@ def main() -> None:
     id_col     = find_id_col(train_df, time_col, target_col)
     group_cols = find_group_cols(train_df, time_col, target_col, id_col)
 
+    # 6b. Optional time codebook (maps opaque IDs → real dates)
+    codebook_info = detect_time_codebook(data_dir, train_df, time_col)
+
     covariate_cols = [
         c for c in train_df.columns
         if c not in {target_col, time_col, id_col}
@@ -1112,6 +1220,7 @@ def main() -> None:
         "val_files":                file_split["val_files"],
         "file_paths":               file_paths,
         "image_data":               img_info,
+        "time_codebook":            codebook_info,
         "warnings":                 warns,
     }
 

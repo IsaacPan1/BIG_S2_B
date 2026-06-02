@@ -64,8 +64,26 @@ profile.json column names):
 | `cov_rolls` | 4-week rolling mean for each numeric covariate |
 | `price_derived` | Group-baseline, deviation, and ratio for the primary numeric cov |
 | `interactions` | numeric × binary and binary × binary covariate pairs |
+| `date_features` | `month_of_year` (1–12), `quarter_of_year` (1–4), `is_quarter_start` (0/1) — **only present when `profile.json` has `time_codebook.available = true`** |
 | `horizon` | Steps ahead (0 in train, 1-N in val) |
 | `covariates` | Raw covariate pass-through |
+
+### Date features (codebook-derived)
+
+When `profile["time_codebook"]["available"]` is `true`, the script loads the
+codebook file from `data/<path>`, resolves each row's opaque time-column value
+to a calendar date, and adds three features:
+
+- `month_of_year` — calendar month (1–12)
+- `quarter_of_year` — calendar quarter (1–4)
+- `is_quarter_start` — 1 if month ∈ {1, 4, 7, 10}, else 0
+
+These features are **additive** — all existing seasonality features
+(`period_id_sin`, `period_id_cos`, etc.) are preserved unchanged. Rows with
+unmapped time values are imputed using the training-set median month (or 6 if
+no training data is available). If >10 % of training rows are unmapped, date
+features are skipped entirely and a warning is logged. When `available` is
+`false`, the codebook block is a silent no-op.
 
 ## What you do NOT do
 - Do NOT write your own feature computation inline — always call `tools/feature_engineering.py`

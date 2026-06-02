@@ -799,6 +799,46 @@ if _shift_cols:
     print(f"Shift-aware features added: {len(_shift_cols)}  "
           f"{_shift_cols[:4]}{'...' if len(_shift_cols) > 4 else ''}")
 
+# ── 12d. Codebook date features ──────────────────────────────────────────────
+_codebook_info = profile.get("time_codebook", {})
+if _codebook_info.get("available") and time_col is not None:
+    try:
+        _cb_path = DATA_DIR / _codebook_info["path"]
+        _raw_cb  = json.loads(_cb_path.read_text(encoding="utf-8"))
+
+        # Normalize to {id: date_string}
+        _direction = _codebook_info.get("direction_detected", "id_to_date")
+        if _direction == "date_to_id":
+            _id_to_date = {str(v): str(k) for k, v in _raw_cb.items()}
+        else:
+            _id_to_date = {str(k): str(v) for k, v in _raw_cb.items()}
+
+        # Map all rows; gate on training unmapped rate
+        _dates_mapped    = full[time_col].astype(str).map(_id_to_date)
+        _tr_unmapped_pct = float(_dates_mapped[tr_mask].isna().mean())
+
+        if _tr_unmapped_pct > 0.1:
+            print(f"WARNING: {_tr_unmapped_pct:.1%} of training rows have unmapped "
+                  f"codebook entries — skipping date features")
+        else:
+            _dt_series  = pd.to_datetime(_dates_mapped, errors="coerce")
+            _month_raw  = _dt_series.dt.month  # NaN for unmapped rows
+
+            _tr_months     = _month_raw[tr_mask].dropna()
+            _median_month  = int(_tr_months.median()) if len(_tr_months) > 0 else 6
+            _month_filled  = _month_raw.fillna(_median_month).astype(np.int8)
+
+            full["month_of_year"]    = _month_filled
+            full["quarter_of_year"]  = ((_month_filled.astype(int) - 1) // 3 + 1).astype(np.int8)
+            full["is_quarter_start"] = _month_filled.isin([1, 4, 7, 10]).astype(np.int8)
+
+            _reg("date_features", ["month_of_year", "quarter_of_year", "is_quarter_start"])
+            print(f"Codebook date features added: month_of_year, quarter_of_year, "
+                  f"is_quarter_start  (median_month={_median_month}, "
+                  f"train_unmapped={_tr_unmapped_pct:.1%})")
+    except Exception as _e:
+        print(f"WARNING: Codebook date feature extraction failed: {_e} — skipping")
+
 # ── 13. Fill val NaN lags/roll features ──────────────────────────────────────
 print("Filling val NaN lag/roll features…")
 last_known = (full.loc[full[_tc] == train_time_max, group_cols + [target_col]]
@@ -909,6 +949,11 @@ features_meta = {
             [f"Shift-aware features added for {len(_shift_cols)} covariate(s) with KS > 0.15: "
              "z-score, rolling z-score, rank, group deviation, time interaction."]
             if _shift_cols else []
+        ),
+        *(
+            ["Codebook date features added: month_of_year, quarter_of_year, is_quarter_start "
+             "(from time_codebook in profile.json)."]
+            if "date_features" in _families else []
         ),
     ],
 }

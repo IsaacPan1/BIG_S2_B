@@ -62,7 +62,27 @@ file. The JSON contains:
 - `distribution_shifts` — columns with KS > 0.15 flagged as `true`
 - `image_data` — whether image files were found and which column links to them
 - `schema` — per-column stats (min/max/mean/std, n_unique, n_null, top_values)
+- `time_codebook` — optional codebook mapping opaque time-column IDs to real dates
+  (see below)
 - `warnings` — anything the profiler could not resolve automatically
+
+**`time_codebook` field** — present whenever `data/` contains a JSON file named
+`period_id_codebook.json`, `period_codebook.json`, `period_id.json`, `dates.json`,
+or `time_codebook.json`. The codebook maps opaque time IDs (e.g. base-64 hashes
+like `"uTjgI1Sv"`) to calendar dates (e.g. `"2019-01-31"`), enabling the feature
+engineer to add month/quarter features even when the time column itself carries no
+readable date. Sub-keys:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `available` | bool | `true` if a valid codebook was found |
+| `path` | str \| null | Filename relative to `data/` (e.g. `"period_id_codebook.json"`) |
+| `n_entries` | int \| null | Number of entries in the codebook |
+| `direction_detected` | str \| null | `"date_to_id"` or `"id_to_date"` |
+| `sample_mappings` | dict \| null | Up to 5 example `{id: date}` pairs |
+
+If no valid codebook is found, `available` is `false` and all other keys are `null`.
+The profiler never raises an exception for a missing or malformed codebook file.
 
 ### Step 3 — Verify the classification
 
