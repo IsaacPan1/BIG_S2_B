@@ -38,11 +38,28 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 |-----------|------|
 | `schema_analyst` | Discovers dataset structure and problem type |
 | `feature_engineer` | Generates features adapted to schema and time granularity |
-| `modeler` | Trains LightGBM with Optuna tuning and seed ensemble |
+| `modeler` | Adaptive ensemble selection (LightGBM + XGBoost + Ridge) based on problem type and dataset size; each family tuned with Optuna and seed-aggregated; final predictions are median across ensemble |
 | `validator` | Independent audit of CV honesty using purged walk-forward |
 | `critic` | 5-check quality review with optional retune feedback loop |
 | `submission_writer` | Validates format and writes `submission.csv` |
 | `report_writer` | Assembles `report.pdf` |
+
+## Adaptive Model Selection
+
+The modeler picks its ensemble based on `problem_type` and training set size read from `profile.json`:
+
+| Condition | Ensemble |
+|-----------|----------|
+| panel_forecasting, n_train ≥ 1,000 | LightGBM + XGBoost + Ridge |
+| panel_forecasting, n_train < 1,000 | LightGBM + Ridge |
+| tabular_regression, n_train ≥ 1,000 | LightGBM + XGBoost + Ridge |
+| tabular_regression, n_train < 1,000 | LightGBM + Ridge |
+
+Ridge predictions pass sanity checks (range and bias tests) before inclusion — excluded if systematically biased or out-of-range. Final prediction is the median across families that survive selection.
+
+## Distribution-Shift-Aware Features
+
+`feature_engineer` tests each covariate for distribution shift between training and validation using the Kolmogorov-Smirnov statistic. Covariates with KS > 0.15 receive five additional derived features: z-score normalization, rolling z-score, percentile rank, group-level deviation, and time interaction. These supplement standard features rather than replace them. Datasets with no detected shift are unaffected.
 
 ## Constraints
 
@@ -50,12 +67,13 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 - No network access during analysis
 - 2-hour wall-clock budget
 - 1M token budget
-- Single LightGBM model family (XGBoost/CatBoost ensembling not implemented; deliberate scope decision)
+- Three-family ensemble (LightGBM + XGBoost + Ridge); CatBoost not included due to Windows installation complexity
 
 ## Known Limitations
 
 - Walk-forward MAE may underestimate out-of-sample error when the validation period has a different distribution than training
 - Image data is detected but not used as model features
 - Pipeline assumes one of the three documented file conventions; unusual structures may not be auto-detected
+- On datasets with severe distribution shift between training and validation periods, internal CV estimates may still underestimate true generalization error even with shift-aware features applied
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.
