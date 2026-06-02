@@ -70,15 +70,33 @@ Key: `feature_families` is a **dict** (family_name → list or dict of feature s
 ### reports/model_results.json
 ```
 {
-  "algorithm": "LightGBM",
+  "algorithm": "Lightgbm+Xgboost+Ridge ensemble",
+  "adaptive_choice": {
+    "branch": 1,
+    "families_selected": ["lightgbm", "xgboost", "ridge"],
+    "families_included_in_ensemble": ["lightgbm", "xgboost", "ridge"],
+    "reasoning": "panel_forecasting, n_train=135000>=1000: full 3-family ensemble"
+  },
+  "families": {
+    "lightgbm": {"best_params": {...}, "oof_mae": 9.3, "training_time_seconds": 120,
+                 "succeeded": true, "included_in_ensemble": true},
+    "xgboost":  {"best_params": {...}, "oof_mae": 9.5, "training_time_seconds": 90,
+                 "succeeded": true, "included_in_ensemble": true},
+    "ridge":    {"best_alpha": 1.0,   "oof_mae": 10.1, "training_time_seconds": 5,
+                 "succeeded": true, "included_in_ensemble": true}
+  },
+  "ensemble_oof_mae": 9.3,
+  "n_families_in_ensemble": 3,
+  "ensemble_disagreement": {"mean_disagreement": 1.2, "n_high_disagreement_rows": 45},
+  "ridge_top_coefficients": [{"feature": "lag_1", "abs_coef": 0.82}, ...],
   "objective": "regression_l1",
   "best_params": {"learning_rate": 0.01, "num_leaves": 153, ...},
   "n_estimators": 638,
   "n_seeds": 5,
-  "oof_mae": 0.130,
-  "oof_cv_scheme": "GroupKFold(n_splits=2, group_col='sex')",
-  "walk_forward_mae": 7.13,
-  "training_time_seconds": 169,
+  "oof_mae": 9.3,
+  "oof_cv_scheme": "WalkForward(cutoff=...)",
+  "walk_forward_mae": 9.3,
+  "training_time_seconds": 220,
   "optuna_trials_completed": 15,
   "feature_importance_top10": [
     {"feature": "sp_mean_sales", "importance": 8144},
@@ -86,6 +104,8 @@ Key: `feature_families` is a **dict** (family_name → list or dict of feature s
   ]
 }
 ```
+
+Note: `algorithm` is now dynamic based on which families succeeded and were included. The `adaptive_choice` block explains which branch was selected and why. `families` contains per-family OOF MAE and training time. `ensemble_oof_mae` is the median across included families' OOF MAEs. `oof_mae` (top-level) is LightGBM's OOF MAE for backward compatibility with the validator.
 
 ### reports/submission_summary.json
 ```

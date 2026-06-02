@@ -5,7 +5,49 @@ description: Trains and tunes the predictive model. MUST be invoked after featur
 
 # Modeler
 
-You are the modeler. Your job: train a competent predictive model on the engineered features and produce predictions for the validation rows.
+You are the modeler. Your job: train an adaptive ensemble of models on the engineered features and produce predictions for the validation rows.
+
+## Adaptive ensemble selection
+
+The modeler selects its ensemble composition from `profile.json` before any training begins:
+
+| Branch | Condition | Families |
+|--------|-----------|----------|
+| 1 | panel_forecasting + n_train >= 1000 | LightGBM + XGBoost + Ridge |
+| 2 | panel_forecasting + n_train < 1000  | LightGBM + Ridge |
+| 3 | tabular_regression + n_train >= 1000 | LightGBM + XGBoost + Ridge |
+| 4 | tabular_regression + n_train < 1000  | LightGBM + Ridge |
+| fallback | classification (any size) | LightGBM only |
+
+**Reasoning**: Branches 1 and 3 add XGBoost when there is enough data (≥ 1000 rows) for its broader hyperparameter space to find good values without overfitting noise. Ridge provides paradigm diversity (linear vs. tree) and is especially useful when distribution-shift-aware features are informative. Small datasets (< 1000 rows) skip XGBoost because its 15-trial search risks overfitting.
+
+**Final predictions** are the median across all included families' validation predictions.
+
+## Ridge sanity checks before ensembling
+
+Before including Ridge in the ensemble:
+1. If target is non-negative in training but Ridge predicts negative values: clip Ridge predictions to >= 0.
+2. If `Ridge pred_max > 5 * train_target_max`: exclude Ridge, log reason.
+3. If `abs(Ridge pred_mean - train_mean) / abs(train_mean) > 1.0`: exclude Ridge, log reason.
+
+These prevent a badly-regularized Ridge from contaminating the ensemble. Ridge is excluded from `all_val_preds` if it fails a check; LightGBM always remains.
+
+## Graceful fallback
+
+Each family is wrapped in try/except. If a family fails, it is logged in `model_results.json` with `succeeded=false` and `exclusion_reason`. The pipeline always succeeds with at least LightGBM predictions available.
+
+**Time safeguards**:
+- If total elapsed time > 20 minutes when XGBoost would start: skip XGBoost.
+- If 2 families have completed and total elapsed time > 30 minutes when Ridge would start: skip Ridge.
+
+## Per-family training setup
+
+**LightGBM**: 15 Optuna trials, 5 seeds (median or mean aggregation), early stopping for n_estimators.
+
+**XGBoost**: 15 Optuna trials, 5 seeds, `reg:absoluteerror` objective (fallback: `reg:squarederror`), same CV scheme as LightGBM.
+  - Search space: learning_rate (0.01–0.3), max_depth (3–12), min_child_weight (1–10), subsample (0.5–1.0), colsample_bytree (0.5–1.0), reg_alpha/reg_lambda (0–1).
+
+**Ridge**: No Optuna. Picks alpha via probe split from {0.01, 0.1, 1.0, 10.0, 100.0}. Uses `StandardScaler` fit on training data only. Single fit (no seed aggregation needed for linear model).
 
 ## Inputs
 - reports/schema_analysis.md (problem context)
