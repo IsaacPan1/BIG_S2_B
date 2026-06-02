@@ -41,9 +41,17 @@ schema      = profile.get("schema", {})
 train_files = profile.get("train_files", [])
 val_files   = profile.get("val_files", [])
 
-# Classify covariates by cardinality
+# Classify covariates by cardinality and dtype
 binary_cols  = [c for c in cov_cols if schema.get(c, {}).get("n_unique", 999) == 2]
-numeric_cols = [c for c in cov_cols if c not in binary_cols]
+# Exclude string/text covariates from numeric processing (e.g. free-text fields)
+_str_dtypes  = {"str", "object", "string", "category"}
+numeric_cols = [c for c in cov_cols
+                if c not in binary_cols
+                and schema.get(c, {}).get("dtype", "float64") not in _str_dtypes]
+text_cols    = [c for c in cov_cols
+                if c not in binary_cols and c not in numeric_cols]
+if text_cols:
+    print(f"Text/string covariates (excluded from numeric processing): {text_cols}")
 
 print(f"Target: {target_col}   Groups: {group_cols}   Time: {time_col}")
 print(f"Numeric covariates: {numeric_cols}")
@@ -63,6 +71,18 @@ def load_and_merge(fnames: list[str]) -> pd.DataFrame:
 
 train = load_and_merge(train_files)
 val   = load_and_merge(val_files)
+
+# ── Expand val with any missing group columns via cross-join ──────────────────
+# e.g. val/covariates.csv is jurisdiction×period only; overdose_category is missing.
+# We cross-join with all known values from train so the val frame covers every
+# (jurisdiction, overdose_category, period_id) combination needed for submission.
+_missing_group_cols = [g for g in group_cols if g not in val.columns] if not val.empty else []
+if _missing_group_cols:
+    print(f"Val is missing group col(s) {_missing_group_cols} — expanding via cross-join with train values")
+    for mg in _missing_group_cols:
+        known_vals = pd.DataFrame({mg: train[mg].unique()})
+        val = val.merge(known_vals, how="cross")
+    print(f"Val shape after cross-join expansion: {val.shape}")
 
 # ── CROSS-SECTIONAL PATH (no time_col) ────────────────────────────────────────
 if time_col is None:
@@ -292,26 +312,47 @@ if time_col is None:
     import sys; sys.exit(0)  # Done — skip the panel path below
 
 # ── PANEL PATH (time_col present) — original logic continues below ─────────────
-train = train.sort_values(group_cols + [time_col]).reset_index(drop=True)
-val   = val.sort_values(group_cols + [time_col]).reset_index(drop=True)
-print(f"Train: {train.shape}   Val: {val.shape}")
 
-# ── Convert datetime time_col to numeric ordinal if needed ─────────────────────
+# ── Convert datetime/opaque time_col to numeric ordinal BEFORE sorting ────────
 _time_col_numeric = f"{time_col}_ord"
 _is_datetime_time = False
+_is_opaque_string_time = False
 try:
     _test = int(train[time_col].max())
+    # Integer time column — no conversion needed; use it directly.
 except (ValueError, TypeError):
-    # Datetime string — convert to integer hours since epoch for arithmetic
-    _is_datetime_time = True
+    # Could be a datetime string or an opaque hash string.
     _epoch = pd.Timestamp("2000-01-01")
-    train[_time_col_numeric] = ((pd.to_datetime(train[time_col]) - _epoch)
-                                .dt.total_seconds() / 3600).astype(int)
-    val[_time_col_numeric]   = ((pd.to_datetime(val[time_col]) - _epoch)
-                                .dt.total_seconds() / 3600).astype(int)
-    print(f"Datetime time_col detected — created numeric ordinal '{_time_col_numeric}'")
+    try:
+        _is_datetime_time = True
+        train[_time_col_numeric] = ((pd.to_datetime(train[time_col]) - _epoch)
+                                    .dt.total_seconds() / 3600).astype(int)
+        val[_time_col_numeric]   = ((pd.to_datetime(val[time_col]) - _epoch)
+                                    .dt.total_seconds() / 3600).astype(int)
+        print(f"Datetime time_col detected — created numeric ordinal '{_time_col_numeric}'")
+    except Exception:
+        # Opaque string IDs (e.g. base64 hashes) — assign rank-ordered integers.
+        _is_datetime_time      = False
+        _is_opaque_string_time = True
+        # Derive ordering from train data: sort all train period IDs, then append
+        # any unseen val IDs.  This preserves whatever temporal ordering is
+        # implicit in the training set (sorted alphabetically as a proxy).
+        _train_ids = sorted(train[time_col].unique().tolist())
+        _val_ids   = [v for v in sorted(val[time_col].unique().tolist())
+                      if v not in set(_train_ids)]
+        _all_ids   = _train_ids + _val_ids
+        _id_to_ord = {v: i for i, v in enumerate(_all_ids)}
+        train[_time_col_numeric] = train[time_col].map(_id_to_ord).astype(int)
+        val[_time_col_numeric]   = val[time_col].map(_id_to_ord).astype(int)
+        print(f"Opaque string time_col detected — created rank ordinal '{_time_col_numeric}' "
+              f"({len(_train_ids)} train IDs, {len(_val_ids)} new val IDs)")
 
-_tc = _time_col_numeric if _is_datetime_time else time_col
+_tc = _time_col_numeric if (_is_datetime_time or _is_opaque_string_time) else time_col
+
+# Sort using the (now-numeric) time column so lags are computed correctly.
+train = train.sort_values(group_cols + [_tc]).reset_index(drop=True)
+val   = val.sort_values(group_cols + [_tc]).reset_index(drop=True)
+print(f"Train: {train.shape}   Val: {val.shape}")
 
 # ── Detect time granularity ────────────────────────────────────────────────────
 def _detect_granularity() -> str:
@@ -358,15 +399,19 @@ print(f"Rolling windows: {ROLL_WINDOWS}")
 val_copy = val.copy()
 if target_col not in val_copy.columns:
     val_copy[target_col] = np.nan   # val_features.csv has no target — add placeholder
-full = (pd.concat([train, val_copy], ignore_index=True)
-          .sort_values(group_cols + [time_col])
-          .reset_index(drop=True))
+full = pd.concat([train, val_copy], ignore_index=True)
 
 # Ensure the numeric ordinal column exists in the combined frame
 if _is_datetime_time:
     _epoch = pd.Timestamp("2000-01-01")
     full[_time_col_numeric] = ((pd.to_datetime(full[time_col]) - _epoch)
                                .dt.total_seconds() / 3600).astype(int)
+elif _is_opaque_string_time:
+    # Re-apply the ordinal mapping to the combined frame
+    full[_time_col_numeric] = full[time_col].map(_id_to_ord).astype(int)
+
+# Sort by the numeric ordinal column so lags are computed correctly
+full = full.sort_values(group_cols + [_tc]).reset_index(drop=True)
 
 tr_mask = full[_tc] <= train_time_max
 vl_mask = full[_tc] >  train_time_max
@@ -394,7 +439,8 @@ if _is_datetime_time:
     full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
     full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
 else:
-    t = full[time_col]
+    # For opaque string IDs _tc is the numeric ordinal; for true integer time_col use it directly.
+    t = full[_tc]
     full[f"{time_col}_sin"]  = np.sin(2 * np.pi * (t % PERIOD) / PERIOD)
     full[f"{time_col}_cos"]  = np.cos(2 * np.pi * (t % PERIOD) / PERIOD)
     full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD) / PERIOD)
@@ -633,6 +679,126 @@ if len(group_cols) == 1:
     full[std_col] = full[g0].map(train.groupby(g0)[target_col].std())
     _reg("group_baselines", [std_col])
 
+# ── 12c. Distribution-shift-aware features ────────────────────────────────────
+def _add_shift_aware_features(
+    df: pd.DataFrame,
+    prof: dict,
+    tr_mask_series: pd.Series,
+) -> tuple[list[str], list[str]]:
+    """Add robust features for numeric covariates whose KS statistic > 0.15.
+
+    All statistics (mean, std, rank CDF, group means) are derived from training
+    rows only — validation rows receive the same transform using training params,
+    so there is no leakage.
+
+    Returns
+    -------
+    added_cols : list[str]
+        New column names actually written to df.
+    added_descs : list[str]
+        Human-readable description strings for features.json.
+    """
+    shift_list = prof.get("distribution_shifts", [])
+    if not shift_list:
+        print("No distribution_shifts in profile — skipping shift-aware features.")
+        return [], []
+
+    shifted_covs = [
+        entry["column"]
+        for entry in shift_list
+        if entry.get("ks_statistic", 0.0) > 0.15
+        and entry["column"] in numeric_cols
+        and entry["column"] in df.columns
+    ]
+    if not shifted_covs:
+        print("No numeric covariate with KS > 0.15 — skipping shift-aware features.")
+        return [], []
+
+    print(f"Shift-aware features for {len(shifted_covs)} covariate(s): {shifted_covs}")
+    added_cols:  list[str] = []
+    added_descs: list[str] = []
+    tr_rows = df[tr_mask_series]
+    new_cols_dict: dict[str, pd.Series] = {}  # batch all new columns to avoid fragmentation
+
+    # Normalized time in [0, 1] across the combined (train+val) frame
+    t_min   = float(df[_tc].min())
+    t_max   = float(df[_tc].max())
+    t_range = max(t_max - t_min, 1.0)
+    time_norm = (df[_tc] - t_min) / t_range  # Series aligned with df.index
+
+    for cov in shifted_covs:
+        tr_vals = tr_rows[cov].dropna()
+        if len(tr_vals) == 0:
+            print(f"  WARNING: {cov} all-NaN in training — skipping its shift features")
+            continue
+
+        tr_mean   = float(tr_vals.mean())
+        tr_std    = float(tr_vals.std())
+        tr_median = float(tr_vals.median())
+        cov_imp   = df[cov].fillna(tr_median)  # impute NaN with training median
+
+        # 1. Z-score normalization (training mean/std)
+        if np.isnan(tr_std) or tr_std < 1e-9:
+            print(f"  WARNING: {cov} std ≈ 0 — skipping z-score features")
+        else:
+            zs_col = f"{cov}_zscore"
+            new_cols_dict[zs_col] = (cov_imp - tr_mean) / tr_std
+            added_cols.append(zs_col)
+            added_descs.append(
+                f"{zs_col}: {cov} z-score normalized to training mean/std")
+
+            # 2. Rolling z-score (4-period window per group)
+            roll4_mean = df.groupby(group_cols)[cov].transform(
+                lambda s: s.rolling(4, min_periods=1).mean())
+            roll4_std  = df.groupby(group_cols)[cov].transform(
+                lambda s: s.rolling(4, min_periods=2).std())
+            roll4_std  = roll4_std.fillna(tr_std).replace(0.0, tr_std)
+            rz_col = f"{cov}_zscore_roll4"
+            new_cols_dict[rz_col] = ((cov_imp - roll4_mean) / roll4_std).fillna(0.0)
+            added_cols.append(rz_col)
+            added_descs.append(
+                f"{rz_col}: {cov} rolling 4-period z-score (short-term anomaly)")
+
+        # 3. Rank transform — percentile in training CDF, normalized to [0, 1]
+        sorted_tr = np.sort(tr_vals.values)
+        n_tr      = len(sorted_tr)
+        rk_col    = f"{cov}_rank"
+        new_cols_dict[rk_col] = pd.Series(
+            np.searchsorted(sorted_tr, cov_imp.values, side="right") / n_tr,
+            index=df.index)
+        added_cols.append(rk_col)
+        added_descs.append(
+            f"{rk_col}: {cov} percentile rank within training distribution [0,1]")
+
+        # 4. Group-relative deviation (one feature per group column)
+        for g in group_cols:
+            grp_means = tr_rows.groupby(g)[cov].mean()
+            dev_col   = f"{cov}_dev_from_{g}_mean"
+            new_cols_dict[dev_col] = cov_imp - df[g].map(grp_means).fillna(tr_mean)
+            added_cols.append(dev_col)
+            added_descs.append(
+                f"{dev_col}: {cov} deviation from {g}-level training mean")
+
+        # 5. Covariate × normalized time interaction
+        tx_col = f"{cov}_x_{time_col}_norm"
+        new_cols_dict[tx_col] = cov_imp * time_norm
+        added_cols.append(tx_col)
+        added_descs.append(
+            f"{tx_col}: {cov} × normalized time — captures time-varying shift effect")
+
+    return added_cols, added_descs, pd.DataFrame(new_cols_dict, index=df.index)
+
+_shift_cols, _shift_descs, _shift_df = _add_shift_aware_features(full, profile, tr_mask)
+if _shift_cols:
+    # Concat all shift-aware columns in one shot to avoid DataFrame fragmentation
+    full = pd.concat([full, _shift_df], axis=1)
+    # Refresh masks after concat (index is unchanged but reassignment is safe)
+    tr_mask = full[_tc] <= train_time_max
+    vl_mask = full[_tc] >  train_time_max
+    _reg("shift_aware", _shift_descs)
+    print(f"Shift-aware features added: {len(_shift_cols)}  "
+          f"{_shift_cols[:4]}{'...' if len(_shift_cols) > 4 else ''}")
+
 # ── 13. Fill val NaN lags/roll features ──────────────────────────────────────
 print("Filling val NaN lag/roll features…")
 last_known = (full.loc[full[_tc] == train_time_max, group_cols + [target_col]]
@@ -739,6 +905,11 @@ features_meta = {
         "Rolling stats use shift(1) before rolling to prevent target leakage.",
         "Val NaN lag/roll features filled with last-known training value per group.",
         "Long lags/windows skipped if min_periods_per_group < threshold.",
+        *(
+            [f"Shift-aware features added for {len(_shift_cols)} covariate(s) with KS > 0.15: "
+             "z-score, rolling z-score, rank, group deviation, time interaction."]
+            if _shift_cols else []
+        ),
     ],
 }
 with open(REPORTS_DIR / "features.json", "w") as fh:
