@@ -1,11 +1,13 @@
 """
-Modeler: Adaptive LightGBM + XGBoost + Ridge ensemble.
+Modeler: Adaptive LightGBM + XGBoost + CatBoost + Ridge ensemble.
 Branch selected by problem_type and n_train:
-  panel_forecasting  + n_train>=1000 → Branch 1: LightGBM+XGBoost+Ridge
+  panel_forecasting  + n_train>=1000 → Branch 1: LightGBM+XGBoost+CatBoost+Ridge
   panel_forecasting  + n_train<1000  → Branch 2: LightGBM+Ridge
-  tabular_regression + n_train>=1000 → Branch 3: LightGBM+XGBoost+Ridge
+  tabular_regression + n_train>=1000 → Branch 3: LightGBM+XGBoost+CatBoost+Ridge
   tabular_regression + n_train<1000  → Branch 4: LightGBM+Ridge
   classification                     → classification_fallback: LightGBM only
+CatBoost (Axis 3) is conditional: runs only when catboost is importable,
+elapsed < 40 min, and n_train >= 500. Excluded if OOF > 1.5x best tree OOF.
 Final predictions = median across included families' val predictions.
 """
 import pandas as pd
@@ -110,8 +112,8 @@ def select_ensemble(profile, n_train):
                 "reasoning": "Classification: LightGBM only (ensembling not fully tested)"}
     if n_train >= 1000:
         b = 1 if pt == "panel_forecasting" else 3
-        return {"branch": b, "families": ["lightgbm", "xgboost", "ridge"],
-                "reasoning": f"{pt}, n_train={n_train}>=1000: full 3-family ensemble"}
+        return {"branch": b, "families": ["lightgbm", "xgboost", "catboost", "ridge"],
+                "reasoning": f"{pt}, n_train={n_train}>=1000: full 4-family ensemble (LGB+XGB+CatBoost+Ridge)"}
     b = 2 if pt == "panel_forecasting" else 4
     return {"branch": b, "families": ["lightgbm", "ridge"],
             "reasoning": f"{pt}, n_train={n_train}<1000: 2-family ensemble (skip XGBoost)"}
@@ -489,6 +491,162 @@ if "xgboost" in families_plan:
         all_family_results["xgboost"] = _xgb_res
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CATBOOST (Axis 3 — conditional, time-gated)
+# ══════════════════════════════════════════════════════════════════════════════
+if "catboost" in families_plan:
+    _elapsed_cb = (time.time() - start_time) / 60
+    try:
+        import catboost as _cb_module
+        _catboost_available = True
+    except ImportError:
+        _catboost_available = False
+
+    _should_run_cb = (
+        _catboost_available
+        and n_train >= 500
+        and _elapsed_cb < 40
+        and problem_type in ("panel_forecasting", "tabular_regression", "classification")
+    )
+
+    if not _should_run_cb:
+        _skip_reason = (
+            "skipped_import_error" if not _catboost_available else
+            f"skipped_data_too_small (n_train={n_train})" if n_train < 500 else
+            f"skipped_no_time (elapsed={_elapsed_cb:.1f}m >= 40m)" if _elapsed_cb >= 40 else
+            "skipped_unsupported_problem_type"
+        )
+        print(f"\nCatBoost skipped: {_skip_reason}")
+        all_family_results["catboost"] = {
+            "succeeded": False, "included_in_ensemble": False,
+            "skip_reason": _skip_reason, "oof_mae": None, "training_time_seconds": 0,
+        }
+    else:
+        print("\n" + "-"*50 + "\nCatBoost (Axis 3)\n" + "-"*50)
+        _ct0 = time.time()
+        _cb_res = {"succeeded": False, "included_in_ensemble": False,
+                   "oof_mae": None, "training_time_seconds": None,
+                   "skip_reason": None, "exclusion_reason": None}
+        try:
+            _cb_loss = "MAE" if problem_type in ("panel_forecasting", "tabular_regression") else "Logloss"
+            _cat_cols = [c for c in feature_cols if train_df[c].dtype.name in ("object", "category")]
+            _cat_idx = [feature_cols.index(c) for c in _cat_cols]
+
+            CB_DEADLINE = start_time + 50 * 60  # hard stop at 50 min total
+
+            def _cb_obj(trial):
+                if time.time() > CB_DEADLINE: raise optuna.exceptions.TrialPruned()
+                _p = {
+                    "iterations": 400,
+                    "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.10, log=True),
+                    "depth": trial.suggest_int("depth", 4, 8),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+                    "loss_function": _cb_loss, "eval_metric": _cb_loss,
+                    "verbose": False, "allow_writing_files": False,
+                }
+                if _cat_idx: _p["cat_features"] = _cat_idx
+                _ms = []
+                for _s in [42, 7]:
+                    _p["random_seed"] = _s
+                    _m = (_cb_module.CatBoostRegressor(**_p) if _cb_loss == "MAE"
+                          else _cb_module.CatBoostClassifier(**_p))
+                    _m.fit(X_ptr.values, y_ptr, verbose=False)
+                    _ms.append(mean_absolute_error(y_pva, np.clip(_m.predict(X_pva.values), 0, None)))
+                return float(np.mean(_ms))
+
+            _cb_study = optuna.create_study(direction="minimize")
+            _cb_study.optimize(_cb_obj, n_trials=10, timeout=15*60, catch=(Exception,))
+            _cb_best = _cb_study.best_params
+            print(f"CatBoost Optuna: {len(_cb_study.trials)} trials, best={_cb_study.best_value:.4f}")
+
+            _cb_fp = {
+                "iterations": 400,
+                "learning_rate": _cb_best.get("learning_rate", 0.05),
+                "depth": _cb_best.get("depth", 6),
+                "l2_leaf_reg": _cb_best.get("l2_leaf_reg", 3.0),
+                "loss_function": _cb_loss, "eval_metric": _cb_loss,
+                "verbose": False, "allow_writing_files": False,
+            }
+            if _cat_idx: _cb_fp["cat_features"] = _cat_idx
+
+            def _cb_pfn(Xtr, ytr, Xva):
+                _preds = []
+                for _s in [42, 7, 123]:
+                    _cb_fp["random_seed"] = _s
+                    _m = (_cb_module.CatBoostRegressor(**_cb_fp) if _cb_loss == "MAE"
+                          else _cb_module.CatBoostClassifier(**_cb_fp))
+                    _m.fit(Xtr.values if hasattr(Xtr, "values") else Xtr, ytr, verbose=False)
+                    _preds.append(np.clip(_m.predict(Xva.values if hasattr(Xva, "values") else Xva), 0, None))
+                return np.median(_preds, axis=0)
+
+            if problem_type == "panel_forecasting":
+                _cm, _cf, _cod = _panel_oof(_cb_pfn, _use_multi_wf)
+            else:
+                _cm, _cf, _carr, _cflds = _tabular_oof(_cb_pfn)
+            print(f"CatBoost OOF MAE: {_cm:.4f}")
+            _cb_res["oof_mae"] = float(_cm)
+
+            # Competence check: cb_oof <= 1.5 * best tree OOF
+            _tree_oof_maes_cb = {k: all_family_results[k]["oof_mae"]
+                                 for k in ("lightgbm", "xgboost")
+                                 if k in all_family_results
+                                 and all_family_results[k].get("succeeded")
+                                 and all_family_results[k].get("oof_mae") is not None}
+            _best_tree_oof_cb = min(_tree_oof_maes_cb.values()) if _tree_oof_maes_cb else float("inf")
+            _cb_passes = _cm <= 1.5 * _best_tree_oof_cb
+
+            if not _cb_passes:
+                _cb_res["exclusion_reason"] = (
+                    f"excluded_too_weak: cb_oof={_cm:.4f} > 1.5x best_tree_oof={_best_tree_oof_cb:.4f}"
+                )
+                _cb_res["included_in_ensemble"] = False
+                _cb_res["succeeded"] = True
+                print(f"CatBoost EXCLUDED (competence): {_cb_res['exclusion_reason']}")
+            else:
+                print("CatBoost: full retrain (5 seeds)...")
+                _cb_fps = []
+                for _s in [42, 7, 123, 2024, 999]:
+                    _cb_fp["random_seed"] = _s
+                    _m = (_cb_module.CatBoostRegressor(**_cb_fp) if _cb_loss == "MAE"
+                          else _cb_module.CatBoostClassifier(**_cb_fp))
+                    _m.fit(X_full.values, y_full, verbose=False)
+                    _cb_fps.append(_m.predict(X_val.values))
+                _cb_vp = np.median(_cb_fps, axis=0)
+                if train_target_min >= 0:
+                    _cb_vp = np.clip(_cb_vp, 0, None)
+
+                _cb_ok = True
+                _cb_pmax, _cb_pmean = float(_cb_vp.max()), float(_cb_vp.mean())
+                if _cb_pmax > 5 * train_target_max:
+                    _cb_res["exclusion_reason"] = (
+                        f"sanity: pred_max={_cb_pmax:.2f} > 5x train_max={train_target_max:.2f}"
+                    )
+                    _cb_ok = False
+                    print(f"CatBoost EXCLUDED (sanity): {_cb_res['exclusion_reason']}")
+                elif abs(train_target_mean) > 0 and abs(_cb_pmean - train_target_mean) / abs(train_target_mean) > 1.0:
+                    _cb_res["exclusion_reason"] = (
+                        f"sanity: pred_mean={_cb_pmean:.2f} deviates >100% from train_mean={train_target_mean:.2f}"
+                    )
+                    _cb_ok = False
+                    print(f"CatBoost EXCLUDED (sanity): {_cb_res['exclusion_reason']}")
+
+                _cb_res["succeeded"] = True
+                if _cb_ok:
+                    all_val_preds["catboost"] = _cb_vp
+                    _cb_res["included_in_ensemble"] = True
+                    print(f"CatBoost included: OOF={_cm:.4f}, val mean={_cb_vp.mean():.3f}")
+                else:
+                    _cb_res["included_in_ensemble"] = False
+
+        except Exception as _cb_exc:
+            _cb_res["succeeded"] = False
+            _cb_res["skip_reason"] = f"training_error: {_cb_exc}"
+            print(f"CatBoost FAILED: {_cb_exc}")
+
+        _cb_res["training_time_seconds"] = float(time.time() - _ct0)
+        all_family_results["catboost"] = _cb_res
+        print(f"CatBoost block: time={_cb_res['training_time_seconds']:.1f}s")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RIDGE
 # ══════════════════════════════════════════════════════════════════════════════
 if "ridge" in families_plan:
@@ -762,7 +920,7 @@ results = {
     },
     "families": {
         "lightgbm": all_family_results.get("lightgbm", {}),
-        **({k: all_family_results[k] for k in ["xgboost", "ridge"] if k in all_family_results}),
+        **({k: all_family_results[k] for k in ["xgboost", "catboost", "ridge"] if k in all_family_results}),
     },
     "ensemble_oof_mae": float(ensemble_oof_mae),
     "n_families_in_ensemble": len(_fam_names),
