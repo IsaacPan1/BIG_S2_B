@@ -31,3 +31,4 @@ Thumbs.db
 
 # claude settings
 .claude/settings.local.json
+tools/run_modeler_script.py
