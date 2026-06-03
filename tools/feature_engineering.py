@@ -970,21 +970,83 @@ last_known = (full.loc[full[_tc] == train_time_max, group_cols + [target_col]]
               .set_index(group_cols))
 full = full.join(last_known, on=group_cols)
 
-# For hourly panel data: impute NaN lag_k with mean(target | group, hour=(h-k)%24)
-# This is far more accurate than using the last training value when predicting many
-# hours ahead, because it preserves the intra-day load pattern in the imputations.
+# Smart lag imputation: fill val NaN lag_k with cycle-position-aware group mean.
+#   hourly  → mean(target | group, hour=(h-k) % 24)
+#   monthly → mean(target | group, month_of_year=(m-k) % 12)
+#   weekly  → mean(target | group, week_of_year=(w-k) % 52)
+#   daily   → mean(target | group, day_of_week=(d-k) % 7)
+# Falls back to last_known when a cycle position cannot be derived.
+_lk_arr = full["_lk"].values
+_smart_lag_meta: dict = {
+    "activated": False,
+    "granularity": _granularity,
+    "method": "last_known",
+    "n_val_lag_cells_filled": 0,
+    "fallback_to_last_known_count": 0,
+}
+
+
+def _cycle_impute_lags(cycle_pos_arr: np.ndarray, cycle_len: int, method: str) -> tuple:
+    """Vectorised cycle-aware lag imputation.  Modifies `full` in-place.
+    Returns (n_smart_filled, n_fallback_filled).
+    """
+    _tr_df = full.loc[tr_mask, group_cols + [target_col]].copy()
+    _tr_df["_cp"] = (cycle_pos_arr[tr_mask.values] % cycle_len).astype(int)
+    _gby = group_cols + ["_cp"]
+    _stats = (_tr_df.groupby(_gby)[target_col]
+              .mean()
+              .reset_index()
+              .rename(columns={target_col: "_cm"}))
+
+    _ns, _nf = 0, 0
+    for _k in LAG_PERIODS:
+        _lc = f"lag_{_k}"
+        if _lc not in full.columns:
+            continue
+        _nan_mask = vl_mask & full[_lc].isna()
+        if not _nan_mask.any():
+            continue
+
+        _aux = full[group_cols].copy()
+        _aux["_cp"] = (cycle_pos_arr.astype(int) - _k) % cycle_len
+        _aux = _aux.reset_index().merge(_stats, on=_gby, how="left").set_index("index")
+        _fill = _aux["_cm"]
+
+        _smart = _nan_mask & _fill.notna()
+        _lkfb  = _nan_mask & _fill.isna()
+        if _smart.any():
+            full.loc[_smart, _lc] = _fill[_smart]
+            _ns += int(_smart.sum())
+        if _lkfb.any():
+            full.loc[_lkfb, _lc] = full.loc[_lkfb, "_lk"]
+            _nf += int(_lkfb.sum())
+        print(f"  {_lc}: filled {int(_nan_mask.sum())} NaN ({method})")
+    return _ns, _nf
+
+
+def _fill_rolls_last_known() -> None:
+    for _w in ROLL_WINDOWS:
+        _col = f"roll_mean_{_w}"
+        _m = vl_mask & full[_col].isna()
+        if _m.sum():
+            full.loc[_m, _col] = full.loc[_m, "_lk"]
+            print(f"  {_col}: filled {int(_m.sum())} NaN")
+    for _col in [f"roll_std_{_w}" for _w in ROLL_WINDOWS]:
+        _m = vl_mask & full[_col].isna()
+        if _m.sum():
+            full.loc[_m, _col] = 0.0
+
+
 if _granularity == "hourly" and _is_datetime_time and len(group_cols) == 1:
     _g0 = group_cols[0]
-    _tr_hod_v = pd.to_datetime(train[time_col]).dt.hour.values
+    _tr_hod_v   = pd.to_datetime(train[time_col]).dt.hour.values
     _full_hod_v = pd.to_datetime(full[time_col]).dt.hour.values
     _full_grp_v = full[_g0].values
-    # Build (group_val, hod) → mean target dict from training only
     _hod_lists: dict = {}
     for _gv, _h, _tv in zip(train[_g0].values, _tr_hod_v, train[target_col].values):
         _hk = (_gv, int(_h))
         _hod_lists.setdefault(_hk, []).append(_tv)
     _hod_mean_d: dict = {k: float(np.mean(v)) for k, v in _hod_lists.items()}
-    _lk_arr = full["_lk"].values
 
     for k in LAG_PERIODS:
         lag_col = f"lag_{k}"
@@ -1004,16 +1066,78 @@ if _granularity == "hourly" and _is_datetime_time and len(group_cols) == 1:
         full.iloc[nan_idx, full.columns.get_loc(lag_col)] = fill_vals
         print(f"  {lag_col}: filled {len(nan_idx)} NaN (hour-aware)")
 
-    for w in ROLL_WINDOWS:
-        col = f"roll_mean_{w}"
-        mask = vl_mask & full[col].isna()
-        if mask.sum():
-            full.loc[mask, col] = full.loc[mask, "_lk"]
-            print(f"  {col}: filled {int(mask.sum())} NaN")
-    for col in [f"roll_std_{w}" for w in ROLL_WINDOWS]:
-        mask = vl_mask & full[col].isna()
-        if mask.sum():
-            full.loc[mask, col] = 0.0
+    _fill_rolls_last_known()
+    _smart_lag_meta.update({"activated": True, "method": "group_x_hour_of_day"})
+
+elif _granularity == "monthly":
+    _moy_arr: np.ndarray | None = None
+    _moy_method = "last_known"
+    if "month_of_year" in full.columns:
+        # Codebook date features already computed — reuse them
+        _moy_arr    = full["month_of_year"].values.astype(int)
+        _moy_method = "group_x_month_of_year_codebook"
+    elif _is_datetime_time:
+        _moy_arr    = pd.to_datetime(full[time_col]).dt.month.values.astype(int)
+        _moy_method = "group_x_month_of_year_datetime"
+
+    if _moy_arr is not None:
+        _ns, _nf = _cycle_impute_lags(_moy_arr, 12, "monthly")
+        _smart_lag_meta.update({
+            "activated": True,
+            "method": _moy_method,
+            "n_val_lag_cells_filled": _ns,
+            "fallback_to_last_known_count": _nf,
+        })
+        print(f"Monthly smart lag imputation: {_ns} cycle fills, {_nf} last_known fallbacks")
+    else:
+        for _lc in [f"lag_{k}" for k in LAG_PERIODS]:
+            _m = vl_mask & full[_lc].isna()
+            if _m.sum():
+                full.loc[_m, _lc] = full.loc[_m, "_lk"]
+                print(f"  {_lc}: filled {int(_m.sum())} NaN (last_known fallback)")
+    _fill_rolls_last_known()
+
+elif _granularity == "weekly":
+    _woy_arr: np.ndarray | None = None
+    _woy_method = "last_known"
+    if _is_datetime_time:
+        _woy_arr    = (pd.to_datetime(full[time_col])
+                       .dt.isocalendar().week.astype(int).values)
+        _woy_method = "group_x_week_of_year_datetime"
+    elif not _is_opaque_string_time:
+        # Integer time_col treated as week number; modulo 52 gives intra-year position
+        _woy_arr    = full[_tc].values.astype(int) % 52
+        _woy_arr    = np.where(_woy_arr == 0, 52, _woy_arr)
+        _woy_method = "group_x_week_of_year_modulo"
+
+    if _woy_arr is not None:
+        _ns, _nf = _cycle_impute_lags(_woy_arr, 52, "weekly")
+        _smart_lag_meta.update({
+            "activated": True,
+            "method": _woy_method,
+            "n_val_lag_cells_filled": _ns,
+            "fallback_to_last_known_count": _nf,
+        })
+        print(f"Weekly smart lag imputation: {_ns} cycle fills, {_nf} last_known fallbacks")
+    else:
+        for _lc in [f"lag_{k}" for k in LAG_PERIODS]:
+            _m = vl_mask & full[_lc].isna()
+            if _m.sum():
+                full.loc[_m, _lc] = full.loc[_m, "_lk"]
+                print(f"  {_lc}: filled {int(_m.sum())} NaN (last_known fallback)")
+    _fill_rolls_last_known()
+
+elif _granularity == "daily" and _is_datetime_time:
+    _dow_arr = pd.to_datetime(full[time_col]).dt.dayofweek.values.astype(int)
+    _ns, _nf = _cycle_impute_lags(_dow_arr, 7, "daily")
+    _smart_lag_meta.update({
+        "activated": True,
+        "method": "group_x_day_of_week",
+        "n_val_lag_cells_filled": _ns,
+        "fallback_to_last_known_count": _nf,
+    })
+    print(f"Daily smart lag imputation: {_ns} cycle fills, {_nf} last_known fallbacks")
+    _fill_rolls_last_known()
 
 else:
     fill_mean_cols = ([f"lag_{k}" for k in LAG_PERIODS]
@@ -1072,13 +1196,14 @@ features_meta = {
     "total_features_planned": len(feature_cols),
     "lag_periods":            LAG_PERIODS,
     "rolling_windows":        ROLL_WINDOWS,
+    "smart_lag_imputation":   _smart_lag_meta,
     "train_shape":            list(features_train.shape),
     "val_shape":              list(features_val.shape),
     "adversarial_validation": _av_meta,
     "notes": [
         "Group baselines computed from train rows only — no leakage.",
         "Rolling stats use shift(1) before rolling to prevent target leakage.",
-        "Val NaN lag/roll features filled with last-known training value per group.",
+        "Val NaN lag/roll features filled with cycle-aware group mean (monthly/weekly/daily/hourly) or last-known fallback.",
         "Long lags/windows skipped if min_periods_per_group < threshold.",
         *(
             [f"Shift-aware features added for {len(_shift_cols)} covariate(s) with KS > 0.15: "
