@@ -93,8 +93,10 @@ Each family is wrapped in try/except. If a family fails, it is logged in `model_
 
 **XGBoost**: 15 Optuna trials, 5 seeds, `reg:absoluteerror` objective (fallback: `reg:squarederror`), same CV scheme as LightGBM.
   - Search space: learning_rate (0.01–0.3), max_depth (3–12), min_child_weight (1–10), subsample (0.5–1.0), colsample_bytree (0.5–1.0), reg_alpha/reg_lambda (0–1).
+  - Pass `sample_weight=_wf_sw` in the Optuna objective `.fit()` and `sample_weight=_adv_weights` for the final full-data retraining (both are None when adversarial validation did not activate).
 
 **Ridge**: No Optuna. Picks alpha via probe split from {0.01, 0.1, 1.0, 10.0, 100.0}. Uses `StandardScaler` fit on training data only. Single fit (no seed aggregation needed for linear model).
+  - Pass `sample_weight=_adv_weights` to `ridge.fit(X, y, sample_weight=_adv_weights)` (None means uniform).
 
 ## Inputs
 - reports/schema_analysis.md (problem context)
@@ -125,7 +127,7 @@ target_col = feat_meta["target_col"]
 group_cols = feat_meta["group_cols"]
 time_col   = feat_meta["time_col"]
 
-exclude = set(group_cols + [time_col, target_col])
+exclude = set(group_cols + ([time_col] if time_col else []) + [target_col, "adversarial_weights"])
 feature_cols = [c for c in train_df.columns if c not in exclude]
 
 print(f"Train: {train_df.shape}, Val: {val_df.shape}")
@@ -139,6 +141,20 @@ print(f"Target: {target_col}")
 # systematic ~11-unit underprediction. Use training medians as defense-in-depth
 # even after the feature_engineer fix fills most of these.
 fill_vals = train_df[feature_cols].median()
+```
+
+### Step 2b — Load adversarial sample weights (if available)
+
+```python
+_av_info = feat_meta.get("adversarial_validation", {})
+_adv_weights = None
+if _av_info.get("weights_applied", False) and "adversarial_weights" in train_df.columns:
+    _adv_weights = train_df["adversarial_weights"].fillna(1.0).values
+    print(f"Adversarial weights loaded: min={_adv_weights.min():.3f}, "
+          f"max={_adv_weights.max():.3f}, mean={_adv_weights.mean():.3f}")
+    print(f"  AUC (train vs val): {_av_info.get('auc_train_vs_val')}")
+else:
+    print("No adversarial weights — training with uniform sample weights")
 ```
 
 ### Step 3 — Choose modeling recipe and CV strategy based on problem_type
@@ -214,6 +230,9 @@ y_wf_val   = wf_val[target_col]
 
 print(f"Walk-forward train: {X_wf_train.shape}, val: {X_wf_val.shape}")
 print(f"Cutoff week: {cutoff_week}")
+
+# Sample weights aligned to walk-forward training rows (None = uniform)
+_wf_sw = _adv_weights[wf_train.index.values] if _adv_weights is not None else None
 
 # For tabular_regression / classification: 80/20 random split for Optuna (fast)
 np.random.seed(42)
@@ -312,6 +331,7 @@ def objective(trial):
         m = lgb.LGBMRegressor(**{**params, "random_state": seed})
         m.fit(
             X_wf_train, y_wf_train,
+            sample_weight=_wf_sw,
             eval_set=[(X_wf_val, y_wf_val)],
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)]
         )
@@ -362,6 +382,7 @@ probe_params = {
 probe = lgb.LGBMRegressor(**probe_params)
 probe.fit(
     X_wf_train, y_wf_train,
+    sample_weight=_wf_sw,
     eval_set=[(X_wf_val, y_wf_val)],
     callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(200)]
 )
@@ -405,10 +426,11 @@ for fold_idx, (tr_idx, va_idx) in enumerate(cv_splits):
     X_va = X_full.iloc[va_idx].fillna(X_full.iloc[tr_idx].median())
     y_va = y_full[va_idx]
 
+    _fold_sw = _adv_weights[tr_idx] if _adv_weights is not None else None
     fold_seed_preds = []
     for seed in [42, 7, 123]:
         m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
-        m.fit(X_tr, y_tr, callbacks=[lgb.log_evaluation(-1)])
+        m.fit(X_tr, y_tr, sample_weight=_fold_sw, callbacks=[lgb.log_evaluation(-1)])
         fold_seed_preds.append(np.clip(m.predict(X_va), 0, None))
 
     fold_pred = np.mean(fold_seed_preds, axis=0)
@@ -432,7 +454,7 @@ X_val  = val_df[feature_cols].fillna(fill_vals)
 seed_preds = []
 for seed in [42, 7, 123, 2024, 999]:
     m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
-    m.fit(X_full_filled, y_full, callbacks=[lgb.log_evaluation(-1)])
+    m.fit(X_full_filled, y_full, sample_weight=_adv_weights, callbacks=[lgb.log_evaluation(-1)])
     seed_preds.append(np.clip(m.predict(X_val), 0, None))
 
 ensemble_preds = np.mean(seed_preds, axis=0)
@@ -505,6 +527,13 @@ results = {
     "n_train_rows": len(train_df),
     "n_val_rows": len(val_df),
     "retune_applied": _retune_applied,
+    "adaptive_choice": {
+        "adversarial_validation": {
+            "used_weights": _adv_weights is not None,
+            "auc_from_feature_engineer": _av_info.get("auc_train_vs_val"),
+            "weight_range_used": _av_info.get("weight_range") if _adv_weights is not None else None,
+        },
+    },
 }
 
 with open("reports/model_results.json", "w") as f:

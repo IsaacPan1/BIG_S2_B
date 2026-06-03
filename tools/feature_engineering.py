@@ -84,6 +84,120 @@ if _missing_group_cols:
         val = val.merge(known_vals, how="cross")
     print(f"Val shape after cross-join expansion: {val.shape}")
 
+# ── Adversarial validation helper ─────────────────────────────────────────────
+def _run_adversarial_validation(
+    train_rows: "pd.DataFrame",
+    val_rows: "pd.DataFrame",
+    numeric_cov_cols: list,
+) -> tuple:
+    """Detect multivariate shift via a binary train-vs-val LightGBM classifier.
+
+    Returns (meta_dict, sample_weights_for_train | None).
+    Weights are parallel to train_rows; None means no weighting applied.
+    Silently degrades on any error so the main pipeline is never blocked.
+    """
+    meta: dict = {
+        "activated": False,
+        "skip_reason": None,
+        "auc_train_vs_val": None,
+        "weights_applied": False,
+        "weight_range": None,
+        "weight_mean": None,
+        "weight_std": None,
+        "top_shift_revealing_features": None,
+        "n_train_rows_weighted": None,
+    }
+    try:
+        n_tr = len(train_rows)
+        n_vl = len(val_rows)
+
+        if n_tr + n_vl < 500:
+            meta["skip_reason"] = f"insufficient_data: combined={n_tr + n_vl} < 500"
+            return meta, None
+        if n_tr < 100:
+            meta["skip_reason"] = f"insufficient_train: n_train={n_tr} < 100"
+            return meta, None
+        if n_vl < 100:
+            meta["skip_reason"] = f"insufficient_val: n_val={n_vl} < 100"
+            return meta, None
+
+        cand = [
+            c for c in numeric_cov_cols
+            if c in train_rows.columns and c in val_rows.columns
+            and pd.api.types.is_numeric_dtype(train_rows[c])
+        ]
+        if len(cand) < 3:
+            meta["skip_reason"] = f"insufficient_numeric_cols: found {len(cand)} < 3"
+            return meta, None
+
+        print(f"Adversarial validation: ACTIVATED — n_train={n_tr}, n_val={n_vl}, "
+              f"n_cov_cols={len(cand)}")
+
+        import lightgbm as _lgb_av
+        from sklearn.model_selection import StratifiedKFold as _SKF_av
+        from sklearn.metrics import roc_auc_score as _roc_av
+
+        _fill  = train_rows[cand].median()
+        _X_adv = pd.concat(
+            [train_rows[cand].fillna(_fill), val_rows[cand].fillna(_fill)],
+            ignore_index=True,
+        )
+        _y_adv = np.concatenate(
+            [np.ones(n_tr, dtype=np.int8), np.zeros(n_vl, dtype=np.int8)]
+        )
+        _clf_p = {
+            "objective": "binary", "metric": "auc",
+            "n_estimators": 100, "learning_rate": 0.05,
+            "num_leaves": 31, "min_child_samples": 20,
+            "verbose": -1, "n_jobs": -1, "random_state": 42,
+        }
+        _oof_p  = np.zeros(n_tr + n_vl)
+        _fi_acc = np.zeros(len(cand))
+
+        for _, (_tri, _vai) in enumerate(
+            _SKF_av(n_splits=5, shuffle=True, random_state=42).split(_X_adv, _y_adv)
+        ):
+            _clf = _lgb_av.LGBMClassifier(**_clf_p)
+            _clf.fit(_X_adv.iloc[_tri], _y_adv[_tri],
+                     callbacks=[_lgb_av.log_evaluation(-1)])
+            _oof_p[_vai]  = _clf.predict_proba(_X_adv.iloc[_vai])[:, 1]
+            _fi_acc       += _clf.feature_importances_
+
+        auc = float(_roc_av(_y_adv, _oof_p))
+        meta["activated"]        = True
+        meta["auc_train_vs_val"] = auc
+        _top = (
+            pd.Series(_fi_acc / 5, index=cand)
+            .nlargest(min(5, len(cand))).index.tolist()
+        )
+        meta["top_shift_revealing_features"] = _top
+        print(f"  AUC={auc:.4f}  top shift features: {_top}")
+
+        if auc < 0.55:
+            meta["weights_applied"] = False
+            meta["skip_reason"]     = "no_meaningful_shift_detected"
+            print("  AUC < 0.55 — no meaningful shift; skipping sample weights")
+            return meta, None
+
+        _w = np.clip(1.0 - _oof_p[:n_tr], 0.1, 10.0)
+        _w = _w / _w.mean()   # normalize so mean = 1.0
+
+        meta["weights_applied"]       = True
+        meta["weight_range"]          = [float(_w.min()), float(_w.max())]
+        meta["weight_mean"]           = float(_w.mean())
+        meta["weight_std"]            = float(_w.std())
+        meta["n_train_rows_weighted"] = n_tr
+        print(f"  Weights: min={_w.min():.3f} max={_w.max():.3f} "
+              f"mean={_w.mean():.3f} std={_w.std():.3f}")
+        return meta, _w
+
+    except Exception as _e:
+        meta["activated"]   = False
+        meta["skip_reason"] = f"classifier_error: {str(_e)[:200]}"
+        print(f"Adversarial validation failed: {_e} — continuing without weights")
+        return meta, None
+
+
 # ── CROSS-SECTIONAL PATH (no time_col) ────────────────────────────────────────
 if time_col is None:
     print("No time_col detected — running cross-sectional feature engineering path.")
@@ -258,13 +372,22 @@ if time_col is None:
     if target_col in val_feat.columns:
         val_feat[target_col] = np.nan
 
+    # ── Adversarial validation (multivariate shift detection) ─────────────────
+    _av_meta, _av_weights = _run_adversarial_validation(
+        train_feat, val_feat, true_numeric_covs,
+    )
+    if _av_weights is not None:
+        train_feat = train_feat.copy()
+        train_feat["adversarial_weights"] = _av_weights
+        print("adversarial_weights column added to features_train")
+
     train_feat.to_parquet(DATA_DIR / "features_train.parquet", index=False)
     val_feat.to_parquet(  DATA_DIR / "features_val.parquet",   index=False)
     print(f"features_train: {train_feat.shape}")
     print(f"features_val:   {val_feat.shape}")
 
     # ── Enumerate feature columns ──────────────────────────────────────────────
-    id_and_target_set = {id_col, target_col, image_link_col} | set(group_cols)
+    id_and_target_set = {id_col, target_col, image_link_col, "adversarial_weights"} | set(group_cols)
     feature_cols = [c for c in train_feat.columns
                     if c not in id_and_target_set and c != target_col]
     print(f"Total feature columns: {len(feature_cols)}")
@@ -283,6 +406,7 @@ if time_col is None:
         "rolling_windows":        [],
         "train_shape":            list(train_feat.shape),
         "val_shape":              list(val_feat.shape),
+        "adversarial_validation": _av_meta,
         "notes": [
             "Cross-sectional tabular regression — no time/lag features.",
             "Group baselines (sex-level) computed from train rows only — no leakage.",
@@ -907,6 +1031,16 @@ else:
 
 full.drop(columns=["_lk"], inplace=True)
 
+# ── 13.5. Adversarial validation (multivariate shift detection + sample weighting) ──
+_av_tr = full[tr_mask].reset_index(drop=True)
+_av_vl = full[vl_mask].reset_index(drop=True)
+_av_meta, _av_weights_arr = _run_adversarial_validation(_av_tr, _av_vl, numeric_cols)
+if _av_weights_arr is not None:
+    _w_full = np.ones(len(full))
+    _w_full[np.where(tr_mask.values)[0]] = _av_weights_arr
+    full["adversarial_weights"] = _w_full
+    print("adversarial_weights column added to full dataframe (training rows only)")
+
 # ── 14. Split and save parquet ────────────────────────────────────────────────
 features_train = full[full[_tc] <= train_time_max].copy()
 features_val   = full[full[_tc] >  train_time_max].copy()
@@ -920,7 +1054,7 @@ print(f"features_train: {features_train.shape}")
 print(f"features_val:   {features_val.shape}")
 
 # ── 15. Enumerate feature columns ─────────────────────────────────────────────
-id_and_target = set(group_cols + [time_col, target_col])
+id_and_target = set(group_cols + [time_col, target_col, "adversarial_weights"])
 if _is_datetime_time:
     id_and_target.add(_time_col_numeric)  # exclude the internal ordinal column
 feature_cols  = [c for c in features_train.columns if c not in id_and_target]
@@ -940,6 +1074,7 @@ features_meta = {
     "rolling_windows":        ROLL_WINDOWS,
     "train_shape":            list(features_train.shape),
     "val_shape":              list(features_val.shape),
+    "adversarial_validation": _av_meta,
     "notes": [
         "Group baselines computed from train rows only — no leakage.",
         "Rolling stats use shift(1) before rolling to prevent target leakage.",

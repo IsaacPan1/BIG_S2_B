@@ -39,8 +39,8 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 | Sub-agent | Role |
 |-----------|------|
 | `schema_analyst` | Runs `tools/profile_data.py` to discover dataset structure, problem type, KS-tested shifts, and optional time codebook; writes `reports/profile.json` and `reports/schema_analysis.md` |
-| `feature_engineer` | Runs `tools/feature_engineering.py` to generate features adapted to schema, detected time granularity, and distribution shift |
-| `modeler` | Executes inline Python: adaptive ensemble selection based on problem type and dataset size; each family tuned with Optuna (15 trials) and 5-seed aggregation; final prediction is median or weighted average across surviving families |
+| `feature_engineer` | Runs `tools/feature_engineering.py` to generate features adapted to schema, detected time granularity, distribution shift (KS-based features), and adversarial validation (train-vs-val shift detection with sample weighting) |
+| `modeler` | Executes inline Python: adaptive ensemble selection based on problem type and dataset size; adversarial sample weights from feature_engineer applied to all model families; each family tuned with Optuna (15 trials) and 5-seed aggregation; final prediction is median or weighted average across surviving families |
 | `validator` | Runs `tools/validate.py` for an independent strict CV audit using purged walk-forward; diagnostic only — never blocks submission |
 | `critic` | Runs `tools/run_critic.py`: 5-check quality review with optional retune feedback to the modeler |
 | `submission_writer` | Runs `tools/build_submission.py` to validate format and write `submission.csv` |
@@ -65,6 +65,32 @@ Ridge predictions pass two sanity checks before inclusion: predicted values must
 ## Distribution-Shift-Aware Features
 
 `feature_engineering.py` tests each numeric covariate for distribution shift between training and validation using the Kolmogorov-Smirnov statistic. Covariates with KS > 0.15 receive five additional derived features: z-score normalization (using training mean/std), rolling 4-period z-score, percentile rank within the training distribution, group-level deviation from training mean, and a covariate × normalized-time interaction. All statistics are derived from training rows only so there is no leakage. Datasets with no detected shift are unaffected.
+
+## Time Granularity Detection
+
+`feature_engineering.py` infers temporal resolution from the median inter-observation step within groups. For datetime time columns (stored internally as hours since a fixed epoch), the thresholds are: < 2 hours → hourly, < 48 hours → daily, < 216 hours → weekly, otherwise monthly. Integer time columns are assumed weekly.
+
+The detected granularity drives additional seasonality features beyond the base annual-cycle sin/cos harmonics:
+
+| Granularity | Extra features added |
+|-------------|----------------------|
+| **Hourly** | hour-of-day sin/cos/sin2/cos2 (24-h cycle); day-of-week sin/cos (7-day cycle); per-(group × hour-of-day) and per-(group × day-of-week) training mean and std of the target |
+| **Daily** | day-of-week sin/cos; month-of-year sin/cos; week-of-year sin/cos |
+| **Monthly** | month-of-year sin/cos; calendar quarter (1–4) |
+| **Weekly** | base annual-cycle sin/cos/sin2/cos2 only (no extra features) |
+
+For hourly data the per-(group, hour) and per-(group, day-of-week) baselines are especially important: when val lag features are imputed, the imputed value uses the mean target for the matching group and hour-of-day rather than the last known training value, preserving the intra-day pattern far ahead of the training window.
+
+## Adversarial Validation
+
+`feature_engineering.py` trains a binary LightGBM classifier (5-fold StratifiedKFold, 100 estimators) to distinguish training rows (label 1) from validation rows (label 0). The classifier's OOF AUC measures multivariate covariate shift that per-column KS tests may miss.
+
+**Activation conditions**: at least 500 combined rows, at least 100 training rows, at least 100 validation rows, and at least 3 numeric covariate columns. Datasets that do not meet all four conditions skip adversarial validation silently.
+
+**AUC < 0.55**: no meaningful shift detected; uniform sample weights are used.  
+**AUC ≥ 0.55**: each training row receives weight `w = clip(1 − P(is_train), 0.1, 10.0)`, then normalized so the mean weight equals 1.0. Rows that "look like" validation rows receive higher weight, nudging the model toward the actual prediction distribution.
+
+The weights are stored as an `adversarial_weights` column in `data/features_train.parquet`. The modeler reads this column and passes it as `sample_weight` to all three model families — LightGBM OOF folds, LightGBM full-data retraining, XGBoost Optuna objective, XGBoost final fit, and Ridge. The top five shift-revealing features (by classifier importance), the AUC, and whether weights were applied are logged in `features.json` under `adversarial_validation` and propagated to `model_results.json` under `adaptive_choice.adversarial_validation`.
 
 ## Codebook-Based Date Features
 
