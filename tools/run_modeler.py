@@ -570,6 +570,27 @@ if "ridge" in families_plan:
                                    f"train_mean={train_target_mean:.2f}")
                 print(f"  Ridge EXCLUDED: {_ridge_excl_why}")
 
+            # Competence check: exclude Ridge if OOF MAE > 1.5x best tree-model OOF MAE
+            if _ridge_included:
+                _tree_oof_maes = {k: all_family_results[k]["oof_mae"]
+                                  for k in ("lightgbm", "xgboost")
+                                  if k in all_family_results
+                                  and all_family_results[k].get("succeeded")
+                                  and all_family_results[k].get("oof_mae") is not None}
+                if _tree_oof_maes:
+                    _best_tree_oof = min(_tree_oof_maes.values())
+                    _ridge_oof_val = float(_rm2)
+                    if _ridge_oof_val > 1.5 * _best_tree_oof:
+                        _ridge_included = False
+                        _ridge_excl_why = (
+                            f"ridge_oof={_ridge_oof_val:.3f} > 1.5x "
+                            f"best_family_oof={_best_tree_oof:.3f}"
+                        )
+                        print(f"  Ridge EXCLUDED (competence): {_ridge_excl_why}")
+                    else:
+                        print(f"  Ridge competence PASS: ridge_oof={_ridge_oof_val:.3f} "
+                              f"<= 1.5x best_family_oof={_best_tree_oof:.3f}")
+
             _ridge_coef_top5 = [{"feature": k, "abs_coef": float(v)}
                                  for k, v in _ridge_coef.head(5).items()]
             print(f"Ridge val: mean={_ridge_vp.mean():.3f}, included={_ridge_included}")
@@ -732,6 +753,12 @@ results = {
         "reasoning": ens_info["reasoning"],
         "ensemble_weighting": _ensemble_weighting,
         "weighting_reason": _weighting_reason,
+        "ridge_excluded_reason": (
+            all_family_results.get("ridge", {}).get("exclusion_reason")
+            if (not all_family_results.get("ridge", {}).get("included_in_ensemble")
+                and all_family_results.get("ridge", {}).get("succeeded"))
+            else None
+        ),
     },
     "families": {
         "lightgbm": all_family_results.get("lightgbm", {}),

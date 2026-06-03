@@ -753,6 +753,154 @@ _reg("cov_lags",   [f"{cov}_lag1"       for cov in numeric_cols])
 _reg("cov_deltas", [f"{cov}_change"     for cov in numeric_cols])
 _reg("cov_rolls",  [f"{cov}_roll_mean4" for cov in numeric_cols])
 
+# ── 8b. Extended covariate rolling windows ────────────────────────────────────
+if numeric_cols and group_cols:
+    _ext_mean_wins = [w for w in [8, 13] if min_periods >= w + 1]
+    _ext_std_wins  = [w for w in [4, 8]  if min_periods >= w + 1]
+    _new_roll_cols: list[str] = []
+    for _cov_ext in numeric_cols:
+        _grp_cov_ext = full.groupby(group_cols)[_cov_ext]
+        for _w_ext in _ext_mean_wins:
+            _col_ext = f"{_cov_ext}_roll_mean{_w_ext}"
+            full[_col_ext] = _grp_cov_ext.transform(
+                lambda s, _w=_w_ext: s.shift(1).rolling(_w, min_periods=1).mean())
+            _new_roll_cols.append(_col_ext)
+        for _w_ext in _ext_std_wins:
+            _col_ext = f"{_cov_ext}_roll_std{_w_ext}"
+            full[_col_ext] = _grp_cov_ext.transform(
+                lambda s, _w=_w_ext: s.shift(1).rolling(_w, min_periods=2).std())
+            _new_roll_cols.append(_col_ext)
+    if _new_roll_cols:
+        _reg("cov_rolls_ext", _new_roll_cols)
+        print(f"Extended covariate rolling features: {len(_new_roll_cols)}")
+
+# ── 8c. Covariate ratios ──────────────────────────────────────────────────────
+if len(numeric_cols) >= 2:
+    _prefix_groups: dict[str, list] = {}
+    for _c in numeric_cols:
+        _prefix_groups.setdefault(_c.split("_")[0], []).append(_c)
+
+    _ratio_cand: list[tuple[str, str]] = []
+    for _plist in _prefix_groups.values():
+        if len(_plist) >= 2:
+            for _pi in range(len(_plist)):
+                for _pj in range(_pi + 1, len(_plist)):
+                    _ratio_cand.append((_plist[_pi], _plist[_pj]))
+
+    if len(numeric_cols) <= 30:
+        _tr_cov_sub = train[numeric_cols].dropna()
+        if len(_tr_cov_sub) > 10:
+            _corr_mat = _tr_cov_sub.corr().abs()
+            for _ci in range(len(numeric_cols)):
+                for _cj in range(_ci + 1, len(numeric_cols)):
+                    _ca, _cb = numeric_cols[_ci], numeric_cols[_cj]
+                    if _corr_mat.loc[_ca, _cb] > 0.5:
+                        _ratio_cand.append((_ca, _cb))
+
+    _ratio_seen: set = set()
+    _ratio_dedup: list[tuple[str, str]] = []
+    for _pair in _ratio_cand:
+        _pkey = tuple(sorted(_pair))
+        if _pkey not in _ratio_seen:
+            _ratio_seen.add(_pkey)
+            _ratio_dedup.append(_pair)
+
+    _ratio_cols: list[str] = []
+    for _ra, _rb in _ratio_dedup[:20]:
+        _rcol = f"{_ra}_div_{_rb}"
+        full[_rcol] = full[_ra] / (full[_rb].abs() + 1e-9)
+        _ratio_cols.append(_rcol)
+    if _ratio_cols:
+        _reg("cov_ratios", _ratio_cols)
+        print(f"Covariate ratio features: {len(_ratio_cols)}  "
+              f"pairs: {_ratio_dedup[:3]}{'...' if len(_ratio_dedup) > 3 else ''}")
+
+# ── 8d. Group-level covariate aggregates ─────────────────────────────────────
+if numeric_cols and group_cols:
+    _grp_cov_feat_cols: list[str] = []
+    _recent_cut = train_time_max - 3
+    _train_rec4 = train[train[_tc] >= _recent_cut]
+    for _cov_g in numeric_cols:
+        for _g in group_cols:
+            _hist_m   = train.groupby(_g)[_cov_g].mean()
+            _recent_m = _train_rec4.groupby(_g)[_cov_g].mean()
+            _drift    = _recent_m - _hist_m
+            _hcol = f"{_cov_g}_{_g}_hist_mean"
+            _rcol = f"{_cov_g}_{_g}_recent4_mean"
+            _dcol = f"{_cov_g}_{_g}_drift"
+            full[_hcol] = full[_g].map(_hist_m)
+            full[_rcol] = full[_g].map(_recent_m)
+            full[_dcol] = full[_g].map(_drift)
+            _grp_cov_feat_cols.extend([_hcol, _rcol, _dcol])
+    _reg("cov_group_stats", _grp_cov_feat_cols)
+    print(f"Group-level covariate aggregate features: {len(_grp_cov_feat_cols)}")
+
+# ── 8e. Slope features per group ─────────────────────────────────────────────
+if numeric_cols and group_cols and min_periods >= 4:
+    _slope_feat_cols: list[str] = []
+    for _sw in [w for w in [6, 12] if min_periods >= w]:
+        _slope_col = f"target_slope_w{_sw}"
+        _slope_map: dict = {}
+        for _skey, _sgrp in train.groupby(group_cols):
+            _srecent = _sgrp.nlargest(_sw, _tc)
+            if len(_srecent) < 2:
+                _slope_map[_skey] = 0.0
+                continue
+            _sx = _srecent[_tc].values.astype(float)
+            _sy = _srecent[target_col].values.astype(float)
+            _sxc = _sx - _sx.mean()
+            _sdenom = float(np.dot(_sxc, _sxc))
+            _slope_map[_skey] = float(np.dot(_sxc, _sy) / (_sdenom + 1e-9))
+
+        if len(group_cols) == 1:
+            full[_slope_col] = full[group_cols[0]].map(_slope_map)
+        else:
+            _sl_df = pd.DataFrame(
+                [{**dict(zip(group_cols,
+                              _sk if isinstance(_sk, tuple) else (_sk,))),
+                  _slope_col: _sv}
+                 for _sk, _sv in _slope_map.items()]
+            )
+            full = full.merge(_sl_df, on=group_cols, how="left")
+            tr_mask = full[_tc] <= train_time_max
+            vl_mask = full[_tc] >  train_time_max
+        _slope_feat_cols.append(_slope_col)
+    if _slope_feat_cols:
+        _reg("slope_features", _slope_feat_cols)
+        print(f"Slope features added: {_slope_feat_cols}")
+
+# ── 8f. Covariate minus overall mean ─────────────────────────────────────────
+if numeric_cols:
+    _centered_cols: list[str] = []
+    for _cov_c in numeric_cols:
+        _tr_cov_mean = float(train[_cov_c].mean())
+        _ccol = f"{_cov_c}_minus_mean"
+        full[_ccol] = full[_cov_c] - _tr_cov_mean
+        _centered_cols.append(_ccol)
+    _reg("cov_centered", _centered_cols)
+    print(f"Covariate minus-mean features: {len(_centered_cols)}")
+
+# ── 8g. Entropy features for covariate prefix groups ─────────────────────────
+if len(numeric_cols) >= 2:
+    _ent_groups: dict[str, list] = {}
+    for _ec in numeric_cols:
+        _ent_groups.setdefault(_ec.split("_")[0], []).append(_ec)
+    _ent_cols: list[str] = []
+    for _ep, _elist in _ent_groups.items():
+        if len(_elist) < 2:
+            continue
+        _evals   = full[_elist].clip(lower=0)
+        _esum    = _evals.sum(axis=1)
+        _esum    = _esum.where(_esum > 0, np.nan)
+        _eprobs  = _evals.div(_esum, axis=0).fillna(1.0 / len(_elist))
+        _entropy = -(_eprobs * np.log(_eprobs + 1e-9)).sum(axis=1)
+        _ecol = f"{_ep}_entropy"
+        full[_ecol] = _entropy
+        _ent_cols.append(_ecol)
+    if _ent_cols:
+        _reg("cov_entropy", _ent_cols)
+        print(f"Entropy features added: {_ent_cols}")
+
 # ── 9. Primary covariate deviation / ratio vs group baseline ──────────────────
 # Captures "is this week's price higher or lower than the product's usual price?"
 if numeric_cols and len(group_cols) >= 2:

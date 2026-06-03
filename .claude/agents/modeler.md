@@ -76,7 +76,7 @@ Before including Ridge in the ensemble:
 1. If target is non-negative in training but Ridge predicts negative values: clip Ridge predictions to >= 0.
 2. If `Ridge pred_max > 5 * train_target_max`: exclude Ridge, log reason.
 3. If `abs(Ridge pred_mean - train_mean) / abs(train_mean) > 1.0`: exclude Ridge, log reason.
-4. **Competence check**: If `Ridge OOF MAE > 2.0 * best_tree_family_OOF_MAE` (best of LightGBM/XGBoost): exclude Ridge, log reason as `"ridge_oof > 2.0x best_family_oof"`. This prevents a high-error Ridge from pulling the median toward less accurate predictions.
+4. **Competence check**: If `Ridge OOF MAE > 1.5 * best_tree_family_OOF_MAE` (best of LightGBM/XGBoost): exclude Ridge, log reason as `"ridge_oof > 1.5x best_family_oof"`. This prevents a high-error Ridge from pulling the median toward less accurate predictions.
 
 These prevent a badly-regularized or uncompetitive Ridge from contaminating the ensemble. Ridge is excluded from `all_val_preds` if it fails any check; LightGBM always remains.
 
