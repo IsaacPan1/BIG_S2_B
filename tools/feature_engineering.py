@@ -481,6 +481,32 @@ print(f"Train: {train.shape}   Val: {val.shape}")
 # ── Detect time granularity ────────────────────────────────────────────────────
 def _detect_granularity() -> str:
     """Return 'hourly', 'daily', 'weekly', or 'monthly' from median inter-obs step."""
+    # When a codebook maps opaque IDs → real dates, use actual dates for detection
+    _cb_info = profile.get("time_codebook", {})
+    if _cb_info.get("available") and not _is_datetime_time:
+        try:
+            _cb_path = DATA_DIR / _cb_info["path"]
+            _raw_cb  = json.loads(_cb_path.read_text(encoding="utf-8"))
+            _direction = _cb_info.get("direction_detected", "id_to_date")
+            if _direction == "date_to_id":
+                _id_to_date = {str(v): str(k) for k, v in _raw_cb.items()}
+            else:
+                _id_to_date = {str(k): str(v) for k, v in _raw_cb.items()}
+            _unique_ids = pd.Series(train[time_col].unique())
+            _resolved = pd.to_datetime(
+                _unique_ids.astype(str).map(_id_to_date), errors="coerce"
+            ).dropna()
+            if len(_resolved) >= 2:
+                _sorted = _resolved.sort_values()
+                _diffs  = _sorted.diff().dropna().abs()
+                med_hours = float(_diffs.median().total_seconds()) / 3600.0
+                if med_hours < 2:    return "hourly"
+                if med_hours < 48:   return "daily"
+                if med_hours < 216:  return "weekly"
+                return "monthly"
+        except Exception as _e:
+            print(f"Codebook granularity detection failed ({_e}); falling back to raw column")
+
     ref = train.sort_values(group_cols + [_tc]) if group_cols else train.sort_values(_tc)
     if group_cols:
         steps = ref.groupby(group_cols)[_tc].diff().dropna().abs()
