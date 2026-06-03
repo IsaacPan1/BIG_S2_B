@@ -79,7 +79,7 @@ The detected granularity drives additional seasonality features beyond the base 
 | **Monthly** | month-of-year sin/cos; calendar quarter (1–4) |
 | **Weekly** | base annual-cycle sin/cos/sin2/cos2 only (no extra features) |
 
-For hourly data the per-(group, hour) and per-(group, day-of-week) baselines are especially important: when val lag features are imputed, the imputed value uses the mean target for the matching group and hour-of-day rather than the last known training value, preserving the intra-day pattern far ahead of the training window.
+For panel data with detected time granularity, val lag features that look back into the validation period are imputed using a cycle-aware method rather than the last known training value. The imputed value uses the mean target for the matching group at the same point in the seasonal cycle: matching hour-of-day for hourly data, day-of-week for daily data, week-of-year for weekly data, and month-of-year for monthly data (requires codebook for monthly). This preserves seasonal pattern information far ahead of the training window, addressing the staleness that occurs when later val periods are many steps removed from training end. The method falls back to last known training value when seasonal position can't be determined.
 
 ## Adversarial Validation
 
@@ -112,6 +112,7 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - Pipeline assumes one of three documented file conventions; unusual layouts may not be auto-detected and will fall back to heuristics that could misclassify train/val files.
 - Stacking and target encoding are not used, to avoid leakage risks that arise when hierarchical outcome categories overlap across folds.
 - Lag features compound error on long forecasts: when the validation horizon extends many periods ahead, lag imputation falls back to the last known training value per group, which degrades accuracy as horizon length increases.
+- Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. Verified on retail: real test MAE improved from 9.27 to 9.05 (2.4% reduction) with internal CV essentially unchanged, demonstrating the imputation primarily helps test-time predictions rather than training-time evaluation.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.
