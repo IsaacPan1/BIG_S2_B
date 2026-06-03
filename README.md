@@ -60,13 +60,29 @@ Ridge predictions pass two sanity checks before inclusion: predicted values must
 
 **Shift-weighted ensembling with competence check.** When any covariate's KS statistic exceeds 0.40, the modeler considers weighting Ridge 1.5× in the final ensemble — Ridge's conservative extrapolation hedges against tree models overfitting shifted regions. The weight is applied only when Ridge is competitive: Ridge OOF MAE must be within 1.5× of the best family's OOF MAE. If Ridge is substantially worse, the ensemble falls back to equal-weight median to avoid pulling predictions toward the weaker family. The decision, OOF comparison, and applied weight are logged in `model_results.json` under `adaptive_choice`.
 
-**Ridge competence check for inclusion.** Beyond the weighting decision, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 2.0× the best tree family's OOF MAE. This prevents Ridge from pulling the median toward less accurate predictions when its model fit is substantially worse than the tree families. The decision is logged in `model_results.json` under `adaptive_choice.ridge_excluded_reason`.
+**Ridge competence check for inclusion.** Beyond the weighting decision, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 1.5× the best tree family's OOF MAE. This prevents Ridge from pulling the median toward less accurate predictions when its model fit is substantially worse than the tree families. When excluded, the ensemble becomes LightGBM + XGBoost only. The decision is logged in `model_results.json` under `adaptive_choice.ridge_excluded_reason`.
 
 **Time safeguards.** If total elapsed time exceeds 20 minutes when XGBoost would start, XGBoost is skipped. If two families have completed and elapsed time exceeds 30 minutes when Ridge would start, Ridge is skipped.
 
 ## Distribution-Shift-Aware Features
 
 `feature_engineering.py` tests each numeric covariate for distribution shift between training and validation using the Kolmogorov-Smirnov statistic. Covariates with KS > 0.15 receive five additional derived features: z-score normalization (using training mean/std), rolling 4-period z-score, percentile rank within the training distribution, group-level deviation from training mean, and a covariate × normalized-time interaction. All statistics are derived from training rows only so there is no leakage. Datasets with no detected shift are unaffected.
+
+## Expanded Covariate Feature Engineering
+
+Beyond the base lag, rolling, and group-baseline features for the target column, the pipeline generates six additional families of features derived from numeric covariates. These activate for panel forecasting when numeric covariates are present, `time_col` is identified, and sufficient training history is available. All families derive statistics from training rows only and map them onto the full frame to prevent leakage.
+
+**Extended rolling windows** for each numeric covariate add rolling mean at windows 8 and 13 and rolling std at windows 4, 8, and 13, beyond the existing 4-period rolling mean. Windows are skipped if they exceed half of `min_periods_per_group`.
+
+**Covariate ratios** are generated for numeric covariates that share a name prefix (split on underscore). For example, `gtrends_fentanyl` and `gtrends_naloxone` share the prefix `gtrends` and generate the ratio `gtrends_fentanyl_div_gtrends_naloxone`. Ratios use safe division and are capped to handle outliers. Limited to 10 ratio features per dataset.
+
+**Group-level covariate aggregates** compute per-group historical mean, per-group recent 4-period mean, and per-group drift (recent minus historical) for each numeric covariate.
+
+**Slope features** compute the linear regression slope of the target on time over recent 6 and 12 observations per group. For validation rows, the slope from the latest training period in that group is used. Skipped when `min_periods_per_group` is below 12.
+
+**Centered covariates** are each numeric covariate minus its overall training mean, capturing centered deviation from cohort average.
+
+**Entropy features** compute Shannon entropy of normalized values within covariate prefix groups when at least 2 covariates share a prefix. Captures concentration versus diffusion of related signals.
 
 ## Time Granularity Detection
 
@@ -116,5 +132,6 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - Lag features compound error on long forecasts: when the validation horizon extends many periods ahead, lag imputation falls back to the last known training value per group, which degrades accuracy as horizon length increases.
 - Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. Verified on retail (weekly): real test MAE improved from 9.27 to 9.05 (2.4% reduction). Verified on Award A (monthly with codebook): smart imputation activated correctly with 7344 val lag cells filled via month-of-year cycle averages and zero fallbacks. In both cases internal CV remained essentially unchanged, demonstrating the imputation primarily helps test-time predictions rather than training-time evaluation.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
+- Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.
