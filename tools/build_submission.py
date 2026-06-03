@@ -92,11 +92,47 @@ def main() -> None:
     if "predicted_target" not in pred.columns:
         sys.exit("ERROR: predictions.csv missing 'predicted_target' column")
 
-    pred_aligned = pred[id_cols + ["predicted_target"]].copy()
+    # Determine join keys: prefer composite key (excluding row_id) when the
+    # prediction row_ids don't map to the same composite keys as the sample.
+    # This happens when predictions cover more rows/periods than the submission
+    # template (e.g. predictions has 2856 rows for 7 periods, sample has 918
+    # rows for 6 periods — row_id=0 points to different rows in each file).
+    join_cols = id_cols
+    if "row_id" in id_cols and "row_id" in pred.columns:
+        composite_id_cols = [c for c in id_cols if c != "row_id"]
+        if composite_id_cols:
+            # Check if row_id is a reliable join key by seeing whether
+            # a few shared row_ids agree on their composite key values.
+            shared_ids = list(set(sample["row_id"]) & set(pred["row_id"]))[:5]
+            if shared_ids:
+                sample_keys = (
+                    sample[sample["row_id"].isin(shared_ids)]
+                    .set_index("row_id")[composite_id_cols]
+                    .sort_index()
+                )
+                pred_keys = (
+                    pred[pred["row_id"].isin(shared_ids)]
+                    .set_index("row_id")[composite_id_cols]
+                    .sort_index()
+                )
+                # If any composite key differs, row_id is not a safe join key
+                try:
+                    aligned = sample_keys.eq(pred_keys)
+                    if not aligned.all(axis=None):
+                        join_cols = composite_id_cols
+                        print(
+                            f"row_id maps to different composite keys in predictions vs sample; "
+                            f"joining on composite key: {join_cols}"
+                        )
+                except Exception:
+                    join_cols = composite_id_cols
+                    print(f"row_id alignment check failed; joining on composite key: {join_cols}")
+
+    pred_aligned = pred[join_cols + ["predicted_target"]].copy()
     pred_aligned = pred_aligned.rename(columns={"predicted_target": target_col})
 
     submission = sample[id_cols].copy()
-    submission = submission.merge(pred_aligned, on=id_cols, how="left")
+    submission = submission.merge(pred_aligned, on=join_cols, how="left")
     print(f"After merge: {submission.shape}, columns: {list(submission.columns)}")
 
     # Validation checks
