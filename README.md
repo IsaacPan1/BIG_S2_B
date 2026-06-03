@@ -60,6 +60,8 @@ Ridge predictions pass two sanity checks before inclusion: predicted values must
 
 **Shift-weighted ensembling with competence check.** When any covariate's KS statistic exceeds 0.40, the modeler considers weighting Ridge 1.5× in the final ensemble — Ridge's conservative extrapolation hedges against tree models overfitting shifted regions. The weight is applied only when Ridge is competitive: Ridge OOF MAE must be within 1.5× of the best family's OOF MAE. If Ridge is substantially worse, the ensemble falls back to equal-weight median to avoid pulling predictions toward the weaker family. The decision, OOF comparison, and applied weight are logged in `model_results.json` under `adaptive_choice`.
 
+**Ridge competence check for inclusion.** Beyond the weighting decision, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 2.0× the best tree family's OOF MAE. This prevents Ridge from pulling the median toward less accurate predictions when its model fit is substantially worse than the tree families. The decision is logged in `model_results.json` under `adaptive_choice.ridge_excluded_reason`.
+
 **Time safeguards.** If total elapsed time exceeds 20 minutes when XGBoost would start, XGBoost is skipped. If two families have completed and elapsed time exceeds 30 minutes when Ridge would start, Ridge is skipped.
 
 ## Distribution-Shift-Aware Features
