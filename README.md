@@ -52,7 +52,7 @@ The modeler selects its ensemble from `profile.json` based on `problem_type` and
 
 | Condition | Ensemble |
 |-----------|----------|
-| panel_forecasting or tabular_regression, n_train ≥ 1,000 | LightGBM + XGBoost + Ridge |
+| panel_forecasting or tabular_regression, n_train ≥ 1,000 | LightGBM + XGBoost + CatBoost (conditional) + Ridge |
 | panel_forecasting or tabular_regression, n_train < 1,000 | LightGBM + Ridge |
 | classification (any size) | LightGBM only |
 
@@ -63,6 +63,23 @@ Ridge predictions pass two sanity checks before inclusion: predicted values must
 **Ridge competence check for inclusion.** Beyond the weighting decision, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 1.5× the best tree family's OOF MAE. This prevents Ridge from pulling the median toward less accurate predictions when its model fit is substantially worse than the tree families. When excluded, the ensemble becomes LightGBM + XGBoost only. The decision is logged in `model_results.json` under `adaptive_choice.ridge_excluded_reason`.
 
 **Time safeguards.** If total elapsed time exceeds 20 minutes when XGBoost would start, XGBoost is skipped. If two families have completed and elapsed time exceeds 30 minutes when Ridge would start, Ridge is skipped.
+
+## Conditional CatBoost Addition
+
+CatBoost is conditionally added as a fourth tree family when the data and time budget permit. CatBoost's symmetric oblivious trees and ordered boosting provide different inductive biases from LightGBM and XGBoost, offering ensemble diversity beyond what two leaf-wise boosters can capture.
+
+Activation conditions require all of the following:
+
+- catboost can be imported without errors (graceful fallback if not installed)
+- n_train is at least 500 (ordered boosting requires sufficient data)
+- Pipeline elapsed time is under 40 minutes when CatBoost would start (preserves budget for Ridge, validator, critic, submission_writer, and report_writer)
+- Problem type is panel_forecasting, tabular_regression, or classification
+
+When activated, CatBoost runs with 10 Optuna trials (fewer than LightGBM and XGBoost's 15 trials to manage compute), 5-seed multi-seed aggregation, and MAE loss for regression or Logloss for classification. Categorical features are passed via cat_features as column indices.
+
+The same competence check applied to Ridge is applied to CatBoost for ensemble inclusion: CatBoost is excluded if its OOF MAE exceeds 1.5x the best tree family's OOF MAE. When included, CatBoost participates in the median or weighted ensemble alongside other surviving families.
+
+If catboost cannot be imported or any activation condition fails, the pipeline runs with the existing 3-family ensemble (LightGBM + XGBoost + Ridge) with no interruption. All decisions are logged in model_results.json under adaptive_choice.catboost_decision.
 
 ## Distribution-Shift-Aware Features
 
@@ -121,7 +138,7 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - CPU only (no GPU)
 - No network access or external data during analysis
 - 2-hour wall-clock budget; 1M token budget (input + output, all agents combined)
-- Three-family ensemble (LightGBM + XGBoost + Ridge); CatBoost is not included
+- Up to four-family ensemble (LightGBM + XGBoost + Ridge always, CatBoost conditionally)
 
 ## Known Limitations
 
@@ -133,5 +150,7 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. Verified on retail (weekly): real test MAE improved from 9.27 to 9.05 (2.4% reduction). Verified on Award A (monthly with codebook): smart imputation activated correctly with 7344 val lag cells filled via month-of-year cycle averages and zero fallbacks. In both cases internal CV remained essentially unchanged, demonstrating the imputation primarily helps test-time predictions rather than training-time evaluation.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
 - Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
+
+- CatBoost adds 1-3 minutes to pipeline runtime when activated. On datasets where CatBoost provides similar OOF performance to LightGBM and XGBoost, the median ensemble may show minimal improvement because the three tree families converge on similar predictions. Real benefit varies by dataset characteristics.
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.
