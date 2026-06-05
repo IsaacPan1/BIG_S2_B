@@ -40,7 +40,7 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 |-----------|------|
 | `schema_analyst` | Runs `tools/profile_data.py` to discover dataset structure, problem type, KS-tested shifts, and optional time codebook; writes `reports/profile.json` and `reports/schema_analysis.md` |
 | `feature_engineer` | Runs `tools/feature_engineering.py` to generate features adapted to schema, detected time granularity, distribution shift (KS-based features), and adversarial validation (train-vs-val shift detection with sample weighting) |
-| `modeler` | Executes inline Python: adaptive ensemble selection based on problem type and dataset size; adversarial sample weights from feature_engineer applied to all model families; each family tuned with Optuna (15 trials) and 5-seed aggregation; final prediction is median or weighted average across surviving families |
+| `modeler` | Executes inline Python: adaptive ensemble selection based on problem type and dataset size; adversarial sample weights from feature_engineer applied to all model families; each family tuned with Optuna (15 trials) with intra-run boundary recentering; 5-seed aggregation; final prediction is dynamically reweighted across surviving families based on OOF performance; ordinal targets receive post-processing rounding |
 | `validator` | Runs `tools/validate.py` for an independent strict CV audit using purged walk-forward; diagnostic only — never blocks submission |
 | `critic` | Runs `tools/run_critic.py`: 5-check quality review with optional retune feedback to the modeler |
 | `submission_writer` | Runs `tools/build_submission.py` to validate format and write `submission.csv` |
@@ -84,9 +84,17 @@ Ordinal regression uses the regression path (not classification) because:
 - Classification cross-entropy would treat both errors equally, losing the ordinal structure
 - This matches how MAE-graded competitions evaluate such targets
 
+**Ordinal post-processing.** After ensembling, predictions for `ordinal_regression` targets are rounded to the nearest valid integer class observed in training. The rounding threshold is optimized on OOF predictions: the modeler tries a small grid of offsets (–0.5 to +0.5 in steps of 0.1) and selects the offset that minimises OOF MAE before clipping to the training min/max. This converts continuous ensemble outputs to valid ordinal integers without sacrificing the distance-aware MAE objective. The chosen offset is logged in `model_results.json` under `ordinal_rounding`.
+
+## Reflective Hyperparameter Loop
+
+The modeler performs intra-run hyperparameter reflection when Optuna's search hits a parameter boundary — for example, when the best trial lands on the maximum `num_leaves` or minimum `learning_rate`. In that case, the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring a family's best configuration, without consuming the single critic-triggered retune cycle reserved for cross-family changes. Recentering is logged in `model_results.json` under `optuna_recentering`.
+
+**Dynamic ensemble reweighting.** Rather than a fixed equal-weight median, the final ensemble weights each surviving family inversely proportional to its OOF MAE (softmax over negative MAEs). Families with substantially worse OOF performance contribute less without being fully excluded. The applied weights are logged under `adaptive_choice.ensemble_weights`.
+
 ## Adaptive Model Selection
 
-The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size. Each tree family is tuned with 15 Optuna trials and predictions are aggregated across 5 random seeds before ensembling.
+The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size. Each tree family is tuned with 15 Optuna trials (with boundary recentering when applicable) and predictions are aggregated across 5 random seeds before ensembling.
 
 | Condition | Ensemble |
 |-----------|----------|
