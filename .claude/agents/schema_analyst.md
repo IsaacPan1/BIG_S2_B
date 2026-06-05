@@ -96,6 +96,25 @@ Compare the profiler's `problem_type` against your reading of
   in `DATA_DESCRIPTION.md`: use the description's name and warn about the
   mismatch.
 
+The profiler also emits a `problem_subtype` field with refined classification:
+
+| `problem_subtype` | When assigned | Ensemble path |
+|-------------------|---------------|---------------|
+| `panel_forecasting` | time + groups detected | existing panel forecasting path |
+| `time_series` | time detected, no groups | existing time-series path |
+| `continuous_regression` | float target or > 50 unique values | full regression ensemble |
+| `ordinal_regression` | integer target, 3–50 consecutive unique values (count/score/days) | **same as continuous_regression** (full ensemble) |
+| `binary_classification` | exactly 2 unique target values | LightGBM only (limitation) |
+| `multiclass_classification` | 3–50 unordered string or categorical-int values | LightGBM only (limitation) |
+
+**Ordinal detection signals** (used by `classify_problem_subtype`):
+1. Keywords in `DATA_DESCRIPTION.md` — "days", "score", "count", "rating", "level", "severity", "stage", "grade", "rank", "visit", "admission", "number" → favour `ordinal_regression`.
+2. Categorical keywords — "category", "class", "type", "label" → favour `multiclass_classification`.
+3. Structural heuristic: if the integer values are consecutive AND range is small (min∈{0,1}, max≤20) → `ordinal_regression`.
+4. Default for consecutive integers when keywords are ambiguous: `ordinal_regression` (safer for MAE-graded competitions).
+
+Document `problem_subtype` in the Problem Classification table in `reports/schema_analysis.md`.
+
 ### Step 4 — Sample the training data
 
 Run a small Python snippet to confirm column meanings match the description:
@@ -132,8 +151,11 @@ Brief one-sentence description of the dataset based on DATA_DESCRIPTION.md.
 | Field | Value |
 |-------|-------|
 | Problem type | panel_forecasting / time_series / tabular_regression / ... |
+| Problem subtype | continuous_regression / ordinal_regression / binary_classification / multiclass_classification / panel_forecasting / time_series |
 | Confidence | high / medium / low |
 | Reasoning | ... |
+| Subtype reasoning | ... |
+| Ensemble path | full_regression_ensemble / classification_fallback |
 
 ## Target
 | Field | Value |

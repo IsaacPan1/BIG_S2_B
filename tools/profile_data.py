@@ -690,6 +690,127 @@ def classify_problem(
 
 
 # ---------------------------------------------------------------------------
+# 6b.  Problem-subtype classification (ordinal vs continuous vs classification)
+# ---------------------------------------------------------------------------
+
+def classify_problem_subtype(
+    train_df: pd.DataFrame,
+    target_col: str | None,
+    problem_type: str,
+    desc_text: str,
+) -> tuple[str, str, dict]:
+    """Return (problem_subtype, reasoning, target_characteristics).
+
+    Subtypes:
+      panel_forecasting       — same as problem_type
+      time_series             — same as problem_type
+      continuous_regression   — float or many-unique numeric target
+      ordinal_regression      — integer with few consecutive unique values (count/score/days)
+      binary_classification   — exactly 2 unique values
+      multiclass_classification — 3-50 unordered unique values
+    """
+    target_chars: dict[str, Any] = {}
+
+    # Panel/time_series: subtype equals problem_type directly.
+    if problem_type in ("panel_forecasting", "time_series"):
+        return problem_type, f"Inherited from problem_type={problem_type}.", target_chars
+
+    if target_col is None or target_col not in train_df.columns:
+        return "continuous_regression", "Target column not found; defaulting to continuous_regression.", target_chars
+
+    series = train_df[target_col].dropna()
+    if len(series) == 0:
+        return "continuous_regression", "Target column is all-null; defaulting to continuous_regression.", target_chars
+
+    n_unique = int(series.nunique())
+    dtype_str = str(series.dtype)
+    is_numeric = pd.api.types.is_numeric_dtype(series)
+    reasons: list[str] = []
+
+    target_chars["n_unique"] = n_unique
+    target_chars["dtype"] = dtype_str
+    if is_numeric:
+        target_chars["min"] = round(float(series.min()), 6)
+        target_chars["max"] = round(float(series.max()), 6)
+
+    # Binary classification (n_unique == 2)
+    if n_unique == 2:
+        target_chars["is_consecutive_integers"] = False
+        target_chars["data_description_hints"] = []
+        return "binary_classification", f"n_unique=2 → binary classification.", target_chars
+
+    # Non-numeric → classification
+    if not is_numeric:
+        target_chars["is_consecutive_integers"] = False
+        target_chars["data_description_hints"] = []
+        subtype = "multiclass_classification"
+        return subtype, f"Non-numeric target, {n_unique} unique values → multiclass classification.", target_chars
+
+    # Many unique values → continuous regression
+    if n_unique > 50:
+        target_chars["is_consecutive_integers"] = False
+        target_chars["data_description_hints"] = []
+        return "continuous_regression", f"Numeric target, {n_unique} > 50 unique values → continuous regression.", target_chars
+
+    # Numeric, 3-50 unique values — determine ordinal vs categorical
+    is_integer_like = pd.api.types.is_integer_dtype(series) or (
+        pd.api.types.is_float_dtype(series)
+        and len(series) > 0
+        and (series == series.round(0)).all()
+    )
+
+    if not is_integer_like:
+        target_chars["is_consecutive_integers"] = False
+        target_chars["data_description_hints"] = []
+        return "continuous_regression", f"Float target, {n_unique} unique values, not integer-like → continuous regression.", target_chars
+
+    # Integer target, 3-50 unique values — ordinal vs categorical
+    min_val = int(series.min())
+    max_val = int(series.max())
+    actual_vals = {int(v) for v in series.unique()}
+    expected_vals = set(range(min_val, max_val + 1))
+    is_consecutive = actual_vals == expected_vals or (
+        len(actual_vals) >= max(1, (max_val - min_val + 1) * 0.9)
+        and actual_vals.issubset(expected_vals)
+    )
+    target_chars["is_consecutive_integers"] = is_consecutive
+
+    ordinal_kws = ["days", "score", "count", "rating", "level", "severity",
+                   "stage", "grade", "rank", "visit", "admission", "number"]
+    categ_kws   = ["category", "class", "type", "label"]
+    desc_lower  = desc_text.lower()
+
+    found_ordinal = [kw for kw in ordinal_kws if kw in desc_lower]
+    found_categ   = [kw for kw in categ_kws   if kw in desc_lower]
+    target_chars["data_description_hints"] = found_ordinal + found_categ
+
+    small_range = min_val in (0, 1) and max_val <= 20
+
+    reasons.append(f"Integer target, {n_unique} unique values [{min_val}-{max_val}].")
+    reasons.append("Consecutive integers." if is_consecutive else "Non-consecutive (gaps present).")
+
+    if found_ordinal and not found_categ:
+        reasons.append(f"Ordinal keywords in description: {found_ordinal}.")
+        return "ordinal_regression", " ".join(reasons), target_chars
+
+    if found_categ and not found_ordinal:
+        reasons.append(f"Categorical keywords in description: {found_categ}.")
+        return "multiclass_classification", " ".join(reasons), target_chars
+
+    # Both or neither keyword — use structural heuristic
+    if is_consecutive and small_range:
+        reasons.append(f"Consecutive ints in small range [min={min_val}, max={max_val}] → ordinal regression.")
+        return "ordinal_regression", " ".join(reasons), target_chars
+
+    if is_consecutive:
+        reasons.append("Consecutive integer values; defaulting to ordinal regression (safer for MAE).")
+        return "ordinal_regression", " ".join(reasons), target_chars
+
+    reasons.append("Non-consecutive integers → multiclass classification.")
+    return "multiclass_classification", " ".join(reasons), target_chars
+
+
+# ---------------------------------------------------------------------------
 # 7.  Horizon detection (panel_forecasting only)
 # ---------------------------------------------------------------------------
 
@@ -980,7 +1101,10 @@ def print_summary(profile: dict) -> None:
     pt   = profile.get("problem_type", "unknown")
     ptc  = profile.get("problem_type_confidence", "?")
     ptr  = profile.get("problem_type_reasoning", "")
+    pst  = profile.get("problem_subtype", "")
     print(f"\nProblem type : {pt}  (confidence: {ptc})")
+    if pst and pst != pt:
+        print(f"Subtype      : {pst}")
     print(f"Reasoning    : {ptr}")
 
     tgt   = profile.get("target_col")   or "(none)"
@@ -1146,6 +1270,13 @@ def main() -> None:
         train_df, val_df, target_col, time_col, group_cols
     )
 
+    # 8b. Problem subtype (ordinal vs continuous vs classification)
+    _desc_text = (data_dir / "DATA_DESCRIPTION.md").read_text(encoding="utf-8") \
+        if (data_dir / "DATA_DESCRIPTION.md").exists() else ""
+    problem_subtype, subtype_reasoning, target_chars = classify_problem_subtype(
+        train_df, target_col, problem_type, _desc_text
+    )
+
     # 9. Horizon detection
     horizon_info: dict = {}
     if problem_type in ("panel_forecasting", "time_series") and time_col:
@@ -1201,6 +1332,9 @@ def main() -> None:
         "problem_type":             problem_type,
         "problem_type_confidence":  confidence,
         "problem_type_reasoning":   reasoning,
+        "problem_subtype":          problem_subtype,
+        "problem_subtype_reasoning": subtype_reasoning,
+        "target_characteristics":   target_chars,
         "target_col":               target_col,
         "group_cols":               group_cols,
         "time_col":                 time_col,

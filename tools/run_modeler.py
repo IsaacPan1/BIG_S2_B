@@ -36,11 +36,12 @@ print("="*60)
 with open(os.path.join(REPORTS, "features.json")) as f: feat_meta = json.load(f)
 with open(os.path.join(REPORTS, "profile.json"))  as f: profile   = json.load(f)
 
-target_col   = feat_meta["target_col"]
-problem_type = profile.get("problem_type") or feat_meta.get("problem_type", "tabular_regression")
-group_cols   = profile.get("group_cols")   or feat_meta.get("group_cols", [])
-time_col     = profile.get("time_col")     or feat_meta.get("time_col")
-print(f"problem_type={problem_type}  target={target_col}  groups={group_cols}  time={time_col}")
+target_col      = feat_meta["target_col"]
+problem_type    = profile.get("problem_type") or feat_meta.get("problem_type", "tabular_regression")
+problem_subtype = profile.get("problem_subtype", "")
+group_cols      = profile.get("group_cols")   or feat_meta.get("group_cols", [])
+time_col        = profile.get("time_col")     or feat_meta.get("time_col")
+print(f"problem_type={problem_type}  problem_subtype={problem_subtype}  target={target_col}  groups={group_cols}  time={time_col}")
 
 # ── 2. Critic retune ───────────────────────────────────────────────────────────
 _retune_applied = None
@@ -106,17 +107,40 @@ train_target_mean = float(y_full.mean())
 
 # ── 5. Ensemble selection ──────────────────────────────────────────────────────
 def select_ensemble(profile, n_train):
-    pt = profile.get("problem_type")
-    if pt == "classification":
-        return {"branch": "classification_fallback", "families": ["lightgbm"],
-                "reasoning": "Classification: LightGBM only (ensembling not fully tested)"}
+    pt  = profile.get("problem_type", "")
+    pst = profile.get("problem_subtype", "")
+
+    # Classification subtypes → LightGBM only (limited to single family)
+    _is_classification = (
+        pst in ("binary_classification", "multiclass_classification")
+        or (pt in ("tabular_classification", "classification")
+            and pst not in ("ordinal_regression", "continuous_regression"))
+    )
+    if _is_classification:
+        return {
+            "branch": "classification_fallback",
+            "families": ["lightgbm"],
+            "reasoning": f"Classification ({pt}/{pst}): LightGBM only (limitation: multi-family classification not implemented)",
+            "ensemble_path_used": "classification_fallback",
+        }
+
+    # Regression path: ordinal_regression treated identically to continuous_regression
+    path = "full_regression_ensemble"
     if n_train >= 1000:
         b = 1 if pt == "panel_forecasting" else 3
-        return {"branch": b, "families": ["lightgbm", "xgboost", "catboost", "ridge"],
-                "reasoning": f"{pt}, n_train={n_train}>=1000: full 4-family ensemble (LGB+XGB+CatBoost+Ridge)"}
+        return {
+            "branch": b,
+            "families": ["lightgbm", "xgboost", "catboost", "ridge"],
+            "reasoning": f"{pt}/{pst}, n_train={n_train}>=1000: full 4-family ensemble (LGB+XGB+CatBoost+Ridge)",
+            "ensemble_path_used": path,
+        }
     b = 2 if pt == "panel_forecasting" else 4
-    return {"branch": b, "families": ["lightgbm", "ridge"],
-            "reasoning": f"{pt}, n_train={n_train}<1000: 2-family ensemble (skip XGBoost)"}
+    return {
+        "branch": b,
+        "families": ["lightgbm", "ridge"],
+        "reasoning": f"{pt}/{pst}, n_train={n_train}<1000: 2-family ensemble (skip XGBoost)",
+        "ensemble_path_used": path,
+    }
 
 ens_info      = select_ensemble(profile, n_train)
 families_plan = ens_info["families"]
@@ -505,7 +529,10 @@ if "catboost" in families_plan:
         _catboost_available
         and n_train >= 500
         and _elapsed_cb < 40
-        and problem_type in ("panel_forecasting", "tabular_regression", "classification")
+        and (
+            problem_type in ("panel_forecasting", "tabular_regression", "classification")
+            or problem_subtype in ("ordinal_regression", "continuous_regression")
+        )
     )
 
     if not _should_run_cb:
@@ -904,6 +931,8 @@ training_time = int(time.time() - start_time)
 
 results = {
     "algorithm": algorithm,
+    "problem_subtype": problem_subtype,
+    "ensemble_path_used": ens_info.get("ensemble_path_used", "full_regression_ensemble"),
     "adaptive_choice": {
         "branch": ens_info["branch"],
         "families_selected": families_plan,

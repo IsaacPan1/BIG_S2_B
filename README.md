@@ -46,6 +46,44 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 | `submission_writer` | Runs `tools/build_submission.py` to validate format and write `submission.csv` |
 | `report_writer` | Runs `tools/generate_report.py` to assemble `report.pdf` |
 
+## Problem Subtype Detection
+
+The pipeline detects a problem subtype from the target column characteristics, not just the broad problem type. This determines which ensemble path is used.
+
+The subtypes are:
+
+- **continuous_regression**: target is float or has many unique values, evaluated by regression metrics
+- **ordinal_regression**: target is integer with few consecutive values that have natural order (e.g., count of days, severity scores, ratings 1-5). These are evaluated by MAE like regression, not by classification metrics
+- **panel_forecasting**: time-indexed regression with group structure
+- **binary_classification**: target has exactly 2 unique values
+- **multiclass_classification**: target has 3-50 unique values that appear unordered (string categories or integer codes without meaningful order)
+
+Subtype is inferred from:
+- Number of unique target values
+- Data type (int vs float vs string)
+- Value range and consecutive structure
+- `DATA_DESCRIPTION.md` keywords (days, score, count, rating, severity, level, stage suggest ordinal)
+
+When subtype is unclear between ordinal_regression and multiclass_classification (e.g., integer target with 5-15 unique values), the pipeline defaults to ordinal_regression for MAE-evaluable behavior.
+
+## Ensemble Path Mapping
+
+Each problem subtype maps to an ensemble training path:
+
+| Problem Subtype | Ensemble Path | Families | Loss |
+|---|---|---|---|
+| continuous_regression | full_regression_ensemble | LGB + XGB + CatBoost + Ridge | MAE |
+| ordinal_regression | full_regression_ensemble | LGB + XGB + CatBoost + Ridge | MAE |
+| panel_forecasting | panel_forecasting_path | LGB + XGB + CatBoost + Ridge | MAE |
+| binary_classification | classification_fallback | LGB only | LogLoss |
+| multiclass_classification | classification_fallback | LGB only | LogLoss |
+
+Ordinal regression uses the regression path (not classification) because:
+- The target has natural ordering, so distance between values matters
+- MAE penalizes by distance, treating predicting 5 vs 6 as small error and 5 vs 14 as large error
+- Classification cross-entropy would treat both errors equally, losing the ordinal structure
+- This matches how MAE-graded competitions evaluate such targets
+
 ## Adaptive Model Selection
 
 The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size. Each tree family is tuned with 15 Optuna trials and predictions are aggregated across 5 random seeds before ensembling.
@@ -171,5 +209,7 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
 
 - CatBoost adds 1-3 minutes to pipeline runtime when activated. On datasets where CatBoost provides similar OOF performance to LightGBM and XGBoost, the median ensemble may show minimal improvement because the three tree families converge on similar predictions. Real benefit varies by dataset characteristics.
+
+- True multiclass classification (unordered categories like species or diagnosis codes) uses LightGBM-only path. Multi-family classification ensembling would require logloss-based competence checks and probability aggregation, which are not implemented. Ordinal regression targets (integer counts/scores with natural order) use the full regression ensemble correctly and are not affected by this limitation.
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.

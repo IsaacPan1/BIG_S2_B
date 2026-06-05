@@ -13,15 +13,20 @@ The modeler makes **two independent adaptive decisions** from `profile.json` bef
 
 ### Axis 1 — Dataset size (gates XGBoost)
 
-| Branch | Condition | Families |
-|--------|-----------|----------|
-| 1 | panel_forecasting + n_train >= 1000 | LightGBM + XGBoost + CatBoost + Ridge |
-| 2 | panel_forecasting + n_train < 1000  | LightGBM + Ridge |
-| 3 | tabular_regression + n_train >= 1000 | LightGBM + XGBoost + CatBoost + Ridge |
-| 4 | tabular_regression + n_train < 1000  | LightGBM + Ridge |
-| fallback | classification (any size) | LightGBM only |
+The ensemble path is determined by `problem_subtype` (from `profile.json`), not just `problem_type`.
+`ordinal_regression` is treated **identically to `continuous_regression`** — it gets the full ensemble.
+
+| Branch | Condition | Families | `ensemble_path_used` |
+|--------|-----------|----------|---------------------|
+| 1 | panel_forecasting + n_train >= 1000 | LightGBM + XGBoost + CatBoost + Ridge | `full_regression_ensemble` |
+| 2 | panel_forecasting + n_train < 1000  | LightGBM + Ridge | `full_regression_ensemble` |
+| 3 | continuous_regression or ordinal_regression + n_train >= 1000 | LightGBM + XGBoost + CatBoost + Ridge | `full_regression_ensemble` |
+| 4 | continuous_regression or ordinal_regression + n_train < 1000  | LightGBM + Ridge | `full_regression_ensemble` |
+| fallback | binary_classification or multiclass_classification (any size) | LightGBM only | `classification_fallback` |
 
 **Reasoning**: Branches 1 and 3 add XGBoost when there is enough data (≥ 1000 rows) for its broader hyperparameter space to find good values without overfitting noise. Ridge provides paradigm diversity (linear vs. tree) and is especially useful when distribution-shift-aware features are informative. Small datasets (< 1000 rows) skip XGBoost because its 15-trial search risks overfitting.
+
+`ordinal_regression` (e.g. hospitalization_days 0–14, severity score 1–5, visit_count 0+) gets the full regression ensemble because: (a) values have natural ordering, (b) distance matters for MAE evaluation, and (c) the full ensemble's MAE-optimised objective handles integer targets correctly without any modification. Classification path (`binary_classification`, `multiclass_classification`) uses LightGBM only — multi-family probability aggregation is a known limitation not yet implemented.
 
 ### Axis 2 — Distribution shift severity (weights Ridge)
 
@@ -79,7 +84,10 @@ _should_run_cb = (
     _catboost_available
     and n_train >= 500
     and elapsed_minutes < 40
-    and problem_type in ("panel_forecasting", "tabular_regression", "classification")
+    and (
+        problem_type in ("panel_forecasting", "tabular_regression", "classification")
+        or problem_subtype in ("ordinal_regression", "continuous_regression")
+    )
 )
 ```
 
