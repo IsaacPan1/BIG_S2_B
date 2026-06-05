@@ -241,6 +241,12 @@ def main() -> None:
         f.write(f"validation_checks_passed: {checks_passed}\n")
     print("Written submission_writer_was_here.txt")
 
+    # ── KG: observability — mark stage complete (best-effort) ─────────────────
+    try:
+        from kg import kg_set_stage
+        kg_set_stage("submission_writer")
+    except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}", file=sys.stderr)
+
     print("\n=== DONE ===")
     print(json.dumps(summary, indent=2))
 

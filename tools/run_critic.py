@@ -219,3 +219,10 @@ with open("reports/critic_was_here.txt", "w") as f:
     f.write(f"critic sub-agent executed at {datetime.datetime.now().isoformat()}\n")
 print(f"Written reports/critic_review.json with status={status}")
 print("Written reports/critic_was_here.txt")
+
+# ── KG: observability — record critic verdict (best-effort) ──────────────────
+try:
+    from kg import kg_append_event, kg_set_stage
+    kg_append_event("critic", "hypothesis", {"hypothesis": "Model predictions pass quality checks", "outcome": status, "detail": str(checks)[:200]})
+    kg_set_stage("critic", {"retune_cycles_used": (1 if second_cycle else 0) + (1 if status == "retune_requested" else 0)})
+except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}")

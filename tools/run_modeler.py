@@ -1172,3 +1172,10 @@ print(f"Ensemble OOF MAE: {ensemble_oof_mae:.4f}")
 print(f"Val mean        : {ensemble_preds.mean():.3f}")
 print(f"Time            : {training_time}s")
 print("="*60)
+
+# ── KG: observability — record Optuna + feature importance (best-effort) ─────
+try:
+    from kg import kg_append_event, kg_set_stage
+    kg_append_event("modeler", "optuna", {"n_trials": int(_lgbm_nt), "best_oof_mae": float(oof_mae), "ensemble_path": ens_info.get("branch"), "n_seeds": 5}); kg_append_event("modeler", "feature_importance", {"top_10": top10, "total_features": len(feature_cols)})
+    kg_set_stage("modeler")
+except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}")

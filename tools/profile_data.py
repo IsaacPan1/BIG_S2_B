@@ -1368,6 +1368,14 @@ def main() -> None:
         json.dump(profile, fh, indent=2, default=str)
     print(f"Profile written -> {out_path}")
 
+    # ── KG: observability — record inferred problem (best-effort) ─────────────
+    try:
+        from kg import kg_init, kg_append_event, kg_set_stage
+        kg_init()
+        kg_set_stage("schema_analyst")
+        kg_append_event("schema_analyst", "inferred_problem", {"problem_type": profile.get("problem_type"), "problem_subtype": profile.get("problem_subtype"), "target_col": profile.get("target_col"), "n_train": profile.get("n_train_rows"), "n_val": profile.get("n_val_rows"), "group_cols": profile.get("group_cols", []), "time_col": profile.get("time_col")})
+    except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()

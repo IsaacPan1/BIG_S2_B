@@ -509,6 +509,13 @@ def main() -> None:
     )
     print(f"Written {marker}")
 
+    # ── KG: observability — record CV verdict (best-effort) ───────────────────
+    try:
+        from kg import kg_append_event, kg_set_stage
+        kg_append_event("validator", "hypothesis", {"hypothesis": "CV gap within threshold", "outcome": verdict, "detail": f"cv_gap_pct={cv_gap_pct:.3f} strict_cv_mae={strict_cv_mae:.4f}"})
+        kg_set_stage("validator")
+    except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}", file=sys.stderr)
+
     print("\n" + "=" * 60)
     print(f"VALIDATOR COMPLETE — verdict: {verdict}")
     print("=" * 60)

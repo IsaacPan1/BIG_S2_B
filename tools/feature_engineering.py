@@ -1800,3 +1800,10 @@ print(f"FEATURE ENGINEERING COMPLETE — {len(feature_cols)} features")
 print("=" * 60)
 for fam, cols in sorted(_families.items()):
     print(f"  {fam:22s}: {len(cols):3d}  {cols[:3]}{'...' if len(cols) > 3 else ''}")
+
+# ── KG: observability — record resource usage (best-effort) ──────────────────
+try:
+    from kg import kg_append_event, kg_set_stage
+    kg_append_event("feature_engineer", "resource", {"n_features": len(feature_cols), "n_families": len(_families)})
+    kg_set_stage("feature_engineer")
+except Exception as _kg_e: print(f"[KG] non-fatal: {_kg_e}")

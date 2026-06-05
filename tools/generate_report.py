@@ -1,6 +1,7 @@
 """Generate report.pdf — user-friendly pipeline results report."""
 import json
 import os
+import textwrap
 from datetime import datetime
 from pathlib import Path
 
@@ -228,7 +229,9 @@ if not REPORTLAB_AVAILABLE:
     ] + (["Missing: " + "; ".join(missing_inputs)] if missing_inputs else [])
     with open(BASE / "report.txt", "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
-    print("Wrote report.txt (reportlab unavailable)")
+    _pdf_written = os.path.getsize(str(BASE / "report.txt")) > 0
+    print("Wrote report.txt (reportlab unavailable)" if _pdf_written
+          else "ERROR: report.txt empty after write — OS write not confirmed")
 else:
     # ── Style definitions ─────────────────────────────────────────────────────
     H1   = ParagraphStyle('H1',   fontName='Helvetica-Bold', fontSize=18, spaceAfter=4)
@@ -331,7 +334,40 @@ else:
         return t
 
     def pipeline_status_table():
-        """Status board: one row per agent, status column colour-coded by outcome."""
+        """Status board: one row per agent, status column colour-coded by outcome.
+
+        Width-check: if sum(colWidths) > 80 % of the page width the Key Output
+        column is compressed to fit; if it cannot reach ≥ 5 cm the font drops to
+        8 pt; if it still cannot reach ≥ 3 cm a 2-column vertical layout is used.
+        Key Output text is capped with textwrap.shorten (~7.5 chars / cm) so that
+        a single unbroken token cannot force the column to overflow into neighbours.
+        """
+        _PAGE_W  = A4[0]               # full A4 page width in points (~595 pt / 21 cm)
+        _THRESH  = 0.80 * _PAGE_W      # 80 % cap (~476 pt / 16.8 cm)
+
+        # Preferred column widths (Step | Agent | Status | Key Output)
+        _w_step   = 1.2 * cm
+        _w_agent  = 4.2 * cm
+        _w_status = 2.2 * cm
+        _w_key    = 8.4 * cm
+        _total    = _w_step + _w_agent + _w_status + _w_key
+
+        _font_sz  = 9
+        _use_vert = False
+
+        if _total > _THRESH:
+            _w_key_fit = _THRESH - _w_step - _w_agent - _w_status
+            if _w_key_fit >= 5.0 * cm:
+                _w_key = _w_key_fit          # compress key column, keep font size
+            elif _w_key_fit >= 3.0 * cm:
+                _w_key  = _w_key_fit
+                _font_sz = 8                 # also reduce font to compensate
+            else:
+                _use_vert = True             # column too narrow: fall back to vertical
+
+        # textwrap limit: ~7.5 chars per cm at 9 pt Helvetica (accounting for padding)
+        _KEY_CHARS = max(50, int(_w_key / cm * 7.5))
+
         AGENTS = [
             ("1",   "schema_analyst",   "reports/schema_analyst_was_here.txt",
              f"{problem_type} ({confidence} conf)"),
@@ -363,38 +399,76 @@ else:
                 return "FAILED",  '#FDECEA', '#d7191c'
             return "PASS", '#D5F5E3', '#145a32'
 
-        hdr = [_p('Step', _CH), _p('Agent', _CH), _p('Status', _CH), _p('Key Output', _CH)]
-        rows = []
-        status_bgs = []
+        # Per-cell styles sized to the resolved font size
+        _cell_st = ParagraphStyle('PST_cell', fontName='Helvetica',
+                                   fontSize=_font_sz, leading=_font_sz + 2)
+        _hdr_st  = ParagraphStyle('PST_hdr',  fontName='Helvetica-Bold',
+                                   fontSize=_font_sz, leading=_font_sz + 2,
+                                   textColor=colors.white)
+
+        # Build row data once; shared by both layout branches
+        entries = []
         for step, name, marker, detail in AGENTS:
             lbl, row_bg, txt_hex = _status(step, name, marker)
-            st_style = ParagraphStyle(f'S{name}', fontName='Helvetica-Bold',
-                                       fontSize=9, textColor=colors.HexColor(txt_hex))
-            rows.append([_p(step), _p(f"<b>{name}</b>", _CS), _p(lbl, st_style), _p(detail)])
+            detail_safe = textwrap.shorten(detail, width=_KEY_CHARS, placeholder='…')
+            st_style = ParagraphStyle(f'PST_s_{name}', fontName='Helvetica-Bold',
+                                       fontSize=_font_sz,
+                                       textColor=colors.HexColor(txt_hex))
+            entries.append((step, name, lbl, row_bg, detail_safe, st_style))
+
+        # ── Vertical layout: 2 columns ─────────────────────────────────────────
+        if _use_vert:
+            _lbl_w = _THRESH * 0.40
+            _val_w = _THRESH - _lbl_w
+            vrows = [[_p('Agent / Stage', _hdr_st), _p('Status  ·  Key Output', _hdr_st)]]
+            vbgs  = []
+            for step, name, lbl, row_bg, detail_safe, st_style in entries:
+                vrows.append([
+                    Paragraph(f"<b>{step}.  {name}</b>", _cell_st),
+                    Paragraph(f"<b>{lbl}</b>  ·  {detail_safe}", st_style),
+                ])
+                vbgs.append(row_bg)
+            ts_v = list(_BASE_TS_CMDS)
+            ts_v.append(('FONTSIZE', (0,0), (-1,-1), _font_sz))
+            for i, bg in enumerate(vbgs):
+                alt = '#F2F2F2' if i % 2 == 0 else '#FFFFFF'
+                ts_v.append(('BACKGROUND', (0, i+1), (0, i+1), colors.HexColor(alt)))
+                ts_v.append(('BACKGROUND', (1, i+1), (1, i+1), colors.HexColor(bg)))
+            ts_v = [c for c in ts_v if c[0] != 'ROWBACKGROUNDS']
+            t = Table(vrows, colWidths=[_lbl_w, _val_w], hAlign='LEFT', repeatRows=1)
+            t.setStyle(TableStyle(ts_v))
+            return t
+
+        # ── Standard 4-column layout ───────────────────────────────────────────
+        col_widths = [_w_step, _w_agent, _w_status, _w_key]
+        hdr = [_p('Step', _hdr_st), _p('Agent', _hdr_st),
+               _p('Status', _hdr_st), _p('Key Output', _hdr_st)]
+        rows = []
+        status_bgs = []
+        for step, name, lbl, row_bg, detail_safe, st_style in entries:
+            rows.append([
+                _p(step,                    _cell_st),
+                Paragraph(f"<b>{name}</b>", _cell_st),
+                Paragraph(lbl,              st_style),
+                _p(detail_safe,             _cell_st),
+            ])
             status_bgs.append(row_bg)
 
         data = [hdr] + rows
         ts_cmds = list(_BASE_TS_CMDS)
-        # Per-row: apply status colour only to the status column (col 2); alternate the rest
+        ts_cmds.append(('FONTSIZE', (0,0), (-1,-1), _font_sz))
+        # Per-row: status colour only on col 2; alternate bg on cols 0-1 and 3
         for i, bg in enumerate(status_bgs):
             alt = '#F2F2F2' if i % 2 == 0 else '#FFFFFF'
             ts_cmds.append(('BACKGROUND', (0, i+1), (1, i+1), colors.HexColor(alt)))
             ts_cmds.append(('BACKGROUND', (2, i+1), (2, i+1), colors.HexColor(bg)))
             ts_cmds.append(('BACKGROUND', (3, i+1), (3, i+1), colors.HexColor(alt)))
-        # Remove the ROWBACKGROUNDS command (handled manually above)
         ts_cmds = [c for c in ts_cmds if c[0] != 'ROWBACKGROUNDS']
-
-        t = Table(data, colWidths=[1.2*cm, 4.2*cm, 2.2*cm, 8.4*cm],
-                  hAlign='LEFT', repeatRows=1)
+        t = Table(data, colWidths=col_widths, hAlign='LEFT', repeatRows=1)
         t.setStyle(TableStyle(ts_cmds))
         return t
 
     # ── Build story ───────────────────────────────────────────────────────────
-    doc = SimpleDocTemplate(
-        str(BASE / "report.pdf"), pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm,
-    )
     story = []
 
     # ── Title ─────────────────────────────────────────────────────────────────
@@ -407,10 +481,11 @@ else:
 
     # ── Executive Summary ─────────────────────────────────────────────────────
     story.append(exec_summary())
-    story.append(Spacer(1, 0.4*cm))
+    story.append(Spacer(1, 0.6*cm))  # min-height buffer prevents overlap with next table
 
     # ── Pipeline Status ───────────────────────────────────────────────────────
     story.append(_p("Pipeline Status", H2))
+    story.append(Spacer(1, 0.25*cm))  # gap between heading and table top border
     story.append(pipeline_status_table())
 
     dec_lines = [f"Axis 1 — dataset size: Branch {ens_branch} — {ens_reasoning}"]
@@ -902,14 +977,40 @@ else:
     ]
 
     n_story = len(story)
-    doc.build(story)
-    sz = os.path.getsize(str(BASE / "report.pdf"))
-    print(f"report.pdf written: {sz:,} bytes, 7 sections, {n_story} story elements")
+    _pdf_path = BASE / "report.pdf"
+    _pdf_written = False
+    try:
+        with open(str(_pdf_path), "wb") as _pdf_fh:
+            _doc = SimpleDocTemplate(
+                _pdf_fh, pagesize=A4,
+                leftMargin=2*cm, rightMargin=2*cm,
+                topMargin=2*cm, bottomMargin=2*cm,
+            )
+            _doc.build(story)
+        # File stream is closed by the 'with' block before we reach here
+        sz = os.path.getsize(str(_pdf_path))
+        if sz > 0:
+            print(f"report.pdf written: {sz:,} bytes, 7 sections, {n_story} story elements")
+            _pdf_written = True
+        else:
+            print("ERROR: report.pdf had 0 bytes after stream close — write not confirmed")
+    except Exception as _build_err:
+        print(f"ERROR: report.pdf build failed: {_build_err}")
 
-# ── Marker file ───────────────────────────────────────────────────────────────
-ts_iso = datetime.utcnow().isoformat() + "Z"
-with open(REPORTS / "report_writer_was_here.txt", "w", encoding="utf-8") as fh:
-    fh.write(f"report_writer sub-agent executed at {ts_iso}\n")
-print(f"Marker: reports/report_writer_was_here.txt")
+# ── Marker file — written only after OS-confirmed file stream close ────────────
 if missing_inputs:
     print(f"Missing inputs: {missing_inputs}")
+if _pdf_written:
+    ts_iso = datetime.utcnow().isoformat() + "Z"
+    with open(REPORTS / "report_writer_was_here.txt", "w", encoding="utf-8") as fh:
+        fh.write(f"report_writer sub-agent executed at {ts_iso}\n")
+    print("Marker: reports/report_writer_was_here.txt")
+else:
+    print("ERROR: marker not written — report file write unconfirmed by OS")
+
+# ── KG: deferred status update — only on confirmed PDF write ──────────────────
+try:
+    from kg import kg_set_stage
+    kg_set_stage("complete" if _pdf_written else "failed")
+except Exception as _kg_e:
+    print(f"[KG] non-fatal: {_kg_e}")
