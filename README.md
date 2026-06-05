@@ -1,4 +1,4 @@
-# Award B: Autonomous Data Analysis Pipeline
+# Autonomous Data Analysis Pipeline
 
 This is an autonomous data analysis pipeline built on Claude Code that handles tabular forecasting and regression problems. Given an unknown dataset placed in `data/`, it produces `submission.csv` and `report.pdf` within 2 hours without human intervention.
 
@@ -91,7 +91,7 @@ Beyond the base lag, rolling, and group-baseline features for the target column,
 
 **Extended rolling windows** for each numeric covariate add rolling mean at windows 8 and 13 and rolling std at windows 4, 8, and 13, beyond the existing 4-period rolling mean. Windows are skipped if they exceed half of `min_periods_per_group`.
 
-**Covariate ratios** are generated for numeric covariates that share a name prefix (split on underscore). For example, `gtrends_fentanyl` and `gtrends_naloxone` share the prefix `gtrends` and generate the ratio `gtrends_fentanyl_div_gtrends_naloxone`. Ratios use safe division and are capped to handle outliers. Limited to 10 ratio features per dataset.
+**Covariate ratios** are generated for numeric covariates that share a name prefix (split on underscore). For example, two covariates sharing a common prefix generate a ratio feature named `{prefix}_{col_a}_div_{prefix}_{col_b}`. Ratios use safe division and are capped to handle outliers. Limited to 10 ratio features per dataset.
 
 **Group-level covariate aggregates** compute per-group historical mean, per-group recent 4-period mean, and per-group drift (recent minus historical) for each numeric covariate.
 
@@ -114,7 +114,7 @@ The detected granularity drives additional seasonality features beyond the base 
 | **Monthly** | month-of-year sin/cos; calendar quarter (1–4) |
 | **Weekly** | base annual-cycle sin/cos/sin2/cos2 only (no extra features) |
 
-For panel data with detected time granularity, val lag features that look back into the validation period are imputed using a cycle-aware method rather than the last known training value. The imputed value uses the mean target for the matching group at the same point in the seasonal cycle: matching hour-of-day for hourly data, day-of-week for daily data, week-of-year for weekly data, and month-of-year for monthly data. For monthly granularity with opaque time IDs (like Award A's period_id hashes), the pipeline first resolves IDs to calendar dates via the codebook, then computes the median date difference across unique time periods to confirm monthly cadence before applying month-of-year cycle imputation. This preserves seasonal pattern information far ahead of the training window, addressing the staleness that occurs when later val periods are many steps removed from training end. The method falls back to last known training value when seasonal position cannot be determined or when fewer than 10 percent of training rows resolve through the codebook.
+For panel data with detected time granularity, val lag features that look back into the validation period are imputed using a cycle-aware method rather than the last known training value. The imputed value uses the mean target for the matching group at the same point in the seasonal cycle: matching hour-of-day for hourly data, day-of-week for daily data, week-of-year for weekly data, and month-of-year for monthly data. For monthly granularity with opaque time IDs, the pipeline first resolves IDs to calendar dates via the codebook, then computes the median date difference across unique time periods to confirm monthly cadence before applying month-of-year cycle imputation. This preserves seasonal pattern information far ahead of the training window, addressing the staleness that occurs when later val periods are many steps removed from training end. The method falls back to last known training value when seasonal position cannot be determined or when fewer than 10 percent of training rows resolve through the codebook.
 
 ## Adversarial Validation
 
@@ -143,11 +143,30 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 ## Known Limitations
 
 - Walk-forward MAE may underestimate out-of-sample error when the validation period has a different distribution than training, even with shift-aware features applied. The validator's purged walk-forward provides a second estimate, but it may also be optimistic under severe shift.
-- **Image handling differs by problem type.** For cross-sectional datasets (no time column), `feature_engineering.py` attempts to extract six grayscale summary statistics per image (mean intensity, std, center mean, corner mean, contrast, bright fraction) using PIL; these are included in the model. For panel (time-series) datasets, image features are not extracted. Note: `schema_analysis.md` states that image features are not used — this is accurate for panel problems but not for cross-sectional ones.
+- **Image embedding features.** For datasets with image sidecar files (PNG, JPG, JPEG), the pipeline extracts 23 hand-crafted spatial features per image using only PIL and numpy. This works for both panel and cross-sectional problems via automatic filename pattern detection.
+
+  Activation conditions: image files present in any data subdirectory, PIL importable, at least 10 images.
+
+  For panel data, the pipeline detects filename patterns like `{group_col}_{time_col}.png` via regex, parses linkage column values, and matches each image to corresponding panel rows. For cross-sectional data, direct row-to-image mapping is used.
+
+  The 23 features per image cover:
+  - Intensity statistics: mean, std, 99th/1st percentiles, median, IQR
+  - Quadrant features: mean and std per 2×2 quadrant grid (8 features)
+  - Center vs edge contrast: center mean, edge mean, center/edge ratio
+  - Brightness distribution: bright/dark pixel fractions and spatial spread
+  - Color features (when RGB present): inter-channel variance, intensity range
+
+  After extraction, the pipeline computes Pearson correlation between each image feature and the target on training rows. The maximum absolute correlation is logged as a diagnostic. Features are added to the model regardless of correlation strength, letting tree-based feature importance determine ultimate usage.
+
+  Graceful failure: missing PIL, no images detected, individual image load failures, or feature extraction errors are all caught and logged. The pipeline continues with standard features in any failure case.
+
+  When image files are successfully matched, all 23 features are passed to the model regardless of their individual correlation with the target; tree-based feature importance determines which features are used in practice.
+
+- Image feature extraction uses hand-crafted spatial statistics rather than deep learning embeddings. For domains where semantic content matters (object recognition, complex scenes), pre-trained CNN embeddings would extract richer features but require GPU and significant model weight downloads. The current approach trades some signal richness for CPU compatibility and zero external dependencies beyond PIL.
 - Pipeline assumes one of three documented file conventions; unusual layouts may not be auto-detected and will fall back to heuristics that could misclassify train/val files.
 - Stacking and target encoding are not used, to avoid leakage risks that arise when hierarchical outcome categories overlap across folds.
 - Lag features compound error on long forecasts: when the validation horizon extends many periods ahead, lag imputation falls back to the last known training value per group, which degrades accuracy as horizon length increases.
-- Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. Verified on retail (weekly): real test MAE improved from 9.27 to 9.05 (2.4% reduction). Verified on Award A (monthly with codebook): smart imputation activated correctly with 7344 val lag cells filled via month-of-year cycle averages and zero fallbacks. In both cases internal CV remained essentially unchanged, demonstrating the imputation primarily helps test-time predictions rather than training-time evaluation.
+- Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. The imputation typically improves walk-forward predictions with minimal effect on internal CV metrics, since it primarily helps test-time predictions rather than training-time evaluation.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
 - Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
 

@@ -32,3 +32,10 @@ Thumbs.db
 # claude settings
 .claude/settings.local.json
 tools/run_modeler_script.py
+tools/run_modeler_*.py
+
+# Runtime artifacts created by Claude Code
+tools/run_modeler_full.py
+tools/run_modeler_retune.py
+tools/run_modeler_v2.py
+tools/run_modeler_v3.py

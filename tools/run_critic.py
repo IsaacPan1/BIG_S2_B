@@ -1,9 +1,9 @@
 import pandas as pd, numpy as np, json, os, datetime, sys
 
 # ── Threshold constants ──────────────────────────────────────────────────────
-CV_GAP_VALIDATOR_WARNING  = 0.10
-CV_GAP_VALIDATOR_CRITICAL = 0.25
-CV_GAP_CRITIC_ACCEPT      = 0.15
+CV_GAP_VALIDATOR_WARNING  = 0.10   # 10%  -> validator issues WARNING
+CV_GAP_VALIDATOR_CRITICAL = 0.25   # 25%  -> validator issues CRITICAL
+CV_GAP_CRITIC_ACCEPT      = 0.15   # 15%  -> critic accepts WARNINGs, rejects CRITICALs
 
 PRED_MEAN_BIAS_CRITICAL   = 0.30
 PRED_STD_CRITICAL         = 0.40
@@ -51,7 +51,7 @@ except Exception as e:
     missing_inputs.append(f"data/features_train.parquet: {e}")
     train_mean, train_std, train_max, train_nonneg = 0.0, 1.0, 0.0, True
 
-# ── Step 3: Run quality checks ────────────────────────────────────────────────
+# ── Step 3: Run quality checks (always, even in second cycle) ────────────────
 checks = []
 warnings_for_report = []
 
@@ -133,7 +133,7 @@ elif train_max > 0.0 and pred_max < PRED_MAX_LOW_RATIO * train_max:
     c5_status = "WARNING"
 checks.append({"name": "prediction_sanity", "status": c5_status, "details": c5_details})
 
-# ── Step 4: Decide on action ──────────────────────────────────────────────────
+# ── Step 4: Decide on action ─────────────────────────────────────────────────
 critical_checks = [c for c in checks if c["status"] == "CRITICAL"]
 warning_checks  = [c for c in checks if c["status"] == "WARNING"]
 for c in warning_checks:
@@ -143,31 +143,32 @@ if missing_inputs:
 
 status = "accepted" if (second_cycle or not critical_checks) else "retune_requested"
 
+# Build decision_rationale
 warn_names = [c["name"] for c in checks if c["status"] == "WARNING"]
 crit_names = [c["name"] for c in checks if c["status"] == "CRITICAL"]
 check_summary = "; ".join(f"{c['name']}={c['status']}" for c in checks)
 if second_cycle:
-    decision_rationale = f"Second retune cycle: accepted regardless. {check_summary}."
+    decision_rationale = f"Second retune cycle: accepted regardless of remaining check results. Check summary: {check_summary}."
 elif status == "accepted":
     if not warn_names and not crit_names:
         decision_rationale = f"All {len(checks)} checks PASS. Model accepted without concerns."
     else:
         decision_rationale = (f"Model accepted: {len(warn_names)} WARNING(s) ({', '.join(warn_names)}), 0 CRITICALs. "
-                              f"WARNINGs documented. {check_summary}.")
+                              f"WARNINGs documented in warnings_for_report. Check summary: {check_summary}.")
 else:
     decision_rationale = (f"Retune requested: {len(crit_names)} CRITICAL check(s) ({', '.join(crit_names)}). "
-                          f"{check_summary}.")
+                          f"Check summary: {check_summary}.")
 
 print(f"Critic decision: {status} (second_cycle={second_cycle})")
 for c in checks:
-    print(f"  {c['name']}: {c['status']} — {c['details']}")
+    print(f"  {c['name']}: {c['status']} -- {c['details']}")
 
-# ── Step 5: If retune requested (first cycle only) ────────────────────────────
+# ── Step 5: If retune requested (first cycle only) ───────────────────────────
 issue = suggested = None
 if status == "retune_requested" and not second_cycle:
     first_critical = critical_checks[0]["name"]
     if first_critical == "validator_concordance":
-        issue = f"Validator returned CRITICAL verdict: {validator_review.get('notes', '')}"
+        issue = f"Validator returned CRITICAL verdict: {validator_review.get('notes', 'see validator_review.json')}"
         fs = validator_review.get("feature_suspicion", [])
         suggested = (f"remove suspect features ({', '.join(str(f) for f in fs[:3])}) and retrain"
                      if fs else "review validator_review.json notes and address CV methodology issue before retraining")
@@ -184,10 +185,10 @@ if status == "retune_requested" and not second_cycle:
             suggested = "apply fill_vals to all val columns; add np.nan_to_num fallback after ensemble_preds"
         else:
             issue = f"Negative predictions: {neg_count} negative values in non-negative target"
-            suggested = "apply np.clip(predictions, 0, None) after seed aggregation"
+            suggested = "apply np.clip(predictions, 0, None) after seed aggregation, before saving predictions.csv"
     else:
-        issue = f"Critical check failed: {first_critical} — {critical_checks[0]['details']}"
-        suggested = "retrain with default hyperparameters"
+        issue = f"Critical check failed: {first_critical} -- {critical_checks[0]['details']}"
+        suggested = "retrain with default hyperparameters to rule out numerical instability"
 
     with open("reports/critic_retune_requested.json", "w") as f:
         json.dump({"issue": issue, "suggested_change": suggested,
@@ -205,11 +206,11 @@ review = {
     "warnings_for_report":  warnings_for_report,
     "retune_attempted":     second_cycle or (status == "retune_requested"),
     "final_recommendation": ("proceed to submission_writer" if status == "accepted"
-                             else "retune requested"),
+                             else "retune requested -- orchestrator should re-invoke modeler, then validator, then critic"),
     "decision_rationale":   decision_rationale,
 }
 if issue is not None:
-    review["retune_issue"] = issue
+    review["retune_issue"]            = issue
     review["retune_suggested_change"] = suggested
 
 with open("reports/critic_review.json", "w") as f:

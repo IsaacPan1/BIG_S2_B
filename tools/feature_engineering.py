@@ -198,6 +198,366 @@ def _run_adversarial_validation(
         return meta, None
 
 
+# ── IMAGE EMBEDDING HELPERS ────────────────────────────────────────────────────
+def _detect_image_dirs() -> dict:
+    """Scan data/ for directories with >= 10 image files."""
+    import os as _os2
+    import re as _re2
+    _exts = {".png", ".jpg", ".jpeg"}
+    _img_dirs: dict = {}
+    for _root, _dirs, _files in _os2.walk(DATA_DIR):
+        _rp = Path(_root)
+        _imgs = [f for f in _files if Path(f).suffix.lower() in _exts]
+        if len(_imgs) >= 10:
+            _img_dirs[_rp] = _imgs
+
+    if not _img_dirs:
+        return {"present": False}
+
+    _train_dir = _val_dir = _flat_dir = None
+    _train_cnt = _val_cnt = _flat_cnt = 0
+    for _d, _imgs in _img_dirs.items():
+        _rel = _d.relative_to(REPO).parts
+        _n = len(_imgs)
+        if "train" in _rel:
+            if _n > _train_cnt:
+                _train_dir, _train_cnt = _d, _n
+        elif "val" in _rel:
+            if _n > _val_cnt:
+                _val_dir, _val_cnt = _d, _n
+        else:
+            if _n > _flat_cnt:
+                _flat_dir, _flat_cnt = _d, _n
+
+    _primary_dir = _train_dir or _flat_dir or next(iter(_img_dirs))
+    _samples = _img_dirs[_primary_dir][:10]
+
+    _img_size = None
+    try:
+        from PIL import Image as _PILI2
+        _img_size = list(_PILI2.open(_primary_dir / _samples[0]).size)
+    except Exception:
+        pass
+
+    _panel_pat = _re2.compile(r'^([A-Z]{2,3})_([A-Za-z0-9]{6,12})\.(png|jpg|jpeg)$')
+    _num_pat   = _re2.compile(r'^img_(\d+)\.(png|jpg|jpeg)$', _re2.IGNORECASE)
+    _panel_n   = sum(1 for s in _samples if _panel_pat.match(s))
+    _num_n     = sum(1 for s in _samples if _num_pat.match(s))
+
+    if _panel_n >= 5:
+        _pattern = "{col0}_{col1}.ext"
+    elif _num_n >= 5:
+        _pattern = "img_{NNNN}.ext"
+    else:
+        _pattern = "generic"
+
+    def _rel_str(p):
+        return str(p.relative_to(REPO)).replace("\\", "/") if p else None
+
+    return {
+        "present": True,
+        "n_images_train": _train_cnt or _flat_cnt,
+        "n_images_val": _val_cnt,
+        "image_dir_train": _rel_str(_train_dir or _flat_dir),
+        "image_dir_val": _rel_str(_val_dir),
+        "image_size": _img_size,
+        "filename_pattern": _pattern,
+        "sample_filenames": _samples[:5],
+    }
+
+
+def _extract_img_features(arr: np.ndarray, tr_p25: float = 0.0,
+                          tr_p75: float = 1.0) -> dict:
+    """Compute 21-23 spatial features from a float32 image array in [0,1]."""
+    _eps = 1e-9
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        _gray = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1]
+                 + 0.114 * arr[:, :, 2]).astype(np.float32)
+        _is_rgb = True
+    else:
+        _gray = arr.squeeze().astype(np.float32)
+        _is_rgb = False
+
+    h, w = _gray.shape
+    feats: dict = {}
+
+    # A. Intensity statistics (6)
+    feats["img_mean_intensity"]   = float(np.mean(_gray))
+    feats["img_std_intensity"]    = float(np.std(_gray))
+    feats["img_p99_intensity"]    = float(np.percentile(_gray, 99))
+    feats["img_p01_intensity"]    = float(np.percentile(_gray, 1))
+    feats["img_median_intensity"] = float(np.median(_gray))
+    feats["img_iqr_intensity"]    = float(np.percentile(_gray, 75)
+                                          - np.percentile(_gray, 25))
+
+    # B. Quadrant features (8)
+    h2, w2 = h // 2, w // 2
+    for _qn, _qs in [("TL", _gray[:h2, :w2]), ("TR", _gray[:h2, w2:]),
+                     ("BL", _gray[h2:, :w2]), ("BR", _gray[h2:, w2:])]:
+        feats[f"img_quad_{_qn}_mean"] = float(np.mean(_qs))
+        feats[f"img_quad_{_qn}_std"]  = float(np.std(_qs))
+
+    # C. Center vs edge (3)
+    h4, w4 = max(1, h // 4), max(1, w // 4)
+    _center = _gray[h4:h - h4, w4:w - w4]
+    _e_mask = np.ones_like(_gray, dtype=bool)
+    _e_mask[h4:h - h4, w4:w - w4] = False
+    _cm = float(np.mean(_center))
+    _em = float(np.mean(_gray[_e_mask]))
+    feats["img_center_mean"]       = _cm
+    feats["img_edge_mean"]         = _em
+    feats["img_center_edge_ratio"] = _cm / (_em + _eps)
+
+    # D. Brightness distribution (4)
+    feats["img_bright_fraction"] = float(np.mean(_gray > tr_p75))
+    feats["img_dark_fraction"]   = float(np.mean(_gray < tr_p25))
+    _bys, _bxs = np.where(_gray > tr_p75)
+    feats["img_spatial_std_x"] = float(np.std(_bxs)) if len(_bxs) > 1 else 0.0
+    feats["img_spatial_std_y"] = float(np.std(_bys)) if len(_bys) > 1 else 0.0
+
+    # E. Color features (2, RGB only)
+    if _is_rgb and arr.ndim == 3:
+        _chmeans = [float(np.mean(arr[:, :, c])) for c in range(min(3, arr.shape[2]))]
+        feats["img_color_intensity_diff"] = float(max(_chmeans) - min(_chmeans))
+        feats["img_color_variance"]       = float(np.var(arr[:, :, :3], axis=2).mean())
+
+    return feats
+
+
+def _run_image_embedding(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    img_profile_hint: dict | None = None,
+) -> tuple:
+    """Load images, extract 21-23 spatial features per image, link to rows.
+
+    Returns (train_img_df, val_img_df, meta_dict).  Never raises.
+    """
+    import time as _itime2
+
+    _meta: dict = {
+        "activated": False, "skip_reason": None,
+        "n_images_processed_train": 0, "n_images_processed_val": 0,
+        "n_features_extracted": 0, "feature_names": [],
+        "n_rows_with_image_match_train": 0, "n_rows_with_image_match_val": 0,
+        "match_rate_train": 0.0, "match_rate_val": 0.0,
+        "max_correlation_with_target": None, "useful_signal_detected": False,
+        "load_time_seconds": 0.0, "feature_extraction_time_seconds": 0.0,
+    }
+    _empty_tr = pd.DataFrame(index=df_train.index)
+    _empty_vl = pd.DataFrame(index=df_val.index)
+
+    try:
+        from PIL import Image as _PILImg2
+    except ImportError:
+        _meta["skip_reason"] = "PIL_not_available"
+        return _empty_tr, _empty_vl, _meta
+
+    try:
+        # Step 1: Detect directories
+        _disc = _detect_image_dirs()
+        _hint = img_profile_hint or {}
+        if not _disc.get("present") and _hint.get("directory"):
+            _hd = REPO / _hint["directory"]
+            if _hd.exists():
+                _disc = {"present": True, "image_dir_train": _hint["directory"],
+                         "image_dir_val": None}
+
+        if not _disc.get("present"):
+            _meta["skip_reason"] = "no_images_detected"
+            return _empty_tr, _empty_vl, _meta
+
+        _tr_dir = REPO / _disc["image_dir_train"]
+        _vl_dir_s = _disc.get("image_dir_val")
+        _vl_dir = REPO / _vl_dir_s if _vl_dir_s else None
+
+        if not _tr_dir.exists():
+            _meta["skip_reason"] = "image_dir_not_found"
+            return _empty_tr, _empty_vl, _meta
+
+        _exts3 = {".png", ".jpg", ".jpeg"}
+
+        # Step 2: Load image arrays
+        _t_load = _itime2.time()
+
+        def _load_cache(img_dir: Path) -> dict:
+            _c: dict = {}
+            for _fp in img_dir.iterdir():
+                if _fp.suffix.lower() not in _exts3:
+                    continue
+                try:
+                    _img = _PILImg2.open(_fp)
+                    if _img.mode in ("RGB", "RGBA"):
+                        _arr = np.array(_img.convert("RGB"), dtype=np.float32) / 255.0
+                    else:
+                        _arr = np.array(_img.convert("L"), dtype=np.float32) / 255.0
+                    _c[_fp.stem] = _arr
+                except Exception:
+                    pass
+            return _c
+
+        print(f"  Image embedding: loading from {_tr_dir}…")
+        _tr_cache = _load_cache(_tr_dir)
+        _vl_cache = _load_cache(_vl_dir) if (_vl_dir and _vl_dir.exists()) else {}
+        _load_secs = _itime2.time() - _t_load
+        print(f"  Loaded {len(_tr_cache)} train + {len(_vl_cache)} val images "
+              f"in {_load_secs:.1f}s")
+
+        if not _tr_cache:
+            _meta["skip_reason"] = "no_images_loaded"
+            return _empty_tr, _empty_vl, _meta
+
+        # Step 3: Training-set brightness thresholds
+        _smeans = [float(np.mean(
+            a if a.ndim == 2 else 0.299*a[:,:,0]+0.587*a[:,:,1]+0.114*a[:,:,2]
+        )) for a in list(_tr_cache.values())[:500]]
+        _tr_p25 = float(np.percentile(_smeans, 25))
+        _tr_p75 = float(np.percentile(_smeans, 75))
+
+        # Step 4: Extract per-image features
+        _t_feat = _itime2.time()
+
+        def _build_fc(cache: dict) -> dict:
+            _out: dict = {}
+            for _stem, _arr in cache.items():
+                try:
+                    _out[_stem] = _extract_img_features(_arr, _tr_p25, _tr_p75)
+                except Exception:
+                    pass
+            return _out
+
+        _tr_fc = _build_fc(_tr_cache)
+        _vl_fc = _build_fc(_vl_cache) if _vl_cache else {}
+        _feat_secs = _itime2.time() - _t_feat
+        print(f"  Features: {len(_tr_fc)} train + {len(_vl_fc)} val images "
+              f"in {_feat_secs:.1f}s")
+
+        if not _tr_fc:
+            _meta["skip_reason"] = "feature_extraction_failed"
+            return _empty_tr, _empty_vl, _meta
+
+        _feat_names = list(next(iter(_tr_fc.values())).keys())
+        _all_stems = set(_tr_fc.keys()) | set(_vl_fc.keys())
+        _hint_lc = _hint.get("linkage_column")
+
+        # Step 5: Auto-detect linkage columns
+        def _find_stem_fn(df: pd.DataFrame):
+            # Hint column (e.g. image_filename for cross-sectional)
+            if _hint_lc and _hint_lc in df.columns:
+                _vv = [Path(str(v)).stem for v in df[_hint_lc].iloc[:50]]
+                if sum(1 for v in _vv if v in _all_stems) >= 3:
+                    return lambda d, _c=_hint_lc: [
+                        Path(str(x)).stem for x in d[_c]]
+            # Single object/string column
+            for _c in [c for c in df.columns
+                       if df[c].dtype == object
+                       or str(df[c].dtype) == "string"]:
+                _vv = df[_c].astype(str).iloc[:50].tolist()
+                if sum(1 for v in _vv if v in _all_stems) >= 5:
+                    return lambda d, _c2=_c: d[_c2].astype(str).tolist()
+            # Two-column combo via group_cols + time_col globals
+            _gc = [c for c in (group_cols or []) + ([time_col] if time_col else [])
+                   if c in df.columns]
+            for _i, _c1 in enumerate(_gc):
+                for _c2 in _gc[_i + 1:]:
+                    _vv = (df[_c1].astype(str).iloc[:50] + "_"
+                           + df[_c2].astype(str).iloc[:50]).tolist()
+                    if sum(1 for v in _vv if v in _all_stems) >= 5:
+                        return lambda d, _a=_c1, _b=_c2: (
+                            d[_a].astype(str) + "_" + d[_b].astype(str)
+                        ).tolist()
+            # Index-based fallback (img_{NNNN})
+            _idx_vv = [f"img_{i:04d}" for i in range(min(50, len(df)))]
+            if sum(1 for v in _idx_vv if v in _all_stems) >= 5:
+                return lambda d: [f"img_{i:04d}" for i in range(len(d))]
+            return None
+
+        _stem_fn_tr = _find_stem_fn(df_train)
+        _stem_fn_vl = (_find_stem_fn(df_val)
+                       if len(df_val) > 0 else None)
+
+        if _stem_fn_tr is None:
+            _meta["skip_reason"] = "cannot_detect_linkage_columns"
+            return _empty_tr, _empty_vl, _meta
+
+        # Step 6: Map features to rows
+        def _map_rows(df: pd.DataFrame, stem_fn,
+                      fc_primary: dict, fc_fallback: dict) -> tuple:
+            _stems = stem_fn(df)
+            _rows = []
+            _nm = 0
+            for _s in _stems:
+                _fd = fc_primary.get(_s) or fc_fallback.get(_s)
+                if _fd is not None:
+                    _rows.append(_fd)
+                    _nm += 1
+                else:
+                    _rows.append({k: np.nan for k in _feat_names})
+            return pd.DataFrame(_rows, index=df.index), _nm
+
+        _tr_img_df, _n_match_tr = _map_rows(
+            df_train, _stem_fn_tr, _tr_fc, _vl_fc)
+        if _stem_fn_vl is not None:
+            _vl_img_df, _n_match_vl = _map_rows(
+                df_val, _stem_fn_vl, _vl_fc, _tr_fc)
+        else:
+            _vl_img_df = pd.DataFrame(
+                {k: np.nan for k in _feat_names}, index=df_val.index)
+            _n_match_vl = 0
+
+        # Step 7: Fill NaN with training median
+        _tr_med = _tr_img_df.median()
+        _tr_img_df = _tr_img_df.fillna(_tr_med)
+        _vl_img_df = _vl_img_df.fillna(_tr_med)
+
+        # Step 8: Signal detection
+        _max_corr = None
+        _useful = False
+        if target_col in df_train.columns:
+            _tgt = df_train[target_col].values.astype(float)
+            _valid = ~np.isnan(_tgt)
+            if _valid.sum() > 10:
+                _corrs = []
+                _tv = _tgt[_valid]
+                for _fn in _feat_names:
+                    if _fn in _tr_img_df.columns:
+                        _fv = _tr_img_df[_fn].values[_valid]
+                        if np.std(_fv) > 0:
+                            _c = float(np.corrcoef(_fv, _tv)[0, 1])
+                            if not np.isnan(_c):
+                                _corrs.append(abs(_c))
+                if _corrs:
+                    _max_corr = float(max(_corrs))
+                    _useful = _max_corr >= 0.05
+                    if not _useful:
+                        print(f"  WARNING: max |corr(img,target)|={_max_corr:.4f} < 0.05"
+                              " — images may not add signal (features kept for tree importance)")
+                    else:
+                        print(f"  Image signal detected: max |corr(img,target)|={_max_corr:.4f}")
+
+        _meta.update({
+            "activated": True, "skip_reason": None,
+            "n_images_processed_train": len(_tr_fc),
+            "n_images_processed_val": len(_vl_fc),
+            "n_features_extracted": len(_feat_names),
+            "feature_names": _feat_names,
+            "n_rows_with_image_match_train": _n_match_tr,
+            "n_rows_with_image_match_val": _n_match_vl,
+            "match_rate_train": float(_n_match_tr) / max(len(df_train), 1),
+            "match_rate_val": float(_n_match_vl) / max(len(df_val), 1),
+            "max_correlation_with_target": _max_corr,
+            "useful_signal_detected": _useful,
+            "load_time_seconds": _load_secs,
+            "feature_extraction_time_seconds": _feat_secs,
+        })
+        return _tr_img_df, _vl_img_df, _meta
+
+    except Exception as _exc:
+        print(f"  Image embedding failed: {_exc} — skipping")
+        _meta["skip_reason"] = f"unexpected_error: {str(_exc)[:200]}"
+        return _empty_tr, _empty_vl, _meta
+
+
 # ── CROSS-SECTIONAL PATH (no time_col) ────────────────────────────────────────
 if time_col is None:
     print("No time_col detected — running cross-sectional feature engineering path.")
@@ -315,45 +675,7 @@ if time_col is None:
             out[col] = np.log1p(np.maximum(out[nc], 0))
         _rg("interactions", [f"{nc}_log1p" for nc in true_numeric_covs])
 
-        # ── 9. Image summary features ─────────────────────────────────────────
-        img_dir = _Path(REPO / profile.get("image_data", {}).get("directory", "data/images"))
-        if image_link_col and image_link_col in out.columns and img_dir.exists():
-            print("  Extracting image summary features (mean intensity, std, region stats)…")
-            try:
-                from PIL import Image as _PILImage
-                import numpy as _np2
-
-                def _img_features(fname: str) -> dict:
-                    fpath = img_dir / fname
-                    if not fpath.exists():
-                        return {"img_mean": np.nan, "img_std": np.nan,
-                                "img_center_mean": np.nan, "img_corner_mean": np.nan,
-                                "img_contrast": np.nan, "img_bright_pct": np.nan}
-                    arr = _np2.array(_PILImage.open(fpath).convert("L"), dtype=_np2.float32) / 255.0
-                    h, w = arr.shape
-                    ch, cw = h // 4, w // 4
-                    center = arr[ch:h-ch, cw:w-cw]
-                    corner = _np2.concatenate([arr[:ch, :cw].ravel(), arr[:ch, -cw:].ravel(),
-                                               arr[-ch:, :cw].ravel(), arr[-ch:, -cw:].ravel()])
-                    return {
-                        "img_mean":        float(_np2.mean(arr)),
-                        "img_std":         float(_np2.std(arr)),
-                        "img_center_mean": float(_np2.mean(center)),
-                        "img_corner_mean": float(_np2.mean(corner)),
-                        "img_contrast":    float(_np2.mean(center) - _np2.mean(corner)),
-                        "img_bright_pct":  float((_np2.mean(arr) > 0.5).astype(float)),
-                    }
-
-                img_feats = out[image_link_col].apply(_img_features)
-                img_df = pd.DataFrame(img_feats.tolist(), index=out.index)
-                for col in img_df.columns:
-                    out[col] = img_df[col].values
-                _rg("image_features", list(img_df.columns))
-                print(f"  Image features added: {list(img_df.columns)}")
-            except Exception as e:
-                print(f"  Image feature extraction failed: {e} — skipping image features.")
-        else:
-            print("  Image directory not available or no linkage col — skipping image features.")
+        # ── 9. Image features — handled outside _build_features (see block below) ──
 
         # ── 10. Raw covariate pass-through ─────────────────────────────────────
         _rg("covariates", list(true_numeric_covs))
@@ -367,6 +689,32 @@ if time_col is None:
     train_feat = _build_features(train, is_train=True)
     val_feat   = _build_features(val,   is_train=False)
     print(f"features_train: {train_feat.shape}   features_val: {val_feat.shape}")
+
+    # ── Image Embedding Features ──────────────────────────────────────────────
+    _img_emb_meta = {"activated": False, "skip_reason": "not_attempted"}
+    try:
+        import time as _img_time_xs
+        _img_t0_xs = _img_time_xs.time()
+        print("Image embedding: scanning for images…")
+        _tr_img_df_xs, _vl_img_df_xs, _img_emb_meta = _run_image_embedding(
+            train, val, profile.get("image_data", {}),
+        )
+        if _img_emb_meta.get("activated") and not _tr_img_df_xs.empty:
+            _img_feat_names_xs = list(_tr_img_df_xs.columns)
+            for _ic_xs in _img_feat_names_xs:
+                train_feat[_ic_xs] = _tr_img_df_xs[_ic_xs].values
+                val_feat[_ic_xs]   = _vl_img_df_xs[_ic_xs].values
+            _reg("image_features", _img_feat_names_xs)
+            _img_ela_xs = _img_time_xs.time() - _img_t0_xs
+            print(f"Image embedding: {len(_img_feat_names_xs)} features added in "
+                  f"{_img_ela_xs:.1f}s (match_train="
+                  f"{_img_emb_meta.get('match_rate_train', 0):.2f}, "
+                  f"match_val={_img_emb_meta.get('match_rate_val', 0):.2f})")
+        else:
+            print(f"Image embedding skipped: {_img_emb_meta.get('skip_reason', 'unknown')}")
+    except Exception as _img_exc_xs:
+        print(f"Image embedding outer error: {_img_exc_xs} — skipping")
+        _img_emb_meta["skip_reason"] = f"outer_error: {str(_img_exc_xs)[:200]}"
 
     # ── Assert: val target is absent (all NaN after merge) ────────────────────
     if target_col in val_feat.columns:
@@ -407,10 +755,11 @@ if time_col is None:
         "train_shape":            list(train_feat.shape),
         "val_shape":              list(val_feat.shape),
         "adversarial_validation": _av_meta,
+        "image_embedding_features": _img_emb_meta,
         "notes": [
             "Cross-sectional tabular regression — no time/lag features.",
             "Group baselines (sex-level) computed from train rows only — no leakage.",
-            "Image summary features extracted from 64x64 grayscale PNGs.",
+            "Image embedding: 21-23 hand-crafted spatial features (intensity, quadrant, center/edge, brightness, color).",
             "Polynomial, interaction, risk-score, and log-transform features included.",
         ],
     }
@@ -1137,6 +1486,42 @@ if _codebook_info.get("available") and time_col is not None:
     except Exception as _e:
         print(f"WARNING: Codebook date feature extraction failed: {_e} — skipping")
 
+# ── 12e. Image Embedding Features ────────────────────────────────────────────
+_img_emb_meta = {"activated": False, "skip_reason": "not_attempted"}
+try:
+    import time as _img_time_pan
+    _img_t0_pan = _img_time_pan.time()
+    print("Image embedding: scanning for images…")
+    _tr_img_df_pan, _vl_img_df_pan, _img_emb_meta = _run_image_embedding(
+        full[tr_mask].copy(), full[vl_mask].copy(),
+        profile.get("image_data", {}),
+    )
+    if _img_emb_meta.get("activated") and not _tr_img_df_pan.empty:
+        _img_feat_names_pan = list(_tr_img_df_pan.columns)
+        # Reindex each split to full.index (NaN for out-of-split rows), then
+        # combine and cast — avoids .loc[bool_mask]=float64_array on float32 df
+        _img_block_pan = (
+            _tr_img_df_pan.reindex(full.index)
+            .combine_first(_vl_img_df_pan.reindex(full.index))
+            .astype(np.float32)
+        )
+        full = pd.concat([full, _img_block_pan], axis=1)
+        tr_mask = full[_tc] <= train_time_max
+        vl_mask = full[_tc] >  train_time_max
+        _reg("image_features", _img_feat_names_pan)
+        _img_ela_pan = _img_time_pan.time() - _img_t0_pan
+        print(f"Image embedding: {len(_img_feat_names_pan)} features added in "
+              f"{_img_ela_pan:.1f}s (match_train="
+              f"{_img_emb_meta.get('match_rate_train', 0):.2f}, "
+              f"match_val={_img_emb_meta.get('match_rate_val', 0):.2f})")
+        if _img_ela_pan > 900:
+            print("WARNING: image processing exceeded 15 minutes — continuing")
+    else:
+        print(f"Image embedding skipped: {_img_emb_meta.get('skip_reason', 'unknown')}")
+except Exception as _img_exc_pan:
+    print(f"Image embedding outer error: {_img_exc_pan} — skipping")
+    _img_emb_meta["skip_reason"] = f"outer_error: {str(_img_exc_pan)[:200]}"
+
 # ── 13. Fill val NaN lags/roll features ──────────────────────────────────────
 print("Filling val NaN lag/roll features…")
 last_known = (full.loc[full[_tc] == train_time_max, group_cols + [target_col]]
@@ -1374,11 +1759,17 @@ features_meta = {
     "train_shape":            list(features_train.shape),
     "val_shape":              list(features_val.shape),
     "adversarial_validation": _av_meta,
+    "image_embedding_features": _img_emb_meta,
     "notes": [
         "Group baselines computed from train rows only — no leakage.",
         "Rolling stats use shift(1) before rolling to prevent target leakage.",
         "Val NaN lag/roll features filled with cycle-aware group mean (monthly/weekly/daily/hourly) or last-known fallback.",
         "Long lags/windows skipped if min_periods_per_group < threshold.",
+        *(
+            [f"Image embedding: {_img_emb_meta.get('n_features_extracted', 0)} features, "
+             f"match_rate_train={_img_emb_meta.get('match_rate_train', 0):.2f}."]
+            if _img_emb_meta.get("activated") else []
+        ),
         *(
             [f"Shift-aware features added for {len(_shift_cols)} covariate(s) with KS > 0.15: "
              "z-score, rolling z-score, rank, group deviation, time interaction."]
