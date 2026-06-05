@@ -124,9 +124,17 @@ Note: `algorithm` is now dynamic based on which families succeeded and were incl
 ```
 Key: prediction stats are **nested** under `prediction_stats`. `validation_checks_passed` (not `validation_passed`).
 
-## Script to write and execute
+## Script to run
 
-Save the following as `reports/build_report.py` and run it with `python reports/build_report.py`. Fix any import errors before running (install `reportlab` and `matplotlib` if missing).
+The report generation tool lives at `tools/generate_report.py`. Run it from the repo root:
+
+```bash
+python tools/generate_report.py
+```
+
+Fix any import errors before running (`pip install reportlab matplotlib` if missing). The tool handles all sections automatically: Executive Summary, Pipeline Status, Pipeline Configuration, Problem Classification, Data Quality (with shift callouts), Feature Engineering (with unique-capability callouts for shift-aware features, image embeddings, smart lag imputation, and adversarial validation), Modeling (subsections 4A Ensemble Architecture / 4B Hyperparameter Selection / 4C Family Performance Comparison), CV & Integrity, Predictions & Submission (with baseline comparison when available), and Limitations & Risks (Critical Risk / Secondary Risks). Do NOT rewrite the script inline — run the tool as-is. If the tool crashes, check `missing_inputs` in its stdout and fix the specific JSON field that failed.
+
+## Script internals (for reference only — do not rewrite inline)
 
 ```python
 import json

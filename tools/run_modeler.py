@@ -276,6 +276,16 @@ _xgb_fi            = None
 _ridge_coef_top5   = []
 _lgbm_nt           = 0
 _lgbm_ne           = 500
+# Per-family WF holdout predictions for inverse-MAE gate
+lgb_wf_val_preds   = None
+xgb_wf_val_preds   = None
+cb_wf_val_preds    = None
+ridge_wf_val_preds = None
+# New behavior-change tracking dicts
+_optuna_reflection = {"pinned_params": [], "recentered": False,
+                      "best_mae_before": None, "best_mae_after": None}
+_postprocessing    = {"ordinal_rounding_applied": False,
+                      "ordinal_raw_wf_mae": None, "ordinal_round_wf_mae": None}
 _lgbm_hp           = {"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 20,
                       "feature_fraction": 0.8, "bagging_fraction": 0.8}
 
@@ -313,6 +323,67 @@ try:
     _ls.optimize(_lgbm_obj, n_trials=15, timeout=25*60, catch=(Exception,))
     _lgbm_bp = _ls.best_params; _lgbm_nt = len(_ls.trials)
     print(f"Optuna: {_lgbm_nt} trials, best={_ls.best_value:.4f}")
+    _optuna_reflection["best_mae_before"] = float(_ls.best_value)
+    _optuna_reflection["best_mae_after"]  = float(_ls.best_value)
+    # Boundary reflection: detect params at bounds, run one more study recentered on them
+    _lgb_bounds_def = {
+        "learning_rate":     (0.01, 0.1,     "log"),
+        "num_leaves":        (15,   _nl_hi,   "int"),
+        "min_child_samples": (_mcs_lo, 60,   "int"),
+        "feature_fraction":  (0.5,  1.0,     "float"),
+        "bagging_fraction":  (0.5,  1.0,     "float"),
+    }
+    _pinned_p = []; _shifted = {}
+    for _pn, (_lo, _hi, _pt) in _lgb_bounds_def.items():
+        _v = _lgbm_bp.get(_pn)
+        if _v is None: continue
+        _rng = _hi - _lo
+        _at_lo = (int(_v) == _lo) if _pt == "int" else (_v <= _lo + 0.05 * _rng)
+        _at_hi = (int(_v) == _hi) if _pt == "int" else (_v >= _hi - 0.05 * _rng)
+        if _at_lo or _at_hi:
+            _pinned_p.append(_pn)
+            if _pt == "int":
+                _d = max(1, (_hi - _lo) // 4)
+                _shifted[_pn] = (max(1, int(_v) - _d), min(int(_v) + _d, 4096))
+            elif _pt == "log":
+                _shifted[_pn] = (max(1e-5, _v / 3.0), min(1.0, _v * 3.0))
+            else:
+                _d2 = 0.25 * _rng
+                _shifted[_pn] = (max(0.01, _v - _d2), min(1.0, _v + _d2))
+    _optuna_reflection["pinned_params"] = _pinned_p
+    if _pinned_p and time.time() < TUNING_DEADLINE - 120:
+        def _reflect_obj(t2):
+            if time.time() > TUNING_DEADLINE: raise optuna.exceptions.TrialPruned()
+            _r_lr = _shifted.get("learning_rate",     (0.01, 0.1))
+            _r_nl = _shifted.get("num_leaves",         (15, _nl_hi))
+            _r_mc = _shifted.get("min_child_samples",  (_mcs_lo, 60))
+            _r_ff = _shifted.get("feature_fraction",   (0.5, 1.0))
+            _r_bf = _shifted.get("bagging_fraction",   (0.5, 1.0))
+            p2 = {"objective": "regression_l1", "metric": "mae", "n_estimators": 500,
+                  "bagging_freq": 5, "reg_alpha": 0.1, "reg_lambda": 0.1, "verbose": -1, "n_jobs": -1,
+                  "learning_rate":     t2.suggest_float("learning_rate",     _r_lr[0], _r_lr[1], log=True),
+                  "num_leaves":        t2.suggest_int("num_leaves",          _r_nl[0], max(_r_nl[0]+1, _r_nl[1])),
+                  "min_child_samples": t2.suggest_int("min_child_samples",   _r_mc[0], max(_r_mc[0]+1, _r_mc[1])),
+                  "feature_fraction":  t2.suggest_float("feature_fraction",  max(0.01, _r_ff[0]), min(1.0, _r_ff[1])),
+                  "bagging_fraction":  t2.suggest_float("bagging_fraction",  max(0.01, _r_bf[0]), min(1.0, _r_bf[1])),
+                  }
+            ms2 = [mean_absolute_error(y_pva, np.clip(
+                       lgb.LGBMRegressor(**{**p2, "random_state": _s}).fit(
+                           X_ptr, y_ptr, eval_set=[(X_pva, y_pva)],
+                           callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)]
+                       ).predict(X_pva), 0, None)) for _s in [42, 7, 123]]
+            return float(np.mean(ms2))
+        _study2 = optuna.create_study(direction="minimize")
+        _study2.optimize(_reflect_obj, n_trials=15,
+                         timeout=max(1, TUNING_DEADLINE - time.time()), catch=(Exception,))
+        _lgbm_nt += len(_study2.trials)
+        _optuna_reflection["recentered"] = True
+        if _study2.trials and _study2.best_value < _ls.best_value:
+            _lgbm_bp = _study2.best_params
+            _optuna_reflection["best_mae_after"] = float(_study2.best_value)
+        print(f"Optuna reflection: pinned={_pinned_p}, "
+              f"mae_before={_optuna_reflection['best_mae_before']:.4f}, "
+              f"mae_after={_optuna_reflection['best_mae_after']:.4f}")
 except Exception as _e:
     _lgbm_bp = {}; _lgbm_nt = 0; print(f"Optuna failed: {_e}")
 
@@ -327,7 +398,9 @@ try:
     _pm.fit(X_ptr, y_ptr, eval_set=[(X_pva, y_pva)],
             callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(200)])
     _lgbm_ne  = max(int((_pm.best_iteration_ or 500) * 1.1), 200)
-    probe_mae = float(mean_absolute_error(y_pva, np.clip(_pm.predict(X_pva), 0, None)))
+    _lgbm_probe_va = np.clip(_pm.predict(X_pva), 0, None)
+    probe_mae = float(mean_absolute_error(y_pva, _lgbm_probe_va))
+    lgb_wf_val_preds = _lgbm_probe_va
     print(f"Probe MAE={probe_mae:.4f}, n_est={_lgbm_ne}")
 except Exception as _e:
     _lgbm_ne = 500; print(f"Probe failed: {_e}")
@@ -455,6 +528,7 @@ if "xgboost" in families_plan:
                        "early_stopping_rounds": 50})
                 _xgb_probe.fit(X_ptr, y_ptr, eval_set=[(X_pva, y_pva)], verbose=False)
                 _xgb_ne = max(int((_xgb_probe.best_iteration or 500) * 1.1), 100)
+                xgb_wf_val_preds = np.clip(_xgb_probe.predict(X_pva), 0, None)
                 print(f"XGBoost probe n_est={_xgb_ne}")
             except Exception as _e:
                 try:
@@ -465,6 +539,7 @@ if "xgboost" in families_plan:
                            "early_stopping_rounds": 50})
                     _xgb_probe.fit(X_ptr, y_ptr, eval_set=[(X_pva, y_pva)], verbose=False)
                     _xgb_ne = max(int((_xgb_probe.best_iteration or 500) * 1.1), 100)
+                    xgb_wf_val_preds = np.clip(_xgb_probe.predict(X_pva), 0, None)
                     print(f"XGBoost probe (squarederror fallback) n_est={_xgb_ne}")
                 except Exception as _e2:
                     print(f"XGBoost probe failed: {_e2}")
@@ -595,6 +670,16 @@ if "catboost" in families_plan:
             }
             if _cat_idx: _cb_fp["cat_features"] = _cat_idx
 
+            # Single-seed WF probe for inverse-MAE gate (fewer iterations for speed)
+            try:
+                _cb_gate_p = {**_cb_fp, "random_seed": 42, "iterations": 150}
+                _cb_gate_m = (_cb_module.CatBoostRegressor(**_cb_gate_p) if _cb_loss == "MAE"
+                              else _cb_module.CatBoostClassifier(**_cb_gate_p))
+                _cb_gate_m.fit(X_ptr.values, y_ptr, verbose=False)
+                cb_wf_val_preds = np.clip(_cb_gate_m.predict(X_pva.values), 0, None)
+            except Exception:
+                pass
+
             def _cb_pfn(Xtr, ytr, Xva):
                 _preds = []
                 for _s in [42, 7, 123]:
@@ -707,6 +792,12 @@ if "ridge" in families_plan:
                 if _mae < _best_alpha_mae:
                     _best_alpha_mae = _mae; _best_alpha = _al
             print(f"Best alpha: {_best_alpha} (probe MAE={_best_alpha_mae:.4f})")
+            try:
+                _ridge_gate_m = SkRidge(alpha=_best_alpha)
+                _ridge_gate_m.fit(_Xptr_s, y_ptr)
+                ridge_wf_val_preds = _ridge_gate_m.predict(_Xpva_s)
+            except Exception:
+                pass
 
             # OOF predictions
             def _ridge_pfn(Xtr, ytr, Xva):
@@ -835,15 +926,62 @@ if _ensemble_weighting == "ridge_weighted_1.5x" and "ridge" in _included:
             )
             print(f"Competence FAIL: ridge_oof={_ridge_oof:.3f} > 1.5*best={1.5*_best_oof:.3f}; downgrading to equal_median")
 
+_included_keys = list(_included.keys())
+_stack = np.array([_included[k] for k in _included_keys])
+_family_oof = {k: all_family_results[k]["oof_mae"]
+               for k in _included_keys
+               if all_family_results.get(k, {}).get("oof_mae") is not None}
+
+ensemble_blend = "equal_median"
+_blend_weights_log = {k: round(1.0 / max(len(_included_keys), 1), 4) for k in _included_keys}
+_blend_holdout_mae_equal = None
+_blend_holdout_mae_inv   = None
+
 if len(_included) == 1:
     ensemble_preds = next(iter(_included.values()))
+    ensemble_blend = "single_family"
+    _blend_weights_log = {_included_keys[0]: 1.0}
 elif _ensemble_weighting == "ridge_weighted_1.5x" and "ridge" in _included:
-    _weights = np.array([1.5 if k == "ridge" else 1.0 for k in _included.keys()])
-    _stacked = np.stack(list(_included.values()), axis=0)
-    ensemble_preds = np.average(_stacked, axis=0, weights=_weights)
-    print(f"Ridge-weighted avg: weights={dict(zip(_included.keys(), _weights.tolist()))}")
+    # Path 1: Axis 2 shift-hedge takes precedence
+    _r_w = np.array([1.5 if k == "ridge" else 1.0 for k in _included_keys])
+    ensemble_preds = np.average(_stack, axis=0, weights=_r_w)
+    ensemble_blend = "ridge_weighted_1.5x"
+    _blend_weights_log = {k: round(float(_r_w[i] / _r_w.sum()), 4) for i, k in enumerate(_included_keys)}
+    print(f"Ridge-weighted avg: weights={dict(zip(_included_keys, _r_w.tolist()))}")
 else:
-    ensemble_preds = np.median(np.stack(list(_included.values()), axis=0), axis=0)
+    # Path 2/3: compare equal-median vs inverse-MAE on WF holdout
+    _equal_preds = np.median(_stack, axis=0)
+    _wf_map = {"lightgbm": lgb_wf_val_preds, "xgboost": xgb_wf_val_preds,
+               "catboost": cb_wf_val_preds, "ridge": ridge_wf_val_preds}
+    _can_gate = (len(_family_oof) == len(_included_keys)
+                 and all(_family_oof.get(k, 0) > 0 for k in _included_keys)
+                 and all(_wf_map.get(k) is not None for k in _included_keys))
+    _inv_sum = sum(1.0 / _family_oof[k] for k in _included_keys if _family_oof.get(k, 0) > 0)
+    if _inv_sum > 0:
+        _inv_w_arr = np.array([(1.0 / _family_oof[k] / _inv_sum if _family_oof.get(k, 0) > 0 else 0.0)
+                               for k in _included_keys])
+        _inv_preds = np.average(_stack, axis=0, weights=_inv_w_arr)
+        if _can_gate:
+            _wf_stack = np.array([_wf_map[k] for k in _included_keys])
+            _blend_holdout_mae_equal = float(mean_absolute_error(y_pva, np.median(_wf_stack, axis=0)))
+            _blend_holdout_mae_inv   = float(mean_absolute_error(y_pva, np.average(_wf_stack, axis=0, weights=_inv_w_arr)))
+            _use_inv = _blend_holdout_mae_inv <= _blend_holdout_mae_equal
+        else:
+            _use_inv = False
+        if _use_inv:
+            ensemble_preds = _inv_preds
+            ensemble_blend = "inverse_mae_weighted"
+            _blend_weights_log = {k: round(float(_inv_w_arr[i]), 4) for i, k in enumerate(_included_keys)}
+        else:
+            ensemble_preds = _equal_preds
+            ensemble_blend = "equal_median"
+            _blend_weights_log = {k: round(1.0 / len(_included_keys), 4) for k in _included_keys}
+    else:
+        ensemble_preds = _equal_preds
+        ensemble_blend = "equal_median"
+        _blend_weights_log = {k: round(1.0 / len(_included_keys), 4) for k in _included_keys}
+    print(f"Ensemble blend={ensemble_blend}, holdout_mae_equal={_blend_holdout_mae_equal}, "
+          f"holdout_mae_inv={_blend_holdout_mae_inv}")
 
 if _retune_applied and "clip_after_ensemble" in (_retune_applied or ""):
     ensemble_preds = np.clip(ensemble_preds, 0, None)
@@ -851,6 +989,21 @@ if _retune_applied and "clip_after_ensemble" in (_retune_applied or ""):
 print(f"Ensemble from {list(_included.keys())}: min={ensemble_preds.min():.2f}, "
       f"mean={ensemble_preds.mean():.2f}, max={ensemble_preds.max():.2f}")
 print(f"NaN count: {np.isnan(ensemble_preds).sum()}")
+
+# Ordinal rounding: only when problem_subtype == "ordinal_regression"
+if problem_subtype == "ordinal_regression" and lgb_wf_val_preds is not None:
+    _t_min = int(y_full.min())
+    _t_max = int(y_full.max())
+    _rounded_preds = np.clip(np.round(ensemble_preds), _t_min, _t_max)
+    _ord_raw_wf  = float(mean_absolute_error(y_pva, lgb_wf_val_preds))
+    _ord_round_wf = float(mean_absolute_error(
+        y_pva, np.clip(np.round(lgb_wf_val_preds), _t_min, _t_max)))
+    _postprocessing["ordinal_raw_wf_mae"]   = _ord_raw_wf
+    _postprocessing["ordinal_round_wf_mae"] = _ord_round_wf
+    if _ord_round_wf < _ord_raw_wf:  # strict improvement; tie → raw
+        ensemble_preds = _rounded_preds
+        _postprocessing["ordinal_rounding_applied"] = True
+        print(f"Ordinal rounding applied: wf_mae {_ord_raw_wf:.4f} → {_ord_round_wf:.4f}")
 
 # Ensemble disagreement
 if len(_included) > 1:
@@ -946,6 +1099,10 @@ results = {
                 and all_family_results.get("ridge", {}).get("succeeded"))
             else None
         ),
+        "ensemble_blend": ensemble_blend,
+        "blend_weights": _blend_weights_log,
+        "blend_holdout_mae_equal": _blend_holdout_mae_equal,
+        "blend_holdout_mae_inv":   _blend_holdout_mae_inv,
     },
     "families": {
         "lightgbm": all_family_results.get("lightgbm", {}),
@@ -981,6 +1138,8 @@ results = {
     "n_train_rows": int(n_train),
     "n_val_rows": int(len(val_df)),
     "retune_applied": _retune_applied,
+    "optuna_reflection": _optuna_reflection,
+    "postprocessing": _postprocessing,
 }
 
 results_path = os.path.join(REPORTS, "model_results.json")

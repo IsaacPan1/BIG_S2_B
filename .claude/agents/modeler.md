@@ -117,10 +117,15 @@ If any sanity check fails or training errors: set `catboost.succeeded = False`, 
 
 ### Final predictions
 
-- `equal_median`: `np.median(stack, axis=0)` across included families (2–4 families)
-- `ridge_weighted_1.5x` (after competence check passes): `np.average(stack, axis=0, weights=[1.5 if ridge else 1.0, ...])` across included families
+Three blend paths in priority order:
 
-Both decisions (plus the competence-check outcome) are logged in `model_results.json` under `adaptive_choice`. Example when shift triggers but Ridge passes competence:
+1. **`ridge_weighted_1.5x`** (Axis 2 shift-hedge; takes precedence when triggered): `np.average(stack, axis=0, weights=[1.5 if ridge else 1.0, ...])` across included families. Only active when max_ks > 0.40 AND Ridge passes competence.
+2. **`inverse_mae_weighted`** (OOF tilt; applied on the equal_median path only): weights w_i = (1/oof_i) / Σ(1/oof_j) over included families. Gated by a walk-forward holdout comparison — used only when its holdout MAE ≤ equal-median holdout MAE, so it can never be worse than equal_median on the measured fold.
+3. **`equal_median`** (default): `np.median(stack, axis=0)` across included families (2–4 families).
+
+The active blend, per-family weights, and holdout MAE comparison are logged in `model_results.json` under `adaptive_choice.ensemble_blend`, `adaptive_choice.blend_weights`, `adaptive_choice.blend_holdout_mae_equal`, and `adaptive_choice.blend_holdout_mae_inv`.
+
+Both Axis 2 decisions (plus the competence-check outcome) are also logged in `model_results.json` under `adaptive_choice`. Example when shift triggers but Ridge passes competence:
 ```json
 {
   "ensemble_weighting": "ridge_weighted_1.5x",
@@ -419,11 +424,94 @@ def objective(trial):
         maes.append(mean_absolute_error(y_wf_val, preds))
     return float(np.mean(maes))
 
+_optuna_reflection = {"pinned_params": [], "recentered": False,
+                      "best_mae_before": None, "best_mae_after": None}
+
 try:
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=15, timeout=25*60, catch=(Exception,))
     best_params = study.best_params
+    _optuna_reflection["best_mae_before"] = float(study.best_value)
+    _optuna_reflection["best_mae_after"] = float(study.best_value)
     optuna_trials = len(study.trials)
+
+    # ── Boundary reflection: intra-run only; NEVER writes critic_retune_attempted.txt ──
+    # Detect params pinned at/near search bounds: ints exactly at bound; floats within 5% of range.
+    _lgb_bounds = {
+        "learning_rate": (0.01, 0.1, "log"),
+        "num_leaves":    (15, 127, "int"),
+        "min_child_samples": (5, 60, "int"),
+        "feature_fraction":  (0.5, 1.0, "float"),
+        "bagging_fraction":  (0.5, 1.0, "float"),
+    }
+    _pinned = []
+    _shifted_bounds = {}  # param → (new_lo, new_hi)
+    for _pn, (_lo, _hi, _pt) in _lgb_bounds.items():
+        _v = best_params.get(_pn)
+        if _v is None:
+            continue
+        _rng = _hi - _lo
+        _at_lo = (_pt == "int" and int(_v) == _lo) or (_pt != "int" and _v <= _lo + 0.05 * _rng)
+        _at_hi = (_pt == "int" and int(_v) == _hi) or (_pt != "int" and _v >= _hi - 0.05 * _rng)
+        if _at_lo or _at_hi:
+            _pinned.append(_pn)
+            if _pt == "int":
+                _d = max(1, (_hi - _lo) // 4)
+                _shifted_bounds[_pn] = (max(1, int(_v) - _d), min(int(_v) + _d, 4096))
+            elif _pt == "log":
+                # Recenter geometrically around best value
+                _shifted_bounds[_pn] = (max(1e-5, _v / 3.0), min(1.0, _v * 3.0))
+            else:
+                _d = 0.25 * _rng
+                _shifted_bounds[_pn] = (max(0.01, _v - _d), min(1.0, _v + _d))
+    _optuna_reflection["pinned_params"] = _pinned
+
+    if _pinned and time.time() < TUNING_DEADLINE - 120:   # need ≥ 2 min remaining
+        print(f"Boundary reflection: {_pinned} pinned — recentering and running second 15-trial study")
+
+        def _reflect_objective(trial):
+            if time.time() > TUNING_DEADLINE:
+                raise optuna.exceptions.TrialPruned()
+            def _rb(pn, lo, hi, log=False):
+                nl, nh = _shifted_bounds.get(pn, (lo, hi))
+                if log:
+                    return trial.suggest_float(pn, float(nl), float(nh), log=True)
+                elif lo == int(lo) and hi == int(hi):
+                    return trial.suggest_int(pn, max(1, int(nl)), max(int(nl)+1, int(nh)))
+                else:
+                    return trial.suggest_float(pn, float(nl), float(nh))
+            _rp = {
+                "objective": "regression_l1", "metric": "mae", "n_estimators": 500,
+                "learning_rate": _rb("learning_rate", 0.01, 0.1, log=True),
+                "num_leaves": _rb("num_leaves", 15, 127),
+                "min_child_samples": _rb("min_child_samples", 5, 60),
+                "feature_fraction": _rb("feature_fraction", 0.5, 1.0),
+                "bagging_fraction": _rb("bagging_fraction", 0.5, 1.0),
+                "bagging_freq": 5, "reg_alpha": 0.1, "reg_lambda": 0.1, "verbose": -1, "n_jobs": -1,
+            }
+            _rmaes = []
+            for _rs in [42, 7, 123]:
+                _rm = lgb.LGBMRegressor(**{**_rp, "random_state": _rs})
+                _rm.fit(X_wf_train, y_wf_train, sample_weight=_wf_sw,
+                        eval_set=[(X_wf_val, y_wf_val)],
+                        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
+                _rmaes.append(mean_absolute_error(y_wf_val, np.clip(_rm.predict(X_wf_val), 0, None)))
+            return float(np.mean(_rmaes))
+
+        _study2 = optuna.create_study(direction="minimize")
+        _study2.optimize(_reflect_objective, n_trials=15,
+                         timeout=max(30, TUNING_DEADLINE - time.time() - 5),
+                         catch=(Exception,))
+        optuna_trials += len(_study2.trials)
+        _optuna_reflection["recentered"] = True
+        if _study2.trials and _study2.best_value < study.best_value:
+            best_params = _study2.best_params
+            print(f"Reflection improved: {study.best_value:.4f} → {_study2.best_value:.4f}")
+            _optuna_reflection["best_mae_after"] = float(_study2.best_value)
+        else:
+            print(f"Reflection did not improve (original={study.best_value:.4f}, reflected={_study2.best_value if _study2.trials else 'N/A'})")
+    # ── End boundary reflection ───────────────────────────────────────────────────────
+
     print(f"Optuna complete: {optuna_trials} trials, best MAE={study.best_value:.4f}")
     print(f"Best params: {best_params}")
     optuna_succeeded = True
@@ -467,20 +555,29 @@ probe.fit(
     callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(200)]
 )
 best_n_estimators = int(probe.best_iteration_ * 1.1) if probe.best_iteration_ else 500
-wf_mae = mean_absolute_error(y_wf_val, np.clip(probe.predict(X_wf_val), 0, None))
+lgb_wf_val_preds = np.clip(probe.predict(X_wf_val), 0, None)  # stored for inverse-MAE gate in Step 7d
+wf_mae = mean_absolute_error(y_wf_val, lgb_wf_val_preds)
+probe_mae_80_20 = float(wf_mae)   # snapshot of Optuna probe MAE before any update
 print(f"Walk-forward MAE: {wf_mae:.4f}, best_iteration: {probe.best_iteration_}, using n_estimators: {best_n_estimators}")
 ```
 
-### Step 7 — OOF CV (tabular/classification) or walk-forward MAE (panel)
+### Step 7a — LightGBM training: OOF CV and full-data retrain
 
-**For `panel_forecasting`**: The walk-forward MAE computed in Step 6 (`wf_mae`) is already
-the honest OOF metric — skip the OOF loop below. Set `oof_mae = wf_mae`. Jump to Step 7b.
-
-**For `tabular_regression` and `classification`**: Run the OOF CV loop with the splitter
-from `build_cv_splits` to compute an honest `oof_mae`. Then do Step 7b.
+Initialize the shared prediction collector before any family trains:
 
 ```python
-# ── 7a: OOF CV loop (tabular_regression / classification only) ─────────────
+all_val_preds = {}  # keyed by family name; populated by Steps 7a–7d
+```
+
+**For `panel_forecasting`**: The walk-forward MAE computed in Step 6 (`wf_mae`) is already
+the honest OOF metric — skip the OOF loop below. Set `oof_mae = wf_mae` and proceed to
+the full-data retrain section below.
+
+**For `tabular_regression` and `classification`**: Run the OOF CV loop with the splitter
+from `build_cv_splits` to compute an honest `oof_mae`, then proceed to the full-data retrain.
+
+```python
+# ── OOF CV loop (tabular_regression / classification only) ─────────────────
 final_params = {
     "objective": "regression_l1",
     "metric": "mae",
@@ -526,7 +623,7 @@ oof_preds = np.where(oof_count > 0, oof_accum / oof_count, float(y_full.mean()))
 oof_mae = mean_absolute_error(y_full, oof_preds)
 print(f"\nOOF MAE ({cv_scheme}): {oof_mae:.4f}")
 
-# ── 7b: Retrain on full data with 5 seeds ──────────────────────────────────
+# ── Full-data retrain on all 5 seeds ───────────────────────────────────────
 X_full_filled = train_df[feature_cols].fillna(fill_vals)
 y_full = train_df[target_col]
 X_val  = val_df[feature_cols].fillna(fill_vals)
@@ -543,7 +640,37 @@ print(f"NaN count: {np.isnan(ensemble_preds).sum()}")
 
 # Use last model for feature importances
 last_model = m
+
+# Register LightGBM in the shared collector; lgb_oof_mae used by Step 7c competence check
+all_val_preds["lgb"] = ensemble_preds
+lgb_oof_mae = float(oof_mae)
 ```
+
+### Step 7b — XGBoost training
+
+Train XGBoost following the walk-forward Optuna (15 trials) + 5-seed full-data retrain
+pattern, using the XGBoost-specific setup from the **Per-family training setup** section.
+
+Key requirements:
+- **Time guard**: if `elapsed_minutes > 20` at the start of this step, skip XGBoost entirely
+- Objective: `reg:absoluteerror` (fallback `reg:squarederror`)
+- Pass `_wf_sw` to Optuna `.fit()`; pass `_adv_weights` to final full-data retrain
+- 15 Optuna trials with the XGBoost search space
+
+After XGBoost training completes, register its predictions, store its OOF MAE, and
+store its walk-forward holdout predictions for the inverse-MAE gate in Step 7d:
+
+```python
+all_val_preds["xgb"] = xgb_ensemble_preds   # 5-seed median of val predictions
+xgb_oof_mae = float(xgb_wf_mae)             # walk-forward OOF; used by Step 7c competence check
+# Walk-forward holdout predictions: best-params 3-seed XGB ensemble predicted on X_wf_val
+# (trained on wf_train only — same holdout used for Optuna tuning; out-of-sample).
+xgb_wf_val_preds = xgb_wf_best_preds        # stored for inverse-MAE gate in Step 7d
+```
+
+If XGBoost is skipped or raises an exception: set `xgb_result["succeeded"] = False`,
+`xgb_oof_mae = float("inf")` so Step 7c's competence check falls back to `lgb_oof_mae` only,
+and leave `xgb_wf_val_preds` undefined (the gate in Step 7d handles missing entries via `None`).
 
 ### Step 7c — CatBoost training (conditional, Axis 3)
 
@@ -665,7 +792,9 @@ if _should_run_cb:
             _wf_sw_cb = _adv_weights[wf_train.index.values] if _adv_weights is not None else None
             _m.fit(X_wf_train.values, y_wf_train.values, sample_weight=_wf_sw_cb, verbose=False)
             _cb_wf_preds_list.append(_m.predict(X_wf_val.values))
-        _cb_oof_mae = float(mean_absolute_error(y_wf_val, np.median(_cb_wf_preds_list, axis=0)))
+        _cb_wf_median = np.median(_cb_wf_preds_list, axis=0)
+        _cb_oof_mae = float(mean_absolute_error(y_wf_val, _cb_wf_median))
+        cb_wf_val_preds = _cb_wf_median   # stored for inverse-MAE gate in Step 7d
         print(f"CatBoost walk-forward OOF MAE: {_cb_oof_mae:.4f}")
         _cb_result["oof_mae"] = _cb_oof_mae
 
@@ -749,7 +878,146 @@ if _should_run_cb:
     print(f"CatBoost block finished in {_cb_result['training_time_seconds']:.1f}s")
 ```
 
-After this block, `all_val_preds` may now contain `"catboost"` as a fourth key alongside `"lgb"`, `"xgb"` (if trained), and `"ridge"` (added in the Ridge block below). The ensemble aggregation in Step 7d (after Ridge) combines all included families.
+After this block, `all_val_preds` may now contain `"catboost"` as a fourth key alongside `"lgb"`, `"xgb"` (if trained), and `"ridge"` (added in Step 7d below). Step 7d combines all included families into `ensemble_preds`.
+
+### Step 7d — Ridge training and ensemble aggregation
+
+**Ridge training**
+
+Ridge is included when the Axis 1 branch selected it (n_train ≥ 1,000). Time guard:
+skip Ridge if `len(all_val_preds) >= 2` and `elapsed_minutes > 50`. Alpha is selected
+via probe split from {0.01, 0.1, 1.0, 10.0, 100.0}; `StandardScaler` is fit on
+training data only. Apply the Ridge sanity checks and competence check from the
+**Ridge sanity checks before ensembling** section above.
+
+```python
+# Log top-5 Ridge coefficients for model_results.json
+ridge_top_coefficients = [
+    {"feature": f, "abs_coef": float(c)}
+    for f, c in sorted(zip(feature_cols, np.abs(ridge.coef_)),
+                       key=lambda x: -x[1])[:5]
+]
+# Walk-forward holdout predictions (fit Ridge on wf_train with best alpha, predict on wf_val)
+# — out-of-sample; same holdout used for alpha selection; stored for inverse-MAE gate in Step 7d.
+ridge_wf_val_preds = np.clip(ridge_wf_scaler.transform(X_wf_val) @ ridge_wf_fitted.coef_
+                             + ridge_wf_fitted.intercept_, 0, None)
+# If Ridge passes all checks, register it in the shared collector
+all_val_preds["ridge"] = ridge_val_preds
+```
+
+**Ensemble aggregation**
+
+After all families have been attempted, combine `all_val_preds` into the final
+`ensemble_preds` used in Step 8. Three paths in priority order; the active blend,
+per-family weights, and holdout gate MAEs are logged in `adaptive_choice`:
+
+```python
+# Per-family OOF MAEs for included families only
+_family_oof = {}
+if "lgb" in all_val_preds:
+    _family_oof["lgb"] = lgb_oof_mae
+if "xgb" in all_val_preds:
+    _family_oof["xgb"] = xgb_oof_mae
+if "catboost" in all_val_preds and _cb_result.get("oof_mae"):
+    _family_oof["catboost"] = _cb_result["oof_mae"]
+if "ridge" in all_val_preds and ridge_result.get("oof_mae"):
+    _family_oof["ridge"] = ridge_result["oof_mae"]
+
+_included_keys = list(all_val_preds.keys())   # e.g. ["lgb", "xgb", "catboost"]
+_stack = np.array([all_val_preds[k] for k in _included_keys])
+
+# ── Path 1: ridge_weighted_1.5x (Axis 2 shift-hedge; takes precedence) ──────
+if ensemble_weighting == "ridge_weighted_1.5x" and "ridge" in all_val_preds:
+    _w = [1.5 if k == "ridge" else 1.0 for k in _included_keys]
+    ensemble_preds = np.average(_stack, axis=0, weights=_w)
+    ensemble_blend = "ridge_weighted_1.5x"
+    _blend_weights_log = {k: round(_w[i] / sum(_w), 4) for i, k in enumerate(_included_keys)}
+    _blend_holdout_mae_equal = None
+    _blend_holdout_mae_inv = None
+
+# ── Paths 2/3: equal_median default with optional inverse-MAE tilt ───────────
+else:
+    _equal_preds = np.median(_stack, axis=0)
+
+    # Inverse-MAE weights: w_i = (1/oof_i) / Σ_j(1/oof_j) over included families
+    _inv_sum = sum(1.0 / _family_oof[k] for k in _included_keys
+                   if k in _family_oof and _family_oof[k] > 0)
+    _inv_w = [(1.0 / _family_oof[k] / _inv_sum
+               if (k in _family_oof and _family_oof[k] > 0) else 0.0)
+              for k in _included_keys]
+    _inv_w_arr = np.array(_inv_w)
+    _inv_preds = np.average(_stack, axis=0, weights=_inv_w_arr)
+
+    # Gate: compare both blends on walk-forward holdout (out-of-sample for each family)
+    _wf_preds_map = {
+        "lgb": lgb_wf_val_preds,
+        "xgb": xgb_wf_val_preds if "xgb" in all_val_preds else None,
+        "catboost": cb_wf_val_preds if "catboost" in all_val_preds else None,
+        "ridge": ridge_wf_val_preds if "ridge" in all_val_preds else None,
+    }
+    _can_gate = all(_wf_preds_map.get(k) is not None for k in _included_keys)
+
+    if _can_gate:
+        _wf_stack = np.array([_wf_preds_map[k] for k in _included_keys])
+        _blend_holdout_mae_equal = float(mean_absolute_error(y_wf_val, np.median(_wf_stack, axis=0)))
+        _blend_holdout_mae_inv   = float(mean_absolute_error(y_wf_val, np.average(_wf_stack, axis=0, weights=_inv_w_arr)))
+        _use_inv = _blend_holdout_mae_inv <= _blend_holdout_mae_equal
+    else:
+        _blend_holdout_mae_equal = None
+        _blend_holdout_mae_inv = None
+        _use_inv = False   # can't verify; fall back to equal_median
+
+    if _use_inv:
+        ensemble_preds = _inv_preds
+        ensemble_blend = "inverse_mae_weighted"
+        _blend_weights_log = {k: round(float(_inv_w_arr[i]), 4) for i, k in enumerate(_included_keys)}
+        print(f"Blend: inverse_mae_weighted (holdout {_blend_holdout_mae_inv:.4f} <= equal {_blend_holdout_mae_equal:.4f})")
+    else:
+        ensemble_preds = _equal_preds
+        ensemble_blend = "equal_median"
+        _blend_weights_log = {k: round(1.0 / len(_included_keys), 4) for k in _included_keys}
+        _reason = "gate_equal_better" if _can_gate else "no_wf_preds_available"
+        print(f"Blend: equal_median ({_reason}; holdout equal={_blend_holdout_mae_equal}, inv={_blend_holdout_mae_inv})")
+
+ensemble_disagreement = {
+    "mean_disagreement": float(np.mean(np.std(_stack, axis=0))),
+    "n_high_disagreement_rows": int(np.sum(np.std(_stack, axis=0) > ensemble_preds.mean())),
+}
+ensemble_oof_mae = min(_family_oof.values()) if _family_oof else float(lgb_oof_mae)
+n_families_in_ensemble = len(_included_keys)
+```
+
+**Ordinal rounding (Change 3 — portability; silent no-op for any non-ordinal subtype)**
+
+Only when `problem_subtype == "ordinal_regression"`: compare walk-forward MAE of raw
+continuous preds vs round-then-clip to the integer target range; apply the lower-MAE
+transform to the final val preds; tie → raw. For `continuous_regression`, `panel_forecasting`,
+or any other subtype, this block is a silent no-op and `_postprocessing` stays as initialized.
+
+```python
+_postprocessing = {"ordinal_rounding_applied": False,
+                   "ordinal_raw_wf_mae": None, "ordinal_round_wf_mae": None}
+
+if problem_subtype == "ordinal_regression":
+    _t_min = int(y_full.min())
+    _t_max = int(y_full.max())
+    _rounded_preds = np.clip(np.round(ensemble_preds), _t_min, _t_max)
+
+    # Gate on LGB walk-forward holdout (always available; proxy for full-ensemble rounding benefit)
+    _ord_raw_wf_mae   = float(mean_absolute_error(y_wf_val, lgb_wf_val_preds))
+    _ord_round_wf_mae = float(mean_absolute_error(
+        y_wf_val, np.clip(np.round(lgb_wf_val_preds), _t_min, _t_max)))
+    _postprocessing["ordinal_raw_wf_mae"]   = _ord_raw_wf_mae
+    _postprocessing["ordinal_round_wf_mae"] = _ord_round_wf_mae
+
+    if _ord_round_wf_mae < _ord_raw_wf_mae:   # strict improvement required; tie → raw
+        ensemble_preds = _rounded_preds
+        _postprocessing["ordinal_rounding_applied"] = True
+        print(f"Ordinal rounding applied: wf MAE {_ord_raw_wf_mae:.4f} → {_ord_round_wf_mae:.4f}")
+    else:
+        print(f"Ordinal rounding skipped: raw wf MAE {_ord_raw_wf_mae:.4f} <= rounded {_ord_round_wf_mae:.4f}")
+# Any other subtype: silent no-op. _postprocessing stays initialized with False/None above.
+```
 
 ### Step 8 — Write reports/predictions.csv
 
@@ -786,23 +1054,65 @@ top10 = [{"feature": k, "importance": int(v)} for k, v in feat_imp.head(10).item
 
 training_time = int(time.time() - start_time)
 
+# Build algorithm label from included families
+_algo_parts = [k for k in ["lightgbm", "xgboost", "catboost", "ridge"] if k in all_val_preds]
+_algo_label = "+".join(p.capitalize() for p in _algo_parts) + " ensemble"
+
 results = {
-    "algorithm": "LightGBM",
+    "algorithm": _algo_label,                          # e.g. "Lightgbm+Xgboost+Catboost ensemble"
+    "problem_subtype": problem_subtype,                 # from profile.json (e.g. "panel_forecasting")
+    "ensemble_path_used": ensemble_path_used,           # e.g. "full_regression_ensemble"
+    "adaptive_choice": {
+        "branch": adaptive_branch,                      # Axis 1 branch number (1–4 or fallback)
+        "families_selected": families_selected,         # list of families Axis 1 chose
+        "families_included_in_ensemble": list(all_val_preds.keys()),
+        "reasoning": adaptive_reasoning,                # human-readable branch explanation
+        "ensemble_weighting": ensemble_weighting,       # Axis 2 decision: "equal_median" or "ridge_weighted_1.5x"
+        "weighting_reason": weighting_reason,           # explains max_ks and competence check
+        "ridge_excluded_reason": ridge_excluded_reason, # null if included or never trained
+        # Blend selection (Change 1) — always present
+        "ensemble_blend": ensemble_blend,               # "equal_median", "inverse_mae_weighted", or "ridge_weighted_1.5x"
+        "blend_weights": _blend_weights_log,            # per-family normalized weights used
+        "blend_holdout_mae_equal": _blend_holdout_mae_equal,  # None when ridge_weighted_1.5x path taken
+        "blend_holdout_mae_inv":   _blend_holdout_mae_inv,    # None when ridge_weighted_1.5x path taken
+    },
+    "families": {
+        # All four family result dicts, populated during Steps 7a–7d.
+        # LightGBM is always present; XGBoost/CatBoost/Ridge present when attempted.
+        "lightgbm": {
+            "best_params": final_hparams,
+            "oof_mae": float(lgb_oof_mae),
+            "training_time_seconds": lgb_training_time,
+            "succeeded": True,
+            "included_in_ensemble": "lgb" in all_val_preds,
+            "n_estimators": best_n_estimators,
+            "optuna_trials": optuna_trials,
+        },
+        "xgboost": xgb_result,       # dict built during Step 7b; absent if not attempted
+        "catboost": _cb_result,      # dict built during Step 7c; attempted=False when skipped
+        "ridge": ridge_result,       # dict built during Step 7d
+    },
+    "ensemble_oof_mae": float(ensemble_oof_mae),
+    "n_families_in_ensemble": n_families_in_ensemble,
+    "ensemble_disagreement": ensemble_disagreement,
+    "feature_importance_top10": top10,
+    "feature_importance_all": all_imp,
+    "ridge_top_coefficients": ridge_top_coefficients,   # top-5 by abs coef; [] if Ridge excluded
+    # LightGBM scalar fields retained for backward compat with validator/report_writer
     "objective": final_params["objective"],
     "best_params": final_hparams,
     "n_estimators": best_n_estimators,
     "n_seeds": 5,
     "cv_scheme": cv_scheme,
-    "oof_mae": float(oof_mae),
+    "oof_mae": float(lgb_oof_mae),
     "oof_cv_scheme": cv_scheme,
     "per_fold_maes": [float(m) for m in fold_maes],
-    # walk_forward_mae: for panel_forecasting use wf_mae; for others use oof_mae
-    # (validator tries walk_forward_mae first, then oof_mae — set both consistently)
+    # walk_forward_mae: validator tries walk_forward_mae first, then oof_mae
     "walk_forward_mae": float(wf_mae if problem_type == "panel_forecasting" else oof_mae),
-    "feature_importance_top10": top10,
-    "feature_importance_all": all_imp,
+    "probe_mae_80_20": float(probe_mae_80_20),          # Optuna walk-forward probe MAE
     "training_time_seconds": training_time,
     "optuna_trials_completed": optuna_trials,
+    "optuna_succeeded": optuna_succeeded,
     "val_prediction_stats": {
         "min": float(ensemble_preds.min()),
         "max": float(ensemble_preds.max()),
@@ -813,20 +1123,8 @@ results = {
     "n_train_rows": len(train_df),
     "n_val_rows": len(val_df),
     "retune_applied": _retune_applied,
-    "family_results": {
-        # Populate each family block from the variables set during training.
-        # LightGBM is always present. XGBoost and Ridge are present when trained.
-        # CatBoost block always present (attempted=False when skipped).
-        "catboost": _cb_result,
-    },
-    "adaptive_choice": {
-        "adversarial_validation": {
-            "used_weights": _adv_weights is not None,
-            "auc_from_feature_engineer": _av_info.get("auc_train_vs_val"),
-            "weight_range_used": _av_info.get("weight_range") if _adv_weights is not None else None,
-        },
-        "catboost_decision": _cb_decision,
-    },
+    "optuna_reflection": _optuna_reflection,    # boundary reflection metadata; always present
+    "postprocessing": _postprocessing,          # ordinal rounding metadata; always present
 }
 
 with open("reports/model_results.json", "w") as f:
@@ -898,7 +1196,7 @@ ALWAYS write reports/predictions.csv with valid (non-NaN) values for all validat
 ## Output
 Four files:
 - `reports/predictions.csv` — columns: `row_id`, identifier columns, `predicted_target` (NEVER the raw target name)
-- `reports/oof_predictions.csv` — out-of-fold predictions on training set: identifier columns, `fold`, `predicted_target` (written by Step 7c; required by validator)
+- `reports/oof_predictions.csv` — out-of-fold predictions on training set: identifier columns, `fold`, `predicted_target` (written by Step 7a; required by validator)
 - `reports/model_results.json` — includes `feature_importance_all` (all features, not just top 10), `oof_mae`, `oof_cv_scheme`
 - `reports/modeler_was_here.txt`
 
