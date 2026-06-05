@@ -155,11 +155,14 @@ def compute_strict_cv(
     problem_type: str,
     hparams: dict,
     n_estimators: int,
-) -> tuple[float, str, list[lgb.LGBMRegressor]]:
+) -> tuple[float, str, list[lgb.LGBMRegressor], list[float], list[int]]:
     """
-    Run strict CV and return (mae, scheme_description, [fold_models]).
+    Run strict CV and return
+    (mean_mae, scheme_description, fold_models, fold_maes, fold_train_sizes).
 
     fold_models are used downstream for importance averaging.
+    fold_maes and fold_train_sizes are written to validator_review.json for
+    gap_attribution.py to classify the OOF→strict gap.
     """
     if problem_type == "panel_forecasting" and time_col:
         splits = _panel_strict_splits(
@@ -184,10 +187,13 @@ def compute_strict_cv(
 
     fold_maes: list[float] = []
     fold_models: list[lgb.LGBMRegressor] = []
+    fold_train_sizes: list[int] = []
 
     for tr_idx, vl_idx in splits:
         fold_tr = train_df.loc[tr_idx]
         fold_vl = train_df.loc[vl_idx]
+
+        fold_train_sizes.append(len(fold_tr))
 
         fill = fold_tr[feature_cols].median()
         X_tr = fold_tr[feature_cols].fillna(fill).values
@@ -201,7 +207,7 @@ def compute_strict_cv(
         fold_models.append(model)
 
     strict_mae = float(np.mean(fold_maes))
-    return strict_mae, scheme, fold_models
+    return strict_mae, scheme, fold_models, fold_maes, fold_train_sizes
 
 
 # ── LEAVE-ONE-FEATURE-OUT CV ───────────────────────────────────────────────
@@ -230,7 +236,7 @@ def loo_strict_cv(
             results[feat] = 0.0
             continue
         try:
-            loo_mae, _, _ = compute_strict_cv(
+            loo_mae, _, _, _, _ = compute_strict_cv(
                 train_df, reduced, target_col, group_cols,
                 time_col, problem_type, hparams, n_estimators,
             )
@@ -407,12 +413,15 @@ def main() -> None:
 
     # ── Strict CV ────────────────────────────────────────────────────
     print("\n--- Computing strict CV ---")
-    strict_cv_mae, strict_cv_scheme, fold_models = compute_strict_cv(
-        train_df, feature_cols, target_col, group_cols, time_col,
-        problem_type, hparams, n_estimators,
-    )
+    strict_cv_mae, strict_cv_scheme, fold_models, _fold_maes, _fold_train_sizes = \
+        compute_strict_cv(
+            train_df, feature_cols, target_col, group_cols, time_col,
+            problem_type, hparams, n_estimators,
+        )
     print(f"strict_cv_mae: {strict_cv_mae:.4f}")
     print(f"scheme: {strict_cv_scheme}")
+    print(f"fold_maes: {[round(m, 4) for m in _fold_maes]}")
+    print(f"fold_train_sizes: {_fold_train_sizes}")
 
     cv_gap_abs = float(strict_cv_mae - reported_cv_mae)
     cv_gap_pct = float(cv_gap_abs / reported_cv_mae) if reported_cv_mae else float("nan")
@@ -488,6 +497,8 @@ def main() -> None:
         "cv_gap_abs":        float(cv_gap_abs),
         "cv_gap_pct":        float(cv_gap_pct),
         "strict_cv_scheme":  strict_cv_scheme,
+        "fold_maes":         [float(m) for m in _fold_maes],
+        "fold_train_sizes":  [int(s) for s in _fold_train_sizes],
         "feature_suspicion": feature_suspicion,
         "checks":            checks,
         "notes":             notes,
@@ -496,6 +507,20 @@ def main() -> None:
     with open(out_path, "w") as f:
         json.dump(review, f, indent=2)
     print(f"\nWritten {out_path}")
+
+    # ── Gap attribution (best-effort: classify OOF→strict gap) ──────────────
+    import subprocess as _subprocess
+    try:
+        _gap_result = _subprocess.run(
+            [sys.executable, str(root / "tools" / "gap_attribution.py"),
+             "--repo-root", str(root)],
+            capture_output=True, text=True, timeout=60,
+        )
+        print(_gap_result.stdout)
+        if _gap_result.returncode != 0:
+            print(f"[gap_attribution] WARNING: {_gap_result.stderr[:400]}", file=sys.stderr)
+    except Exception as _gap_e:
+        print(f"[gap_attribution] non-fatal: {_gap_e}", file=sys.stderr)
 
     # ── Marker file ──────────────────────────────────────────────────
     ts = datetime.datetime.utcnow().isoformat() + "Z"

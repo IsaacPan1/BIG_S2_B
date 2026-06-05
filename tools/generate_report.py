@@ -368,25 +368,46 @@ else:
         # textwrap limit: ~7.5 chars per cm at 9 pt Helvetica (accounting for padding)
         _KEY_CHARS = max(50, int(_w_key / cm * 7.5))
 
+        # Tuple: (step, name, marker_path, detail_text, artifact_path)
+        # artifact_path is checked when the marker is absent — a stage whose
+        # output artifact exists on disk did not "not run" (marker missing ≠ not run).
         AGENTS = [
             ("1",   "schema_analyst",   "reports/schema_analyst_was_here.txt",
-             f"{problem_type} ({confidence} conf)"),
+             f"{problem_type} ({confidence} conf)",
+             "reports/schema_analysis.md"),
             ("2",   "feature_engineer", "reports/feature_engineer_was_here.txt",
-             f"{total_features} features, {n_feat_families} families"),
+             f"{total_features} features, {n_feat_families} families",
+             "reports/features.json"),
             ("3",   "modeler",          "reports/modeler_was_here.txt",
-             f"OOF MAE: {fmt(mae, 4)} | {algorithm[:35]}"),
+             f"OOF MAE: {fmt(mae, 4)} | {algorithm[:35]}",
+             "reports/predictions.csv"),
             ("3.5", "validator",        "reports/validator_was_here.txt",
-             f"Verdict: {val_verdict}"),
+             f"Verdict: {val_verdict}",
+             "reports/validator_review.json"),
             ("3.6", "critic",           "reports/critic_was_here.txt",
-             f"Status: {critic_status} | retune: {'Yes' if critic_retune else 'No'}"),
+             f"Status: {critic_status} | retune: {'Yes' if critic_retune else 'No'}",
+             "reports/critic_review.json"),
             ("4",   "submission_writer","reports/submission_writer_was_here.txt",
-             f"{fmt(sub_row_count)} rows | valid: {fmt_bool(sub_passed)}"),
+             f"{fmt(sub_row_count)} rows | valid: {fmt_bool(sub_passed)}",
+             "submission.csv"),
             ("5",   "report_writer",    "reports/report_writer_was_here.txt",
+             "report.pdf",
              "report.pdf"),
         ]
 
-        def _status(step, name, marker):
+        def _status(step, name, marker, artifact=None):
+            # Self-reference guard: generate_report.py IS the report_writer.
+            # The marker is written only after the PDF is built (which embeds this
+            # table), so the exists()-check can never see it.  The fact that this
+            # code is executing means the stage is running → PASS.
+            if name == "report_writer":
+                return "PASS", '#D5F5E3', '#145a32'
             if not os.path.exists(BASE / marker):
+                # A stage whose output artifact exists on disk did run —
+                # a missing marker just means the marker write was skipped or
+                # the stage was called without the canonical tool.
+                if artifact and os.path.exists(BASE / artifact):
+                    return "RAN (marker missing)", '#FEF9E7', '#e08200'
                 return "NOT RUN", '#FDECEA', '#d7191c'
             if name == "validator":
                 if val_verdict == "CRITICAL":
@@ -408,8 +429,8 @@ else:
 
         # Build row data once; shared by both layout branches
         entries = []
-        for step, name, marker, detail in AGENTS:
-            lbl, row_bg, txt_hex = _status(step, name, marker)
+        for step, name, marker, detail, artifact in AGENTS:
+            lbl, row_bg, txt_hex = _status(step, name, marker, artifact)
             detail_safe = textwrap.shorten(detail, width=_KEY_CHARS, placeholder='…')
             st_style = ParagraphStyle(f'PST_s_{name}', fontName='Helvetica-Bold',
                                        fontSize=_font_sz,

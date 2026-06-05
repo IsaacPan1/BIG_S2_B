@@ -78,11 +78,24 @@ train_max  = float(train_target.max())
 
 Five checks. Each classified as PASS, WARNING, or CRITICAL.
 
-**CHECK 1: Validator concordance**
-- If validator verdict is CRITICAL: CRITICAL (validator caught something serious)
-- If validator verdict is WARNING: WARNING
-- If validator verdict is PASS: PASS
-- Details format: `"validator reported cv_mae=X, strict_cv_mae=Y, cv_gap=Z%; verdict was W"`
+**CHECK 1: Validator concordance (with gap attribution downgrade)**
+
+Base status from validator verdict:
+- If validator verdict is CRITICAL: raw status = CRITICAL
+- If validator verdict is WARNING:  raw status = WARNING
+- If validator verdict is PASS:     raw status = PASS
+
+Gap attribution downgrade (read `validator_review.gap_attribution.classification`):
+- If classification == "CV_SCHEME" AND raw status is CRITICAL → downgrade to WARNING
+- If classification == "CV_SCHEME" AND raw status is WARNING  → downgrade to PASS-with-note
+- If classification == "REAL_DIVERGENCE" or "UNKNOWN"         → no change (raw status stands)
+
+**HARD directionality rule**: gap attribution can only SUPPRESS a retune that the gap
+would otherwise cause. It must NEVER CREATE or ESCALATE a retune signal. A CV_SCHEME
+classification never causes a downgrade from PASS; it only softens CRITICAL/WARNING.
+Document this in the details string when a downgrade occurs.
+
+- Details format: `"validator reported cv_mae=X, strict_cv_mae=Y, cv_gap=Z%; verdict was W. gap_attribution=C. [DOWNGRADED from R: CV gap attributed to expanding-window scheme pessimism (latest-fold MAE ≈ reported); not overfit — retune suppressed by gap attribution]"`
 - Read `cv_gap_pct` from validator_review (stored as fraction, multiply by 100 for display)
 
 **CHECK 2: Prediction distribution match**
@@ -113,14 +126,62 @@ Five checks. Each classified as PASS, WARNING, or CRITICAL.
 - Otherwise: PASS
 - Details format: `"pred_min=X, pred_max=Y; train_max=Z; n_nan=A; n_negative=B"`
 
+### Step 3.5 — Run family ablation (first cycle only; best-effort)
+
+After completing the 5 checks, if this is NOT the second cycle, invoke `tools/family_ablation.py`.
+The ablation budget-gates itself — it will skip cleanly if time is insufficient.
+A failure or skip here is non-fatal and must never block submission.
+
+```python
+import subprocess, sys, json, os
+
+family_ablation = None
+net_harmful_families = []
+ablation_attempted = False
+
+if not second_cycle:
+    ablation_attempted = True
+    try:
+        abl = subprocess.run(
+            [sys.executable, "tools/family_ablation.py", "--repo-root", "."],
+            capture_output=True, text=True, timeout=300,
+        )
+        out_tail = abl.stdout[-4000:] if len(abl.stdout) > 4000 else abl.stdout
+        print("[ablation stdout]:", out_tail)
+        if abl.returncode != 0:
+            print(f"[ablation stderr]: {abl.stderr[-500:]}")
+        if os.path.exists("reports/family_ablation.json"):
+            with open("reports/family_ablation.json") as f:
+                family_ablation = json.load(f)
+            if not family_ablation.get("skipped", True):
+                net_harmful_families = family_ablation.get("net_harmful_families", [])
+                print(f"[ablation] net_harmful_families: {net_harmful_families}")
+            else:
+                print(f"[ablation] skipped: {family_ablation.get('reason', 'unknown')}")
+    except Exception as _abl_e:
+        print(f"[ablation] non-fatal error: {_abl_e}")
+```
+
 ### Step 4 — Decide on action
 
-Use CONSERVATIVE thresholds:
-- All PASS or only WARNINGs: status = "accepted", no retune
-- 1+ CRITICAL: status = "retune_requested", trigger retune (but only if this is the first cycle — already checked in Step 1)
+Retune triggers share **exactly one** retune slot, gated by `critic_retune_attempted.txt`.
+The CRITICAL path has priority; the ablation path fires only if no CRITICAL triggered.
+
+```
+CRITICAL checks present     → retune_reason = "critical"    (as before)
+net_harmful_families found  → retune_reason = "ablation"    (ONLY if no CRITICAL)
+otherwise                   → status = "accepted"
+```
+
+- All PASS or only WARNINGs AND no net-harmful families: status = "accepted", no retune
+- 1+ CRITICAL: status = "retune_requested", retune_reason = "critical"
+- net_harmful_families non-empty AND 0 CRITICALs: status = "retune_requested", retune_reason = "ablation"
+
+(Second cycle: always status = "accepted"; skip all retune logic — already checked in Step 1.)
 
 ### Step 5 — If retune requested (first cycle only)
 
+**If retune_reason == "critical"** (unchanged from original logic):
 Write reports/critic_retune_requested.json:
 ```json
 {
@@ -135,15 +196,55 @@ Write reports/critic_retune_requested.json:
 }
 ```
 
-The suggested_change must be ONE specific adjustment, not a list. Examples:
+The suggested_change must be ONE specific adjustment. Examples:
 - For severe under-dispersion: "use median seed aggregation instead of mean; if already median, expand Optuna num_leaves upper bound from 127 to 255 and min_child_samples lower bound from 5 to 3"
 - For systematic mean bias: "verify val feature imputation uses training medians per group, not zeros; check fill_vals computation in modeler"
 - For negative predictions: "ensure np.clip(predictions, 0, None) is applied after seed aggregation, before saving predictions.csv"
 - For validator CRITICAL on CV leakage: "remove suspect features identified in validator_review.feature_suspicion and retrain"
 
-Write reports/critic_retune_attempted.txt as the marker that this cycle has been used.
+**If retune_reason == "ablation"** (new path):
+Write reports/critic_retune_requested.json with:
+```json
+{
+  "issue": "Net-harmful feature families identified by strict-CV leave-one-family-out ablation: [list]",
+  "suggested_change": "drop net-harmful feature families [list] identified by strict-CV leave-one-family-out ablation; do not re-add them",
+  "ablation_triggered": true,
+  "net_harmful_families": ["family_name", ...],
+  "per_family_deltas": {"family_name": delta_value, ...},
+  "previous_metrics": {
+    "walk_forward_mae": <number>,
+    "pred_mean": <number>,
+    "pred_std": <number>,
+    "validator_verdict": <string>
+  }
+}
+```
 
-Then write critic_review.json with status="retune_requested" and stop. The orchestrator will detect the retune file, re-invoke modeler (which reads the request), then re-invoke validator (it audits the new modeler output), then re-invoke critic (which detects the marker and accepts the second result regardless of remaining concerns).
+The modeler reads `suggested_change` for the "drop net-harmful feature families" trigger and
+reads `net_harmful_families` from the JSON to know which families to drop.
+Dropping features is non-contaminating — no hyperparameter optimization against the audit fold.
+
+In both cases, also log rejected families to the knowledge graph (best-effort):
+```python
+try:
+    import sys; sys.path.insert(0, "tools")
+    from kg import kg_append_event
+    for _fam in net_harmful_families:
+        kg_append_event("critic", "rejected_hypothesis", {
+            "hypothesis": f"family '{_fam}' beneficial to strict-CV MAE",
+            "outcome": "rejected",
+            "detail": f"ablation: delta_vs_full={per_family_deltas.get(_fam)}",
+        })
+except Exception as _kg_e:
+    print(f"[KG] non-fatal: {_kg_e}")
+```
+
+Write `reports/critic_retune_attempted.txt` as the marker that this cycle has been used.
+
+Then write critic_review.json with status="retune_requested" and stop. The orchestrator will
+detect the retune file, re-invoke modeler (which reads the request), then re-invoke validator
+(it audits the new modeler output), then re-invoke critic (which detects the marker and accepts
+the second result regardless of remaining concerns).
 
 ### Step 6 — Write critic_review.json (always, every run)
 
@@ -212,7 +313,7 @@ with open("reports/critic_was_here.txt", "w") as f:
 Execute this Python script directly (write and run it). It is also saved as `tools/run_critic.py` for direct invocation:
 
 ```python
-import pandas as pd, numpy as np, json, os, datetime, sys
+import pandas as pd, numpy as np, json, os, datetime, sys, subprocess
 
 # ── Threshold constants ──────────────────────────────────────────────────────
 CV_GAP_VALIDATOR_WARNING  = 0.10   # 10%  → validator issues WARNING
@@ -269,16 +370,40 @@ except Exception as e:
 checks = []
 warnings_for_report = []
 
-# CHECK 1: Validator concordance
+# CHECK 1: Validator concordance (with gap attribution downgrade)
 verdict         = validator_review.get("verdict", "UNKNOWN")
 reported_cv_mae = float(validator_review.get("reported_cv_mae") or validator_review.get("honest_cv_mae") or 0.0)
 strict_cv_mae   = float(validator_review.get("strict_cv_mae") or reported_cv_mae)
 cv_gap_frac     = float(validator_review.get("cv_gap_pct", 0.0))
 cv_gap_display  = cv_gap_frac * 100
 
-c1_status  = "CRITICAL" if verdict == "CRITICAL" else ("WARNING" if verdict == "WARNING" else "PASS")
-c1_details = (f"validator reported cv_mae={reported_cv_mae:.4f}, strict_cv_mae={strict_cv_mae:.4f}, "
-              f"cv_gap={cv_gap_display:.1f}%; verdict was {verdict}")
+gap_attribution     = validator_review.get("gap_attribution", {})
+attr_classification = gap_attribution.get("classification", "UNKNOWN")
+
+# Base status from validator verdict
+c1_raw_status = "CRITICAL" if verdict == "CRITICAL" else ("WARNING" if verdict == "WARNING" else "PASS")
+
+# Gap attribution downgrade: CV_SCHEME suppresses one severity level.
+# HARD: this can only SUPPRESS a retune, never CREATE or escalate one.
+attr_note = ""
+if attr_classification == "CV_SCHEME" and c1_raw_status in ("CRITICAL", "WARNING"):
+    c1_status = "WARNING" if c1_raw_status == "CRITICAL" else "PASS"
+    attr_note = (
+        f" [DOWNGRADED from {c1_raw_status}: "
+        "CV gap attributed to expanding-window scheme pessimism "
+        "(latest-fold MAE ≈ reported); not overfit — retune suppressed by gap attribution]"
+    )
+    print(f"  CHECK 1: gap_attribution=CV_SCHEME → downgraded {c1_raw_status} → {c1_status}")
+else:
+    c1_status = c1_raw_status
+    if attr_classification in ("REAL_DIVERGENCE", "UNKNOWN"):
+        attr_note = f" [gap_attribution={attr_classification}; no downgrade]"
+
+c1_details = (
+    f"validator reported cv_mae={reported_cv_mae:.4f}, strict_cv_mae={strict_cv_mae:.4f}, "
+    f"cv_gap={cv_gap_display:.1f}%; verdict was {verdict}."
+    f" gap_attribution={attr_classification}.{attr_note}"
+)
 checks.append({"name": "validator_concordance", "status": c1_status, "details": c1_details})
 
 # CHECK 2: Prediction distribution match
@@ -347,6 +472,34 @@ elif train_max > 0.0 and pred_max < PRED_MAX_LOW_RATIO * train_max:
     c5_status = "WARNING"
 checks.append({"name": "prediction_sanity", "status": c5_status, "details": c5_details})
 
+# ── Step 3.5: Family ablation (best-effort, first cycle only) ────────────────
+family_ablation    = None
+net_harmful_families: list[str] = []
+ablation_attempted = False
+
+if not second_cycle:
+    ablation_attempted = True
+    try:
+        abl = subprocess.run(
+            [sys.executable, "tools/family_ablation.py", "--repo-root", "."],
+            capture_output=True, text=True, timeout=300,
+        )
+        out_tail = abl.stdout[-4000:] if len(abl.stdout) > 4000 else abl.stdout
+        print("[ablation stdout]:", out_tail)
+        if abl.returncode != 0:
+            print(f"[ablation stderr]: {abl.stderr[-500:]}")
+        if os.path.exists("reports/family_ablation.json"):
+            with open("reports/family_ablation.json") as f:
+                family_ablation = json.load(f)
+            if not family_ablation.get("skipped", True):
+                net_harmful_families = family_ablation.get("net_harmful_families", [])
+                print(f"[ablation] net_harmful_families: {net_harmful_families}")
+            else:
+                print(f"[ablation] skipped: {family_ablation.get('reason', 'unknown')}")
+    except Exception as _abl_e:
+        print(f"[ablation] non-fatal error: {_abl_e}")
+        warnings_for_report.append(f"Family ablation error: {_abl_e}")
+
 # ── Step 4: Decide on action ─────────────────────────────────────────────────
 critical_checks = [c for c in checks if c["status"] == "CRITICAL"]
 warning_checks  = [c for c in checks if c["status"] == "WARNING"]
@@ -355,72 +508,184 @@ for c in warning_checks:
 if missing_inputs:
     warnings_for_report.append("Some critic inputs were missing: " + "; ".join(missing_inputs))
 
-status = "accepted" if (second_cycle or not critical_checks) else "retune_requested"
+# Single retune slot: CRITICAL path has priority over ablation path
+retune_reason = None  # "critical" | "ablation" | None
+if not second_cycle:
+    if critical_checks:
+        retune_reason = "critical"
+    elif net_harmful_families:
+        retune_reason = "ablation"
+
+status = "accepted" if (second_cycle or retune_reason is None) else "retune_requested"
 
 # Build decision_rationale
-warn_names = [c["name"] for c in checks if c["status"] == "WARNING"]
-crit_names = [c["name"] for c in checks if c["status"] == "CRITICAL"]
+warn_names    = [c["name"] for c in checks if c["status"] == "WARNING"]
+crit_names    = [c["name"] for c in checks if c["status"] == "CRITICAL"]
 check_summary = "; ".join(f"{c['name']}={c['status']}" for c in checks)
+
 if second_cycle:
     decision_rationale = f"Second retune cycle: accepted regardless of remaining check results. Check summary: {check_summary}."
 elif status == "accepted":
     if not warn_names and not crit_names:
         decision_rationale = f"All {len(checks)} checks PASS. Model accepted without concerns."
     else:
-        decision_rationale = (f"Model accepted: {len(warn_names)} WARNING(s) ({', '.join(warn_names)}), 0 CRITICALs. "
-                              f"WARNINGs documented in warnings_for_report. Check summary: {check_summary}.")
+        decision_rationale = (
+            f"Model accepted: {len(warn_names)} WARNING(s) ({', '.join(warn_names)}), 0 CRITICALs. "
+            f"WARNINGs documented in warnings_for_report. Check summary: {check_summary}."
+        )
+    if attr_classification == "CV_SCHEME" and c1_raw_status in ("CRITICAL", "WARNING"):
+        decision_rationale += (
+            f" Gap attribution CV_SCHEME: validator {c1_raw_status} downgraded to {c1_status} — not overfit."
+        )
+    if net_harmful_families:
+        decision_rationale += (
+            f" Ablation found net-harmful families {net_harmful_families} but CRITICAL path already claimed retune slot — "
+            f"families NOT dropped this cycle."
+        )
+elif retune_reason == "ablation":
+    decision_rationale = (
+        f"Retune requested (ablation): {len(net_harmful_families)} net-harmful feature "
+        f"families ({net_harmful_families}). 0 CRITICAL checks. Check summary: {check_summary}."
+    )
 else:
-    decision_rationale = (f"Retune requested: {len(crit_names)} CRITICAL check(s) ({', '.join(crit_names)}). "
-                          f"Check summary: {check_summary}.")
+    decision_rationale = (
+        f"Retune requested (critical): {len(crit_names)} CRITICAL check(s) ({', '.join(crit_names)}). "
+        f"Check summary: {check_summary}."
+    )
 
-print(f"Critic decision: {status} (second_cycle={second_cycle})")
+print(f"Critic decision: {status} (second_cycle={second_cycle}, retune_reason={retune_reason})")
 for c in checks:
     print(f"  {c['name']}: {c['status']} — {c['details']}")
 
 # ── Step 5: If retune requested (first cycle only) ───────────────────────────
 issue = suggested = None
+retune_json: dict = {}
+per_family_deltas: dict = {}
+
 if status == "retune_requested" and not second_cycle:
-    first_critical = critical_checks[0]["name"]
-    if first_critical == "validator_concordance":
-        issue = f"Validator returned CRITICAL verdict: {validator_review.get('notes', 'see validator_review.json')}"
-        fs = validator_review.get("feature_suspicion", [])
-        suggested = (f"remove suspect features ({', '.join(str(f) for f in fs[:3])}) and retrain"
-                     if fs else "review validator_review.json notes and address CV methodology issue before retraining")
-    elif first_critical == "prediction_distribution":
-        if train_mean != 0.0 and abs(pred_mean - train_mean) > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
-            issue = f"Systematic mean bias: pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (>30% offset)"
-            suggested = "verify val feature imputation uses training medians per group, not zeros"
+    if retune_reason == "ablation":
+        fam_list = net_harmful_families
+        per_family_deltas = {
+            fam: family_ablation["families"][fam]["delta_vs_full"]
+            for fam in fam_list
+            if fam in (family_ablation or {}).get("families", {})
+            and "delta_vs_full" in (family_ablation or {}).get("families", {}).get(fam, {})
+        }
+        issue     = (
+            f"Net-harmful feature families identified by strict-CV "
+            f"leave-one-family-out ablation: {fam_list}"
+        )
+        suggested = (
+            f"drop net-harmful feature families {fam_list} identified by "
+            f"strict-CV leave-one-family-out ablation; do not re-add them"
+        )
+        retune_json = {
+            "issue":                issue,
+            "suggested_change":     suggested,
+            "ablation_triggered":   True,
+            "net_harmful_families": fam_list,
+            "per_family_deltas":    per_family_deltas,
+            "previous_metrics": {
+                "walk_forward_mae":   float(wf_mae),
+                "pred_mean":          float(pred_mean),
+                "pred_std":           float(pred_std),
+                "validator_verdict":  verdict,
+            },
+        }
+        # Log rejected families to knowledge graph (best-effort)
+        try:
+            sys.path.insert(0, "tools")
+            from kg import kg_append_event
+            for _fam in fam_list:
+                kg_append_event("critic", "rejected_hypothesis", {
+                    "hypothesis": f"family '{_fam}' beneficial to strict-CV MAE",
+                    "outcome":    "rejected",
+                    "detail":     f"ablation: delta_vs_full={per_family_deltas.get(_fam)}",
+                })
+        except Exception as _kg_e:
+            print(f"[KG] non-fatal: {_kg_e}")
+
+    else:  # retune_reason == "critical"
+        first_critical = critical_checks[0]["name"]
+        if first_critical == "validator_concordance":
+            issue = f"Validator returned CRITICAL verdict: {validator_review.get('notes', 'see validator_review.json')}"
+            fs    = validator_review.get("feature_suspicion", [])
+            suggested = (
+                f"remove suspect features ({', '.join(str(f) for f in fs[:3])}) and retrain"
+                if fs else
+                "review validator_review.json notes and address CV methodology issue before retraining"
+            )
+        elif first_critical == "prediction_distribution":
+            if train_mean != 0.0 and abs(pred_mean - train_mean) > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
+                issue     = f"Systematic mean bias: pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (>30% offset)"
+                suggested = "verify val feature imputation uses training medians per group, not zeros"
+            else:
+                issue     = f"Severe under-dispersion: pred_std={pred_std:.3f} < {PRED_STD_CRITICAL:.2f}*train_std={train_std:.3f}"
+                suggested = "use median seed aggregation; expand Optuna num_leaves upper bound from 127 to 255"
+        elif first_critical == "prediction_sanity":
+            if nan_count > 0:
+                issue     = f"NaN predictions: {nan_count} NaN in predicted_target"
+                suggested = "apply fill_vals to all val columns; add np.nan_to_num fallback after ensemble_preds"
+            else:
+                issue     = f"Negative predictions: {neg_count} negative values in non-negative target"
+                suggested = "apply np.clip(predictions, 0, None) after seed aggregation, before saving predictions.csv"
         else:
-            issue = f"Severe under-dispersion: pred_std={pred_std:.3f} < {PRED_STD_CRITICAL:.2f}*train_std={train_std:.3f}"
-            suggested = "use median seed aggregation; expand Optuna num_leaves upper bound from 127 to 255"
-    elif first_critical == "prediction_sanity":
-        if nan_count > 0:
-            issue = f"NaN predictions: {nan_count} NaN in predicted_target"
-            suggested = "apply fill_vals to all val columns; add np.nan_to_num fallback after ensemble_preds"
-        else:
-            issue = f"Negative predictions: {neg_count} negative values in non-negative target"
-            suggested = "apply np.clip(predictions, 0, None) after seed aggregation, before saving predictions.csv"
-    else:
-        issue = f"Critical check failed: {first_critical} — {critical_checks[0]['details']}"
-        suggested = "retrain with default hyperparameters to rule out numerical instability"
+            issue     = f"Critical check failed: {first_critical} — {critical_checks[0]['details']}"
+            suggested = "retrain with default hyperparameters to rule out numerical instability"
+
+        retune_json = {
+            "issue":            issue,
+            "suggested_change": suggested,
+            "previous_metrics": {
+                "walk_forward_mae":  float(wf_mae),
+                "pred_mean":         float(pred_mean),
+                "pred_std":          float(pred_std),
+                "validator_verdict": verdict,
+            },
+        }
 
     with open("reports/critic_retune_requested.json", "w") as f:
-        json.dump({"issue": issue, "suggested_change": suggested,
-                   "previous_metrics": {"walk_forward_mae": float(wf_mae), "pred_mean": float(pred_mean),
-                                        "pred_std": float(pred_std), "validator_verdict": verdict}}, f, indent=2)
+        json.dump(retune_json, f, indent=2)
     with open("reports/critic_retune_attempted.txt", "w") as f:
-        f.write(f"critic retune marker written at {datetime.datetime.now().isoformat()}\n")
-    print("Written reports/critic_retune_requested.json and reports/critic_retune_attempted.txt")
+        f.write(
+            f"critic retune marker written at {datetime.datetime.now().isoformat()}\n"
+            f"retune_reason: {retune_reason}\n"
+        )
+    print(f"Written reports/critic_retune_requested.json (reason={retune_reason})")
+    print("Written reports/critic_retune_attempted.txt")
 
 # ── Step 6: Write critic_review.json ─────────────────────────────────────────
+ablation_summary = None
+if family_ablation is not None:
+    ablation_summary = {
+        "skipped":              family_ablation.get("skipped", True),
+        "net_harmful_families": family_ablation.get("net_harmful_families", []),
+        "triggered_retune":     retune_reason == "ablation",
+        "reason":               family_ablation.get("reason", ""),
+    }
+elif ablation_attempted:
+    ablation_summary = {
+        "skipped": True, "reason": "run failed or json not written",
+        "net_harmful_families": [], "triggered_retune": False,
+    }
+
 review = {
     "status":               status,
     "cycle":                2 if second_cycle else 1,
     "checks":               checks,
+    "gap_attribution_used": {
+        "classification":    attr_classification,
+        "downgraded_check1": (attr_classification == "CV_SCHEME" and c1_raw_status != "PASS"),
+        "original_verdict":  c1_raw_status,
+        "final_status":      c1_status,
+    },
+    "family_ablation":      ablation_summary,
     "warnings_for_report":  warnings_for_report,
     "retune_attempted":     second_cycle or (status == "retune_requested"),
-    "final_recommendation": ("proceed to submission_writer" if status == "accepted"
-                             else "retune requested — orchestrator should re-invoke modeler, then validator, then critic"),
+    "final_recommendation": (
+        "proceed to submission_writer" if status == "accepted"
+        else f"retune requested ({retune_reason}) — orchestrator: re-invoke modeler, validator, critic"
+    ),
     "decision_rationale":   decision_rationale,
 }
 if issue is not None:
@@ -436,17 +701,25 @@ print("Written reports/critic_was_here.txt")
 ```
 
 ## Output
-- reports/critic_review.json (always)
-- reports/critic_was_here.txt (always)
-- reports/critic_retune_requested.json (only if retune triggered, cycle 1)
-- reports/critic_retune_attempted.txt (only if retune triggered, cycle 1)
+- `reports/critic_review.json` (always; now includes `gap_attribution_used` and `family_ablation` keys)
+- `reports/critic_was_here.txt` (always)
+- `reports/family_ablation.json` (written by tools/family_ablation.py; best-effort, first cycle only)
+- `reports/critic_retune_requested.json` (only if retune triggered, cycle 1)
+- `reports/critic_retune_attempted.txt` (only if retune triggered, cycle 1)
 
 ## What you do NOT do
 - You do NOT block the pipeline. Always allow submission_writer to run.
 - You do NOT request more than one retune cycle (controlled by the critic_retune_attempted.txt marker).
+  The CRITICAL path and the ablation path share this single slot; ablation does not get its own.
+- You do NOT feed strict CV results back into any hyperparameter tuning objective.
+  The ablation measures on the strict scheme, but the retune only instructs feature dropping —
+  the model's hyperparameters are re-used unchanged from the first run.
+- You do NOT let gap_attribution ESCALATE or CREATE a retune signal. It can only suppress
+  (downgrade CRITICAL→WARNING or WARNING→PASS-with-note).
 - You do NOT modify predictions, features, or model results directly.
 - You do NOT use external knowledge — only what's in reports/ and data/.
-- You do NOT duplicate the validator's work. The validator audits CV methodology and leakage; you audit prediction quality and distribution match. Different jobs.
+- You do NOT duplicate the validator's work. The validator audits CV methodology and leakage;
+  you audit prediction quality, distribution match, and feature family usefulness. Different jobs.
 
 ## Failure handling
 If any input is missing, log it in critic_review.json under warnings_for_report and proceed with accept status. Never block by crashing. The pipeline must always reach submission_writer.
