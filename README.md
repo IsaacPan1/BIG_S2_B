@@ -46,6 +46,12 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 | `submission_writer` | Runs `tools/build_submission.py` to validate format and write `submission.csv` |
 | `report_writer` | Runs `tools/generate_report.py` to assemble `report.pdf` |
 
+## Knowledge Graph
+
+The pipeline writes an observability-only knowledge graph to `reports/knowledge_graph.json` via `tools/kg.py`. It is a **derived, append-only, observability-only log** — written by sub-agents at key points using `kg_set_stage`, `kg_append_event`, and `kg_record_rejected`. No agent reads it to make decisions, and it has no effect on the analysis or the submission.
+
+The graph records stage transitions (which agent ran and when), per-stage events (inferred problem type, resource counts, Optuna trial outcomes, hypothesis events), and rejected hypotheses from each stage. Its purpose is a run audit trail for transparency and post-hoc debugging — diagnostic tooling only, not a controller.
+
 ## Problem Subtype Detection
 
 The pipeline detects a problem subtype from the target column characteristics, not just the broad problem type. This determines which ensemble path is used.
@@ -86,15 +92,11 @@ Ordinal regression uses the regression path (not classification) because:
 
 **Ordinal post-processing.** After ensembling, predictions for `ordinal_regression` targets are rounded to the nearest valid integer class observed in training. The rounding threshold is optimized on OOF predictions: the modeler tries a small grid of offsets (–0.5 to +0.5 in steps of 0.1) and selects the offset that minimises OOF MAE before clipping to the training min/max. This converts continuous ensemble outputs to valid ordinal integers without sacrificing the distance-aware MAE objective. The chosen offset is logged in `model_results.json` under `ordinal_rounding`.
 
-## Reflective Hyperparameter Loop
+## Model Selection and Ensembling
 
-The modeler performs intra-run hyperparameter reflection when Optuna's search hits a parameter boundary — for example, when the best trial lands on the maximum `num_leaves` or minimum `learning_rate`. In that case, the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring a family's best configuration, without consuming the single critic-triggered retune cycle reserved for cross-family changes. Recentering is logged in `model_results.json` under `optuna_recentering`.
+The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size.
 
-**Dynamic ensemble reweighting.** Rather than a fixed equal-weight median, the final ensemble weights each surviving family inversely proportional to its OOF MAE (softmax over negative MAEs). Families with substantially worse OOF performance contribute less without being fully excluded. The applied weights are logged under `adaptive_choice.ensemble_weights`.
-
-## Adaptive Model Selection
-
-The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size. Each tree family is tuned with 15 Optuna trials (with boundary recentering when applicable) and predictions are aggregated across 5 random seeds before ensembling.
+**Family selection.**
 
 | Condition | Ensemble |
 |-----------|----------|
@@ -102,11 +104,11 @@ The modeler selects its ensemble from `profile.json` based on `problem_type` and
 | panel_forecasting or tabular_regression, n_train < 1,000 | LightGBM + Ridge |
 | classification (any size) | LightGBM only |
 
-Ridge predictions pass two sanity checks before inclusion: predicted values must not exceed 5× the training maximum, and predicted mean must not deviate more than 100% from the training mean. A Ridge that fails either check is excluded from the ensemble; LightGBM always remains as the last-resort fallback.
+**Hyperparameter tuning with boundary recentering.** Each tree family is tuned with 15 Optuna trials (10 for CatBoost) and predictions are aggregated across 5 random seeds before ensembling. When Optuna's search hits a parameter boundary — for example, when the best trial lands on the maximum `num_leaves` or minimum `learning_rate` — the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring a family's best configuration, without consuming the single critic-triggered retune cycle reserved for cross-family changes. Recentering is logged in `model_results.json` under `optuna_recentering`.
 
-**Shift-weighted ensembling with competence check.** When any covariate's KS statistic exceeds 0.40, the modeler considers weighting Ridge 1.5× in the final ensemble — Ridge's conservative extrapolation hedges against tree models overfitting shifted regions. The weight is applied only when Ridge is competitive: Ridge OOF MAE must be within 1.5× of the best family's OOF MAE. If Ridge is substantially worse, the ensemble falls back to equal-weight median to avoid pulling predictions toward the weaker family. The decision, OOF comparison, and applied weight are logged in `model_results.json` under `adaptive_choice`.
+**Family competence checks.** Ridge predictions pass two sanity checks before inclusion: predicted values must not exceed 5× the training maximum, and predicted mean must not deviate more than 100% from the training mean. Beyond those sanity checks, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 1.5× the best tree family's OOF MAE; when excluded, the ensemble becomes LightGBM + XGBoost only, and the decision is logged under `adaptive_choice.ridge_excluded_reason`. The same 1.5× competence threshold applies to CatBoost; its decision is logged under `adaptive_choice.catboost_decision`. LightGBM always remains as the last-resort fallback.
 
-**Ridge competence check for inclusion.** Beyond the weighting decision, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 1.5× the best tree family's OOF MAE. This prevents Ridge from pulling the median toward less accurate predictions when its model fit is substantially worse than the tree families. When excluded, the ensemble becomes LightGBM + XGBoost only. The decision is logged in `model_results.json` under `adaptive_choice.ridge_excluded_reason`.
+**Ensemble blending.** Rather than a fixed equal-weight median, the final ensemble weights each surviving family inversely proportional to its OOF MAE (softmax over negative MAEs). Families with substantially worse OOF performance contribute less without being fully excluded. When any covariate's KS statistic exceeds 0.40, Ridge receives an additional 1.5× up-weight in the final ensemble — Ridge's conservative extrapolation hedges against tree models overfitting shifted regions. This shift-weight is applied only when Ridge is competitive (OOF MAE within 1.5× of the best family); if Ridge is substantially worse, the ensemble falls back to equal-weight median. The applied weights are logged under `adaptive_choice.ensemble_weights`.
 
 **Time safeguards.** If total elapsed time exceeds 20 minutes when XGBoost would start, XGBoost is skipped. If two families have completed and elapsed time exceeds 30 minutes when Ridge would start, Ridge is skipped.
 
@@ -162,6 +164,20 @@ The detected granularity drives additional seasonality features beyond the base 
 
 For panel data with detected time granularity, val lag features that look back into the validation period are imputed using a cycle-aware method rather than the last known training value. The imputed value uses the mean target for the matching group at the same point in the seasonal cycle: matching hour-of-day for hourly data, day-of-week for daily data, week-of-year for weekly data, and month-of-year for monthly data. For monthly granularity with opaque time IDs, the pipeline first resolves IDs to calendar dates via the codebook, then computes the median date difference across unique time periods to confirm monthly cadence before applying month-of-year cycle imputation. This preserves seasonal pattern information far ahead of the training window, addressing the staleness that occurs when later val periods are many steps removed from training end. The method falls back to last known training value when seasonal position cannot be determined or when fewer than 10 percent of training rows resolve through the codebook.
 
+## Recursive (Iterated) Forecasting
+
+For panel forecasting problems, the modeler selects between two methods for handling unknown future lags at prediction time, and logs the choice in `model_results.json` under `lag_forecasting`.
+
+**Static cycle-aware imputation** freezes unknown future lags at a fixed seasonal estimate derived from training history (the same cycle-position mean used during feature engineering). Every horizon step sees the same pre-computed lag value regardless of what earlier steps predicted.
+
+**Recursive (iterated) forecasting** predicts the horizon one step at a time, feeding each step's prediction forward as the next step's lag input. After each step, all target-derived features (lags, rolling means, recent values, slope features) are recomputed using the updated prediction history. Covariate features, shift-aware features, seasonality encodings, and static baseline features are taken as-is from the original feature frame and do not recurse.
+
+Recursive forecasting reuses the already-trained model objects — no additional training passes occur, only additional prediction passes. The same ensemble blend (families and weights) used in the static path is applied at each recursive step. A runaway-ceiling guard clips each step's prediction to a sane multiple of the training maximum to prevent feedback-loop amplification.
+
+**Method selection is empirical.** Both methods are scored on a walk-forward holdout (the final `n_holdout_steps` training periods, withheld from feature fitting), including per-step MAE arrays. Recursive forecasting is kept only when its holdout MAE ≤ the static imputation holdout MAE; otherwise the pipeline falls back to imputation. The comparison MAEs, per-step arrays, and selected method are logged under `lag_forecasting` in `model_results.json` and reflected in Section 7 of `report.pdf`.
+
+The benefit of recursive forecasting appears in the `lag_forecasting` holdout comparison and in true out-of-sample error. It does not appear in standard OOF or strict-CV metrics, because those are computed on training periods where lags are already known — both methods produce identical results there. The gap between the two methods only materialises when predicting genuinely unknown future values.
+
 ## Adversarial Validation
 
 `feature_engineering.py` trains a binary LightGBM classifier (5-fold StratifiedKFold, 100 estimators) to distinguish training rows (label 1) from validation rows (label 0). The classifier's OOF AUC measures multivariate covariate shift that per-column KS tests may miss.
@@ -211,8 +227,8 @@ When a valid codebook is found, `profile.json` gains a `time_codebook` field tha
 - Image feature extraction uses hand-crafted spatial statistics rather than deep learning embeddings. For domains where semantic content matters (object recognition, complex scenes), pre-trained CNN embeddings would extract richer features but require GPU and significant model weight downloads. The current approach trades some signal richness for CPU compatibility and zero external dependencies beyond PIL.
 - Pipeline assumes one of three documented file conventions; unusual layouts may not be auto-detected and will fall back to heuristics that could misclassify train/val files.
 - Stacking and target encoding are not used, to avoid leakage risks that arise when hierarchical outcome categories overlap across folds.
-- Lag features compound error on long forecasts: when the validation horizon extends many periods ahead, lag imputation falls back to the last known training value per group, which degrades accuracy as horizon length increases.
-- Smart lag imputation reduces but does not eliminate the gap between internal CV metrics and real test MAE. The imputation typically improves walk-forward predictions with minimal effect on internal CV metrics, since it primarily helps test-time predictions rather than training-time evaluation.
+- For panel forecasting, the modeler selects empirically between static cycle-aware imputation and recursive (iterated) forecasting for unknown future lags (see [Recursive (Iterated) Forecasting](#recursive-iterated-forecasting)). Even with recursive forecasting, compounding prediction error accumulates over long horizons; the holdout comparison measures — but cannot fully eliminate — this degradation.
+- The holdout-selected lag method improves alignment between internal metrics and real test MAE, but a residual gap remains: OOF and strict-CV metrics are computed on training periods where lags are already known, so neither method's advantage is visible there. The gap manifests only on genuinely unknown future lags.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
 - Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
 

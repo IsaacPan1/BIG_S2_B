@@ -448,10 +448,12 @@ _lgb_t0       = time.time()
 X_full_filled = train_df[feature_cols].fillna(fill_vals)
 X_val         = val_df[feature_cols].fillna(fill_vals)
 
+_lgb_trained_models = []
 seed_preds = []
 for seed in [42, 7, 123, 2024, 999]:
     m = lgb.LGBMRegressor(**{**final_params, "random_state": seed})
     m.fit(X_full_filled, y_full, sample_weight=_adv_weights, callbacks=[lgb.log_evaluation(-1)])
+    _lgb_trained_models.append(m)
     raw_p = m.predict(X_val)
     seed_preds.append(np.clip(inv(raw_p), 0, None))
 
@@ -484,8 +486,9 @@ xgb_result         = {
     "attempted": False, "skip_reason": None, "succeeded": None,
     "oof_mae": None, "included_in_ensemble": None,
 }
-xgb_oof_mae      = float("inf")
-xgb_wf_val_preds = None
+xgb_oof_mae        = float("inf")
+xgb_wf_val_preds   = None
+_xgb_trained_models = []
 
 if elapsed_before_xgb > 20:
     xgb_result["skip_reason"] = (
@@ -573,6 +576,7 @@ else:
         for _s in [42, 7, 123, 2024, 999]:
             _xm = xgb_lib.XGBRegressor(**{**xgb_final, "random_state": _s})
             _xm.fit(X_full_filled.values, y_full, sample_weight=_adv_weights)
+            _xgb_trained_models.append(_xm)
             _xseed_preds.append(np.clip(inv(_xm.predict(X_val.values)), 0, None))
 
         xgb_ensemble_preds = np.median(_xseed_preds, axis=0)
@@ -623,7 +627,8 @@ _cb_decision = {
     "data_size_check_passed":    n_train >= 500,
     "competence_check_result":   None,
 }
-cb_wf_val_preds = None
+cb_wf_val_preds    = None
+_cb_trained_models = []
 
 _should_run_cb = (
     _catboost_available
@@ -758,6 +763,7 @@ if _should_run_cb:
                     X_full_filled.values, y_full,
                     sample_weight=_adv_weights, verbose=False,
                 )
+                _cb_trained_models.append(_m)
                 _raw_p = _m.predict(X_val.values)
                 _cb_seed_preds.append(np.clip(inv(_raw_p), 0, None))
 
@@ -820,6 +826,8 @@ ridge_val_preds        = None
 ridge_wf_val_preds     = None
 ridge_excluded_reason  = None
 ridge_top_coefficients = []
+_ridge_trained_model   = None
+_ridge_trained_scaler  = None
 
 _elapsed_before_ridge = (time.time() - pipeline_start_time) / 60
 _should_run_ridge = (
@@ -931,9 +939,11 @@ else:
             _ridge_full  = Ridge(alpha=_best_alpha)
             _ridge_full.fit(_Xfull_s, y_full, sample_weight=_adv_weights)
 
-            _ridge_raw_preds = _ridge_full.predict(_Xval_s)
-            ridge_val_preds  = np.clip(inv(_ridge_raw_preds), 0, None)
+            _ridge_raw_preds      = _ridge_full.predict(_Xval_s)
+            ridge_val_preds       = np.clip(inv(_ridge_raw_preds), 0, None)
             all_val_preds["ridge"] = ridge_val_preds
+            _ridge_trained_model  = _ridge_full
+            _ridge_trained_scaler = _scaler_full
 
             ridge_top_coefficients = [
                 {"feature": feat, "abs_coef": float(coef)}
@@ -1098,6 +1108,270 @@ print(
     f"mean={ensemble_preds.mean():.2f}  families={_included_keys}"
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Recursive multi-step forecasting
+# Replaces static lag-imputation on val by feeding each step's prediction
+# back as the lag seed for the next step. Compared against imputation on the
+# walk-forward holdout (where ground truth is known); winner used for val.
+# ─────────────────────────────────────────────────────────────────────────────
+_lag_forecasting = {
+    "method_used":             "imputation",
+    "imputation_holdout_mae":  None,
+    "recursive_holdout_mae":   None,
+    "per_step_mae_imputation": [],
+    "per_step_mae_recursive":  [],
+    "notes":                   "not_attempted",
+}
+
+try:
+    _rf_ord_col = "period_id_ord"
+    _has_ord    = (
+        problem_type == "panel_forecasting"
+        and group_cols
+        and time_col
+        and _rf_ord_col in train_df.columns
+        and _rf_ord_col in val_df.columns
+    )
+
+    if not _has_ord:
+        _lag_forecasting["notes"] = (
+            f"skipped: problem_type={problem_type}, ord_col_present={_rf_ord_col in train_df.columns}"
+        )
+    else:
+        _rf_lag_periods  = feat_meta.get("lag_periods",    [1, 2, 3, 4])
+        _rf_roll_windows = feat_meta.get("rolling_windows", [4, 8])
+        _rf_lag_cols     = [f"lag_{k}"       for k in _rf_lag_periods  if f"lag_{k}"       in feature_cols]
+        _rf_rmean_cols   = [f"roll_mean_{w}" for w in _rf_roll_windows if f"roll_mean_{w}" in feature_cols]
+        _rf_rstd_cols    = [f"roll_std_{w}"  for w in _rf_roll_windows if f"roll_std_{w}"  in feature_cols]
+        _rf_tgt_cols     = set(_rf_lag_cols + _rf_rmean_cols + _rf_rstd_cols)
+        _rf_ceiling      = float(train_df[target_col].max()) * 10.0
+        _rf_ceiling_hits = 0
+
+        # column-index lookup (constant across all steps)
+        _fc_idx     = {c: i for i, c in enumerate(feature_cols)}
+        _fv_arr     = np.array([fill_vals.get(c, 0.0) for c in feature_cols], dtype=np.float64)
+
+        # ── Ensemble predict using stored models (same blend as static path) ──
+        def _rf_predict(X_df: pd.DataFrame) -> np.ndarray:
+            _pf: dict = {}
+            if _lgb_trained_models and "lgb" in _included_keys:
+                _sp = [np.clip(inv(m.predict(X_df)), 0, None) for m in _lgb_trained_models]
+                _pf["lgb"] = _seed_agg(_sp, axis=0)
+            if _xgb_trained_models and "xgb" in _included_keys:
+                _sp = [np.clip(inv(m.predict(X_df.values)), 0, None) for m in _xgb_trained_models]
+                _pf["xgb"] = np.median(_sp, axis=0)
+            if _cb_trained_models and "catboost" in _included_keys:
+                _sp = [np.clip(inv(m.predict(X_df.values)), 0, None) for m in _cb_trained_models]
+                _pf["catboost"] = np.median(_sp, axis=0)
+            if _ridge_trained_model is not None and "ridge" in _included_keys:
+                _Xs = _ridge_trained_scaler.transform(X_df.values)
+                _pf["ridge"] = np.clip(inv(_ridge_trained_model.predict(_Xs)), 0, None)
+            if not _pf:
+                return np.zeros(len(X_df))
+            _ks  = [k for k in _included_keys if k in _pf]
+            _stk = np.array([_pf[k] for k in _ks])
+            if ensemble_blend == "ridge_weighted_1.5x" and "ridge" in _ks:
+                _w = np.array([1.5 if k == "ridge" else 1.0 for k in _ks])
+                return np.clip(np.average(_stk, axis=0, weights=_w), 0, None)
+            if ensemble_blend == "inverse_mae_weighted":
+                _iw = np.array([1.0 / _family_oof.get(k, 1.0) for k in _ks])
+                _iw /= max(_iw.sum(), 1e-12)
+                return np.clip(np.average(_stk, axis=0, weights=_iw), 0, None)
+            return np.clip(np.median(_stk, axis=0), 0, None)
+
+        # ── Helper: compute target-derived features from history ──────────────
+        def _inject_target_feats(feat_arr: np.ndarray, local_i: int,
+                                 hist: list) -> None:
+            """Overwrite lag/rolling columns in feat_arr[local_i] from hist."""
+            for k in _rf_lag_periods:
+                ci = _fc_idx.get(f"lag_{k}")
+                if ci is not None:
+                    feat_arr[local_i, ci] = (
+                        float(hist[-k]) if len(hist) >= k else (float(hist[-1]) if hist else 0.0)
+                    )
+            for w in _rf_roll_windows:
+                win = hist[-w:] if len(hist) >= w else hist
+                ci_m = _fc_idx.get(f"roll_mean_{w}")
+                ci_s = _fc_idx.get(f"roll_std_{w}")
+                if ci_m is not None:
+                    feat_arr[local_i, ci_m] = float(np.mean(win)) if win else 0.0
+                if ci_s is not None:
+                    feat_arr[local_i, ci_s] = (
+                        float(np.std(win, ddof=1)) if len(win) >= 2 else 0.0
+                    )
+
+        # ── Helper: group-key list (scalar or tuple depending on n group cols) ─
+        def _build_gkeys(df: pd.DataFrame) -> list:
+            if len(group_cols) == 1:
+                return list(df[group_cols[0]])
+            return [tuple(r) for r in df[group_cols].values.tolist()]
+
+        # ── Sort wf_val / wf_train by group + ordinal ─────────────────────────
+        _wf_v = wf_val.sort_values(group_cols + [_rf_ord_col]).reset_index(drop=True)
+        _wf_t = wf_train.sort_values(group_cols + [_rf_ord_col]).reset_index(drop=True)
+        _wf_train_max_ord = int(_wf_t[_rf_ord_col].max())
+        _wf_val_periods   = sorted(_wf_v[_rf_ord_col].unique().tolist())
+        _n_h_steps        = len(_wf_val_periods)
+        _wf_step_nums     = (_wf_v[_rf_ord_col].values - _wf_train_max_ord).astype(int)
+        _y_wf_truth       = _wf_v[target_col].values
+
+        # Per-group history from wf_train
+        _hist_seed: dict = {}
+        _gb_cols = group_cols if len(group_cols) > 1 else group_cols[0]
+        for _gk, _gdf in _wf_t.groupby(_gb_cols):
+            _hist_seed[_gk] = list(_gdf[target_col].values)  # already sorted
+
+        # Group-key arrays for wf_val rows
+        _wf_gkeys = _build_gkeys(_wf_v)
+
+        # Base feature array for wf_val (NaN-filled with training medians)
+        _wf_base = _wf_v[feature_cols].values.astype(np.float64)
+        _nm = np.isnan(_wf_base)
+        _wf_base[_nm] = np.take(_fv_arr, np.where(_nm)[1])
+
+        # ── (A) Imputation holdout evaluation ─────────────────────────────────
+        print("Recursive forecasting: scoring imputation holdout…")
+        _last_known: dict = {_gk: float(v[-1]) if v else 0.0
+                             for _gk, v in _hist_seed.items()}
+        _imp_base = _wf_base.copy()
+        for _col in _rf_lag_cols + _rf_rmean_cols:
+            ci = _fc_idx.get(_col)
+            if ci is None:
+                continue
+            for _ri, _gk in enumerate(_wf_gkeys):
+                _imp_base[_ri, ci] = _last_known.get(_gk, _fv_arr[ci])
+        for _col in _rf_rstd_cols:
+            ci = _fc_idx.get(_col)
+            if ci is not None:
+                _imp_base[:, ci] = 0.0
+        _imp_preds_h   = _rf_predict(pd.DataFrame(_imp_base, columns=feature_cols))
+        _imp_hold_mae  = float(mean_absolute_error(_y_wf_truth, _imp_preds_h))
+        _per_step_imp  = [
+            float(mean_absolute_error(_y_wf_truth[_wf_step_nums == s],
+                                      _imp_preds_h[_wf_step_nums == s]))
+            for s in range(1, _n_h_steps + 1)
+            if (_wf_step_nums == s).any()
+        ]
+        print(f"  Imputation holdout MAE: {_imp_hold_mae:.4f}")
+        print(f"  Per-step (imp): {[round(v,3) for v in _per_step_imp]}")
+
+        # ── (B) Recursive holdout evaluation ──────────────────────────────────
+        print("Recursive forecasting: scoring recursive holdout…")
+        _rec_preds_h = np.zeros(len(_wf_v))
+        _rec_hist: dict = {_gk: list(v) for _gk, v in _hist_seed.items()}
+
+        for _pord in _wf_val_periods:
+            _pm    = (_wf_v[_rf_ord_col] == _pord).values
+            _pidxs = np.where(_pm)[0]
+            _sf    = _wf_base[_pidxs].copy()
+            for _li, _ri in enumerate(_pidxs):
+                _inject_target_feats(_sf, _li, _rec_hist.get(_wf_gkeys[_ri], []))
+            _sp = _rf_predict(pd.DataFrame(_sf, columns=feature_cols))
+            _cf = _sp > _rf_ceiling
+            if _cf.any():
+                _rf_ceiling_hits += int(_cf.sum())
+                _sp = np.clip(_sp, 0, _rf_ceiling)
+            _rec_preds_h[_pidxs] = _sp
+            for _li, _ri in enumerate(_pidxs):
+                _gk = _wf_gkeys[_ri]
+                _rec_hist.setdefault(_gk, []).append(float(_sp[_li]))
+
+        _rec_hold_mae = float(mean_absolute_error(_y_wf_truth, _rec_preds_h))
+        _per_step_rec = [
+            float(mean_absolute_error(_y_wf_truth[_wf_step_nums == s],
+                                      _rec_preds_h[_wf_step_nums == s]))
+            for s in range(1, _n_h_steps + 1)
+            if (_wf_step_nums == s).any()
+        ]
+        print(f"  Recursive holdout MAE: {_rec_hold_mae:.4f}")
+        print(f"  Per-step (rec): {[round(v,3) for v in _per_step_rec]}")
+        if _rf_ceiling_hits:
+            print(f"  Ceiling triggered {_rf_ceiling_hits} time(s) on holdout")
+
+        _rec_wins = _rec_hold_mae <= _imp_hold_mae
+        print(f"  Winner: {'RECURSIVE' if _rec_wins else 'IMPUTATION'} "
+              f"(Δ={abs(_rec_hold_mae - _imp_hold_mae):.4f})")
+
+        _method_used     = "imputation"
+        _n_val_steps     = int(val_df[_rf_ord_col].nunique())
+        _val_ceil_hits   = 0
+
+        if _rec_wins:
+            # ── Apply recursive to the actual (blind) val set ─────────────────
+            print("Recursive forecasting: generating recursive val predictions…")
+            _val_s   = val_df.sort_values(group_cols + [_rf_ord_col]).reset_index(drop=True)
+            _val_orig_positions = val_df.sort_values(group_cols + [_rf_ord_col]).index.tolist()
+            _val_periods = sorted(_val_s[_rf_ord_col].unique().tolist())
+            _val_gkeys   = _build_gkeys(_val_s)
+
+            # Seed with ALL training data
+            _train_s2 = train_df.sort_values(group_cols + [_rf_ord_col]).reset_index(drop=True)
+            _full_hist: dict = {}
+            for _gk, _gdf in _train_s2.groupby(_gb_cols):
+                _full_hist[_gk] = list(_gdf[target_col].values)
+
+            _val_base = _val_s[feature_cols].values.astype(np.float64)
+            _nm2 = np.isnan(_val_base)
+            _val_base[_nm2] = np.take(_fv_arr, np.where(_nm2)[1])
+
+            _rec_val_preds  = np.zeros(len(_val_s))
+            _val_hist: dict = {_gk: list(v) for _gk, v in _full_hist.items()}
+
+            for _pord in _val_periods:
+                _pm    = (_val_s[_rf_ord_col] == _pord).values
+                _pidxs = np.where(_pm)[0]
+                _sf    = _val_base[_pidxs].copy()
+                for _li, _ri in enumerate(_pidxs):
+                    _inject_target_feats(_sf, _li, _val_hist.get(_val_gkeys[_ri], []))
+                _sp = _rf_predict(pd.DataFrame(_sf, columns=feature_cols))
+                _cf = _sp > _rf_ceiling
+                if _cf.any():
+                    _val_ceil_hits += int(_cf.sum())
+                    _sp = np.clip(_sp, 0, _rf_ceiling)
+                _rec_val_preds[_pidxs] = _sp
+                for _li, _ri in enumerate(_pidxs):
+                    _gk = _val_gkeys[_ri]
+                    _val_hist.setdefault(_gk, []).append(float(_sp[_li]))
+
+            # Re-align to original val_df row order (val_df.index = 0..n-1)
+            _aligned = np.zeros(len(val_df))
+            for _new_pos, _orig_idx in enumerate(_val_orig_positions):
+                _aligned[_orig_idx] = _rec_val_preds[_new_pos]
+
+            if np.isnan(_aligned).any() or (np.array(_aligned) < 0).any():
+                print("  WARNING: invalid recursive val preds — keeping imputation")
+            else:
+                ensemble_preds = np.clip(_aligned, 0, None)
+                _method_used   = "recursive"
+                print(f"  Recursive val: min={ensemble_preds.min():.2f} "
+                      f"max={ensemble_preds.max():.2f} mean={ensemble_preds.mean():.2f}")
+                if _val_ceil_hits:
+                    print(f"  WARNING: val ceiling triggered {_val_ceil_hits} time(s)")
+
+        _lag_forecasting = {
+            "method_used":             _method_used,
+            "imputation_holdout_mae":  _imp_hold_mae,
+            "recursive_holdout_mae":   _rec_hold_mae,
+            "per_step_mae_imputation": _per_step_imp,
+            "per_step_mae_recursive":  _per_step_rec,
+            "n_holdout_steps":         _n_h_steps,
+            "n_val_steps":             _n_val_steps,
+            "ceiling_hits_holdout":    _rf_ceiling_hits,
+            "ceiling_hits_val":        _val_ceil_hits,
+            "ceiling_value":           _rf_ceiling,
+            "notes": (
+                f"recursive won by {_imp_hold_mae - _rec_hold_mae:.4f}"
+                if _rec_wins
+                else f"imputation won by {_rec_hold_mae - _imp_hold_mae:.4f}"
+            ),
+        }
+
+except Exception as _rf_exc:
+    import traceback as _tb
+    print(f"Recursive forecasting failed ({_rf_exc}) — using imputation path")
+    _tb.print_exc()
+    _lag_forecasting["notes"] = f"error: {str(_rf_exc)[:300]}"
+
 # Ordinal rounding (no-op for panel_forecasting)
 _postprocessing = {
     "ordinal_rounding_applied": False,
@@ -1199,6 +1473,7 @@ results = {
     "retune_applied":    _retune_applied,
     "optuna_reflection": _optuna_reflection,
     "postprocessing":    _postprocessing,
+    "lag_forecasting":   _lag_forecasting,
 }
 
 _mr_path = os.path.join(REPO_ROOT, "reports", "model_results.json")

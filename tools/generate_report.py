@@ -943,11 +943,43 @@ else:
             "The reported metric may be optimistic.",
             "Modeler retune triggered." if critic_retune else "Manual review recommended."))
 
+    _lag_fc      = model_res.get("lag_forecasting") or {}
+    _lag_method  = _lag_fc.get("method_used")
+    _lag_imp_mae = _lag_fc.get("imputation_holdout_mae")
+    _lag_rec_mae = _lag_fc.get("recursive_holdout_mae")
+    _lag_body = (
+        "Within-horizon predictions rely on model estimates rather than actuals, "
+        "introducing compounding error for longer forecast horizons."
+    )
+    if _lag_method == "recursive":
+        _mae_note = (
+            f"  Imputation holdout MAE: {fmt(_lag_imp_mae, 4)};  "
+            f"Recursive holdout MAE: {fmt(_lag_rec_mae, 4)}."
+            if (_lag_imp_mae is not None and _lag_rec_mae is not None) else ""
+        )
+        _lag_mitigation = (
+            f"Recursive (iterated) forecasting selected — outperformed static "
+            f"imputation on holdout.{_mae_note}"
+        )
+    elif _lag_method == "imputation":
+        _mae_note = (
+            f"  Imputation holdout MAE: {fmt(_lag_imp_mae, 4)};  "
+            f"Recursive holdout MAE: {fmt(_lag_rec_mae, 4)}."
+            if (_lag_imp_mae is not None and _lag_rec_mae is not None) else ""
+        )
+        _lag_mitigation = (
+            f"Static cycle-aware imputation selected — recursion was measured "
+            f"but did not improve the holdout.{_mae_note}"
+        )
+    else:
+        _lag_mitigation = (
+            "Lag forecasting method not recorded "
+            "(lag_forecasting block absent from model_results.json)."
+        )
     lims.append(("MEDIUM",
         "Lag feature imputation at the validation boundary",
-        "Within-horizon predictions rely on model estimates rather than actuals, "
-        "introducing compounding error for longer forecast horizons.",
-        "Cycle-aware imputation used where applicable."))
+        _lag_body,
+        _lag_mitigation))
 
     if n_trials is not None:
         lims.append(("LOW",
