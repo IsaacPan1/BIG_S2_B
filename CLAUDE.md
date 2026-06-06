@@ -45,6 +45,41 @@ Each sub-agent is defined in `.claude/agents/` — use its registered name exact
 After each agent completes, read its primary output file and verify it is
 non-empty and sensible before continuing.
 
+### Sub-agent completion contract (read before invoking any stage)
+
+**MARKER IS AUTHORITATIVE — ABSENCE ≠ FAILURE.**
+A sub-agent is COMPLETE when and only when its `*_was_here.txt` marker file exists.
+If the marker is absent, the sub-agent is either STILL RUNNING or genuinely failed —
+these are two different states and must NOT be conflated. Absence of the marker is NOT
+proof of failure. Do NOT re-invoke a sub-agent solely because its outputs are not yet
+present.
+
+**NEVER DOUBLE-INVOKE.**
+Before invoking any sub-agent, check whether its marker already exists OR whether a
+process for it is already running. NEVER launch a second instance of a sub-agent while
+a prior instance may still be running — concurrent writes to the same `reports/` files
+corrupt outputs. If a stage appears stalled, wait; do not relaunch.
+
+**HOW TO DISTINGUISH 'STILL RUNNING' FROM 'FAILED'.**
+The only valid failure signal is: the process has EXITED (with any exit code) AND the
+marker file is still absent after exit. Re-invocation or fallback logic is permitted ONLY
+in that genuine-failure state — never on a not-yet-present check during an active run.
+
+**Expected wall-clock durations per stage** (the marker will be absent throughout this
+window during normal operation — this is expected, not a failure):
+
+| Stage | Typical duration | Outer budget |
+|-------|-----------------|--------------|
+| feature_engineer | 2–5 min | 15 min |
+| modeler | 8–15 min (Optuna tuning across families) | 60 min |
+| validator | 3–8 min | 10 min |
+| critic | 2–5 min | 5 min |
+
+The modeler is the longest-running stage. It is normal for `reports/modeler_was_here.txt`
+to be absent for 10+ minutes after invocation while Optuna trials are running. Do not
+treat this as a failure. Poll for the marker periodically; continue waiting as long as
+the launched process is alive.
+
 ### Step 1 — schema_analyst (ALWAYS first)
 
 ```
@@ -69,7 +104,10 @@ one-page `report.pdf` explaining the failure, then stop.
 ### Step 2 — feature_engineer
 
 After schema_analyst completes, invoke the feature_engineer sub-agent using the Task tool.
-Wait for it to write `reports/features.json` before proceeding.
+Wait for it to write `reports/feature_engineer_was_here.txt` before proceeding. This stage
+typically takes 2–5 minutes; the marker may be absent for several minutes during normal
+operation. See the Sub-agent completion contract above — do NOT re-invoke if the marker
+has not yet appeared.
 
 ```
 Use the feature_engineer sub-agent to engineer features for the dataset.
@@ -80,11 +118,12 @@ Use the feature_engineer sub-agent to engineer features for the dataset.
 - Budget: **15 minutes**
 
 Verify after completion:
-- `reports/features.json` exists and lists at least one feature group
 - `reports/feature_engineer_was_here.txt` exists (proves the sub-agent ran, not inline work)
+- `reports/features.json` exists and lists at least one feature group
 - `data/features_train.parquet` exists and has more columns than the raw data
 
-If this step fails or times out: fall back to raw covariates only (no lag features).
+If the process has exited AND `reports/feature_engineer_was_here.txt` is still absent
+(genuine failure): fall back to raw covariates only (no lag features).
 Log the fallback in stdout and continue to the modeler with whatever feature files exist.
 
 ### Step 3 — modeler
@@ -93,6 +132,12 @@ Invoke the modeler sub-agent via the Task tool. Wait for it to write
 `reports/model_results.json`, `reports/predictions.csv`, AND
 `reports/modeler_was_here.txt`. Do not proceed until the marker file exists.
 Do NOT perform modeling inline — always delegate to the modeler sub-agent.
+
+This is the longest-running stage: Optuna hyperparameter tuning typically takes
+8–15 minutes. The marker `reports/modeler_was_here.txt` will be absent throughout
+this time — that is expected, not a failure. Poll for the marker periodically;
+continue waiting as long as the launched process is alive. See the Sub-agent
+completion contract above.
 
 ```
 Use the modeler sub-agent to train models and generate predictions.
@@ -105,13 +150,16 @@ Use the modeler sub-agent to train models and generate predictions.
 - Budget: **60 minutes**
 
 Verify after completion:
+- Before verifying, confirm the sub-agent process has exited. If the marker is absent
+  but the process is still alive, continue waiting — this is NOT a failure state.
 - `reports/modeler_was_here.txt` exists (proves the sub-agent ran, not inline work)
 - `reports/predictions.csv` exists
 - Row count matches the validation set (check against `n_val_rows` in `reports/profile.json`)
 - Prediction column name matches `target_col` from the profile
 - No NaN predictions
 
-If this step fails: generate a group-mean baseline prediction for `reports/predictions.csv`
+If the process has exited AND `reports/modeler_was_here.txt` is still absent (genuine
+failure): generate a group-mean baseline prediction for `reports/predictions.csv`
 using Python directly (do not invoke another agent), log the fallback, and continue.
 
 ### Step 3.5 — validator
@@ -121,7 +169,9 @@ Wait for it to write `reports/validator_review.json` AND
 `reports/validator_was_here.txt`. Do not proceed until the marker file exists.
 Do NOT perform validation inline — always delegate to the validator sub-agent.
 The validator is **diagnostic only** — it does NOT modify predictions and does NOT
-block submission regardless of verdict.
+block submission regardless of verdict. This stage typically takes 3–8 minutes;
+see the Sub-agent completion contract above — do NOT re-invoke if the marker
+has not yet appeared.
 
 ```
 Use the validator sub-agent to audit the modeler's CV integrity.
@@ -134,6 +184,8 @@ Use the validator sub-agent to audit the modeler's CV integrity.
 - Budget: **10 minutes**
 
 Verify after completion:
+- Before verifying, confirm the sub-agent process has exited. If the marker is absent
+  but the process is still alive, continue waiting — this is NOT a failure state.
 - `reports/validator_was_here.txt` exists (proves sub-agent ran, not inline work)
 - `reports/validator_review.json` exists and has all required keys:
   `verdict`, `reported_cv_mae`, `strict_cv_mae`, `honest_cv_mae`,
@@ -141,14 +193,17 @@ Verify after completion:
   `checks`, `notes`
 - `verdict` ∈ {PASS, WARNING, CRITICAL}
 
-If this step fails: write a minimal `reports/validator_review.json` with
-`verdict="WARNING"` and `notes` explaining the failure. Always continue to
-`submission_writer` — a missing validator review never blocks submission.
+If the process has exited AND `reports/validator_was_here.txt` is still absent (genuine
+failure): write a minimal `reports/validator_review.json` with `verdict="WARNING"` and
+`notes` explaining the failure. Always continue to `submission_writer` — a missing
+validator review never blocks submission.
 
 ### Step 3.6 — Critic Review
 
 Invoke the critic sub-agent via the Task tool. Wait for
-reports/critic_was_here.txt and reports/critic_review.json.
+reports/critic_was_here.txt and reports/critic_review.json. This stage typically
+takes 2–5 minutes; see the Sub-agent completion contract above — do NOT re-invoke
+if the marker has not yet appeared.
 
 ```
 Use the critic sub-agent to review the validator output and modeler predictions.
@@ -162,6 +217,11 @@ Use the critic sub-agent to review the validator output and modeler predictions.
           `reports/critic_retune_attempted.txt`
 - Budget: **5 minutes**
 
+NOTE: the retune cycle below is an INTENTIONAL, gated re-invocation of the modeler —
+distinct from the accidental double-invocation that the Sub-agent completion contract
+prohibits. It is triggered only by `reports/critic_retune_requested.json` existing,
+never by the absence of a marker file.
+
 If reports/critic_retune_requested.json exists AND
 reports/critic_retune_attempted.txt was just created in this run:
 - Re-invoke modeler (it will read critic_retune_requested.json
@@ -174,12 +234,15 @@ Maximum one retune cycle per pipeline run. Do NOT generate critic
 review inline; always delegate to the critic sub-agent.
 
 Verify after completion:
+- Before verifying, confirm the sub-agent process has exited. If the marker is absent
+  but the process is still alive, continue waiting — this is NOT a failure state.
 - `reports/critic_was_here.txt` exists (proves the sub-agent ran, not inline work)
 - `reports/critic_review.json` exists with a `status` field
 
-If this step fails: write a minimal `reports/critic_review.json` with
-`status="accepted"` and a warning note. Always continue to
-`submission_writer` — a missing critic review never blocks submission.
+If the process has exited AND `reports/critic_was_here.txt` is still absent (genuine
+failure): write a minimal `reports/critic_review.json` with `status="accepted"` and a
+warning note. Always continue to `submission_writer` — a missing critic review never
+blocks submission.
 
 ### Step 4 — submission_writer
 
@@ -264,7 +327,7 @@ fallback variants immediately.
 | `tools/run_modeler.py` | modeler | LightGBM training with problem-type-aware CV (GroupKFold, StratifiedKFold, or KFold) and Optuna hyperparameter tuning. Writes `reports/model_results.json`, `reports/predictions.csv`, `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`. |
 | `tools/validate.py` | validator | CV integrity and leakage audit. Computes purged walk-forward MAE and compares to reported CV MAE. Writes `reports/validator_review.json` (including `fold_maes`, `fold_train_sizes`); calls `tools/gap_attribution.py` internally. Run with `--repo-root PATH`. |
 | `tools/gap_attribution.py` | validator (auto) | Dataset-agnostic OOF→strict CV gap attribution. Reads `fold_maes`/`fold_train_sizes` from `validator_review.json`; classifies gap as CV_SCHEME (scheme pessimism) or REAL_DIVERGENCE; appends `gap_attribution` block to `validator_review.json`. No model training. |
-| `tools/family_ablation.py` | critic (auto) | Leave-one-family-out strict-CV ablation using `feature_families` from `features.json`. Budget-gated (skips if time insufficient). Flags families as NET-HARMFUL if `strict_mae_without + margin < strict_mae_full` where `margin = max(3*seed_std, 0.005)`. Writes `reports/family_ablation.json`. |
+| `tools/family_ablation.py` | critic (auto) | Leave-one-family-out strict-CV ablation using `feature_families` from `features.json`. Budget-gated (skips if time insufficient). Flags families as NET-HARMFUL if `strict_mae_without + margin < strict_mae_full` where `margin = max(3*seed_std, 0.005)`. Writes `reports/family_ablation.json`. **DIAGNOSTIC ONLY** — results are recorded for analysis but the critic must NOT automatically drop families or trigger a retune based on `net_harmful_families` unless the `auto_drop_harmful_families` flag is explicitly enabled (default: off). |
 | `tools/run_critic.py` | critic | 5-check quality review covering CV gap (with gap-attribution downgrade), prediction bias/variance, feature concentration, walk-forward plausibility, and prediction sanity. Invokes `family_ablation.py`. Writes `reports/critic_review.json`, `reports/critic_was_here.txt`, and optionally `reports/critic_retune_requested.json`. |
 | `tools/build_submission.py` | submission_writer | Validates predictions against `data/sample_submission.csv` and writes `submission.csv` at the repo root. Renames `predicted_target` to the actual target column name. Run with `--repo-root PATH`. |
 | `tools/generate_report.py` | report_writer | Assembles `report.pdf` from `reports/` artefacts using reportlab. Includes methodology, feature importance, prediction diagnostics, and limitations sections. |
@@ -333,6 +396,11 @@ Non-fatal. Write a minimal report directly.
 
 ## What NOT to do
 
+- **Do not re-invoke a sub-agent because its marker is absent** — absence of a marker
+  while a process is still running means the stage is in progress, not failed. See the
+  Sub-agent completion contract. The only permitted re-invocations are: (a) genuine
+  failure (process exited AND marker still absent), and (b) the critic-triggered retune
+  cycle (gated by `reports/critic_retune_requested.json`, never by a missing marker).
 - **Do not create new sub-agent definitions** (`.md` files in `.claude/agents/`) for
   tasks not already registered. If a registered sub-agent fails or is missing, implement
   its fallback logic inline using Python or bash — this is allowed and expected. What is
