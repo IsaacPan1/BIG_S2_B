@@ -30,6 +30,12 @@ import time
 import warnings
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -169,7 +175,7 @@ def run_family_ablation(
             "families":         {},
             "net_harmful_families": [],
         }
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
         print("[ablation] no valid families — writing empty result")
         return result
@@ -190,7 +196,7 @@ def run_family_ablation(
             "skipped": True, "reason": msg,
             "families": {}, "net_harmful_families": [],
         }
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
         return result
 
@@ -215,7 +221,7 @@ def run_family_ablation(
             "pilot_time_s":     float(pilot_time),
             "estimated_total_s": float(estimated_total),
         }
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
         return result
 
@@ -307,7 +313,7 @@ def run_family_ablation(
         "total_time_s":         float(time.time() - t_start),
     }
 
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
     print(

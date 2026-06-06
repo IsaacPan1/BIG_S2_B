@@ -19,8 +19,15 @@ reports/feature_engineer_was_here.txt
 """
 from __future__ import annotations
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 import numpy as np
 import pandas as pd
@@ -763,13 +770,13 @@ if time_col is None:
             "Polynomial, interaction, risk-score, and log-transform features included.",
         ],
     }
-    with open(REPORTS_DIR / "features.json", "w") as fh:
+    with open(REPORTS_DIR / "features.json", "w", encoding="utf-8") as fh:
         json.dump(features_meta, fh, indent=2)
     print("reports/features.json written")
 
     # ── Marker file ───────────────────────────────────────────────────────────
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with open(REPORTS_DIR / "feature_engineer_was_here.txt", "w") as fh:
+    with open(REPORTS_DIR / "feature_engineer_was_here.txt", "w", encoding="utf-8") as fh:
         fh.write(f"feature_engineer sub-agent executed at {ts}\n")
         fh.write(f"train shape: {list(train_feat.shape)}\n")
         fh.write(f"val shape:   {list(val_feat.shape)}\n")
@@ -1782,13 +1789,13 @@ features_meta = {
         ),
     ],
 }
-with open(REPORTS_DIR / "features.json", "w") as fh:
+with open(REPORTS_DIR / "features.json", "w", encoding="utf-8") as fh:
     json.dump(features_meta, fh, indent=2)
 print("reports/features.json written")
 
 # ── 17. Marker file ───────────────────────────────────────────────────────────
 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-with open(REPORTS_DIR / "feature_engineer_was_here.txt", "w") as fh:
+with open(REPORTS_DIR / "feature_engineer_was_here.txt", "w", encoding="utf-8") as fh:
     fh.write(f"feature_engineer sub-agent executed at {ts}\n")
     fh.write(f"train shape: {list(features_train.shape)}\n")
     fh.write(f"val shape:   {list(features_val.shape)}\n")

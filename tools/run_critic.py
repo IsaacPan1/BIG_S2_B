@@ -1,5 +1,11 @@
 import pandas as pd, numpy as np, json, os, datetime, sys, subprocess
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 # ── Threshold constants ──────────────────────────────────────────────────────
 CV_GAP_VALIDATOR_WARNING  = 0.10   # 10%  -> validator issues WARNING
 CV_GAP_VALIDATOR_CRITICAL = 0.25   # 25%  -> validator issues CRITICAL
@@ -329,9 +335,9 @@ if status == "retune_requested" and not second_cycle:
             },
         }
 
-    with open("reports/critic_retune_requested.json", "w") as f:
+    with open("reports/critic_retune_requested.json", "w", encoding="utf-8") as f:
         json.dump(retune_json, f, indent=2)
-    with open("reports/critic_retune_attempted.txt", "w") as f:
+    with open("reports/critic_retune_attempted.txt", "w", encoding="utf-8") as f:
         f.write(
             f"critic retune marker written at {datetime.datetime.now().isoformat()}\n"
             f"retune_reason: {retune_reason}\n"
@@ -377,9 +383,9 @@ if issue is not None:
     review["retune_issue"]            = issue
     review["retune_suggested_change"] = suggested
 
-with open("reports/critic_review.json", "w") as f:
+with open("reports/critic_review.json", "w", encoding="utf-8") as f:
     json.dump(review, f, indent=2)
-with open("reports/critic_was_here.txt", "w") as f:
+with open("reports/critic_was_here.txt", "w", encoding="utf-8") as f:
     f.write(f"critic sub-agent executed at {datetime.datetime.now().isoformat()}\n")
 print(f"Written reports/critic_review.json with status={status}")
 print("Written reports/critic_was_here.txt")

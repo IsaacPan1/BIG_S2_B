@@ -15,8 +15,15 @@ import pandas as pd
 import numpy as np
 import json
 import os
-from datetime import datetime
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 BASE    = Path(__file__).resolve().parent.parent
 DATA    = BASE / "data"
@@ -265,13 +272,13 @@ features_meta = {
     ]
 }
 
-with open(REPORTS / "features.json", "w") as fh:
+with open(REPORTS / "features.json", "w", encoding="utf-8") as fh:
     json.dump(features_meta, fh, indent=2)
 print("  Saved reports/features.json")
 
 # ── 15. Marker file ───────────────────────────────────────────────────────────
-ts = datetime.utcnow().isoformat()
-with open(REPORTS / "feature_engineer_was_here.txt", "w") as fh:
+ts = datetime.now(timezone.utc).isoformat()
+with open(REPORTS / "feature_engineer_was_here.txt", "w", encoding="utf-8") as fh:
     fh.write(f"feature_engineer sub-agent executed at {ts}\n")
     fh.write(f"train shape: {list(features_train.shape)}\n")
     fh.write(f"val shape:   {list(features_val.shape)}\n")

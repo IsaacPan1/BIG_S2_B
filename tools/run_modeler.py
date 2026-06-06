@@ -5,10 +5,17 @@ Panel forecasting with log1p target transform, walk-forward CV, Optuna tuning.
 import pandas as pd
 import numpy as np
 import json
+import sys
 import time
 import warnings
 import os
 warnings.filterwarnings('ignore')
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 start_time = time.time()
 pipeline_start_time = start_time
@@ -1043,13 +1050,13 @@ results = {
     "postprocessing": _postprocessing,
 }
 
-with open(os.path.join(REPO_ROOT, "reports", "model_results.json"), "w") as f:
+with open(os.path.join(REPO_ROOT, "reports", "model_results.json"), "w", encoding="utf-8") as f:
     json.dump(results, f, indent=2)
 print("Written reports/model_results.json")
 
 # ── Step 10: Marker file ──────────────────────────────────────────────────────
 import datetime
-with open(os.path.join(REPO_ROOT, "reports", "modeler_was_here.txt"), "w") as f:
+with open(os.path.join(REPO_ROOT, "reports", "modeler_was_here.txt"), "w", encoding="utf-8") as f:
     f.write(f"modeler sub-agent executed at {datetime.datetime.now().isoformat()}\n")
 print("Written reports/modeler_was_here.txt")
 print(f"\nTotal training time: {training_time}s ({training_time/60:.1f} min)")

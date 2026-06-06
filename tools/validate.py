@@ -26,6 +26,12 @@ import sys
 import warnings
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -504,7 +510,7 @@ def main() -> None:
         "notes":             notes,
     }
     out_path = reports / "validator_review.json"
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(review, f, indent=2)
     print(f"\nWritten {out_path}")
 
@@ -523,14 +529,15 @@ def main() -> None:
         print(f"[gap_attribution] non-fatal: {_gap_e}", file=sys.stderr)
 
     # ── Marker file ──────────────────────────────────────────────────
-    ts = datetime.datetime.utcnow().isoformat() + "Z"
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
     marker = reports / "validator_was_here.txt"
     marker.write_text(
         f"validator sub-agent executed at {ts}\n"
         f"verdict: {verdict}\n"
         f"strict_cv_mae: {strict_cv_mae:.4f}\n"
         f"reported_cv_mae: {reported_cv_mae:.4f}\n"
-        f"cv_gap_pct: {cv_gap_pct:.4f}\n"
+        f"cv_gap_pct: {cv_gap_pct:.4f}\n",
+        encoding="utf-8",
     )
     print(f"Written {marker}")
 

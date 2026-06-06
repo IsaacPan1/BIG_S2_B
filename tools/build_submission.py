@@ -14,6 +14,12 @@ import json
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 
@@ -357,7 +363,7 @@ def main() -> None:
             "warnings":                     warnings_list,
             "round_trip_audit":             audit_result,
         }
-        with open(REPORTS_DIR / "submission_summary.json", "w") as f:
+        with open(REPORTS_DIR / "submission_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         raise  # let the submission_writer agent handle fallback
 
@@ -382,12 +388,12 @@ def main() -> None:
         "round_trip_audit":             audit_result,
     }
     summary_path = REPORTS_DIR / "submission_summary.json"
-    with open(summary_path, "w") as f:
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print("Written submission_summary.json")
 
     marker_path = REPORTS_DIR / "submission_writer_was_here.txt"
-    with open(marker_path, "w") as f:
+    with open(marker_path, "w", encoding="utf-8") as f:
         f.write("submission_writer completed successfully\n")
         f.write("build_submission.py invoked: YES\n")
         f.write(f"submission.csv written to: {sub_path}\n")

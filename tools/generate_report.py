@@ -1,9 +1,16 @@
 """Generate report.pdf — user-friendly pipeline results report."""
 import json
 import os
+import sys
 import textwrap
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 try:
     from reportlab.lib.pagesizes import A4
@@ -1022,7 +1029,7 @@ else:
 if missing_inputs:
     print(f"Missing inputs: {missing_inputs}")
 if _pdf_written:
-    ts_iso = datetime.utcnow().isoformat() + "Z"
+    ts_iso = datetime.now(timezone.utc).isoformat()
     with open(REPORTS / "report_writer_was_here.txt", "w", encoding="utf-8") as fh:
         fh.write(f"report_writer sub-agent executed at {ts_iso}\n")
     print("Marker: reports/report_writer_was_here.txt")

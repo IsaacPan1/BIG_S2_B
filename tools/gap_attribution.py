@@ -24,7 +24,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+def _safe_print(text: str) -> None:
+    """Print text, falling back to ASCII-safe output on console encoding errors."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "replace").decode("ascii"))
+
 
 # ── Classification thresholds ─────────────────────────────────────────────────
 # Latest fold MAE must be within this fraction of reported MAE to call CV_SCHEME
@@ -73,9 +89,9 @@ def run_gap_attribution(repo_root: Path) -> dict:
             ),
         }
         review["gap_attribution"] = attribution
-        with open(review_path, "w") as f:
+        with open(review_path, "w", encoding="utf-8") as f:
             json.dump(review, f, indent=2)
-        print("[gap_attribution] UNKNOWN — missing or mismatched fold data")
+        _safe_print("[gap_attribution] UNKNOWN — missing or mismatched fold data")
         return attribution
 
     # ── Sort folds by train size ascending (smallest history → largest) ───────
@@ -137,13 +153,13 @@ def run_gap_attribution(repo_root: Path) -> dict:
     }
 
     review["gap_attribution"] = attribution
-    with open(review_path, "w") as f:
+    with open(review_path, "w", encoding="utf-8") as f:
         json.dump(review, f, indent=2)
 
     print(f"[gap_attribution] classification={classification}")
     print(f"  latest_fold_mae={latest_fold_mae:.4f}  reported_mae={reported_mae:.4f}")
     print(f"  pct_explained_by_scheme={pct_explained*100:.1f}%  monotone_score={mono_score:.2f}")
-    print(f"  {note}")
+    _safe_print(f"  {note}")
 
     return attribution
 

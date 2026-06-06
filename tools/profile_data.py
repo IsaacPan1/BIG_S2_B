@@ -21,6 +21,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 
