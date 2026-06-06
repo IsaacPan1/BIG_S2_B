@@ -793,6 +793,52 @@ if time_col is None:
 
 # ── PANEL PATH (time_col present) — original logic continues below ─────────────
 
+# === RAIL 1: Memory / feature-count gate ======================================
+# Thresholds for the EXPANSIVE panel feature families that scale as
+# O(n_rows × n_covariates × n_windows). If the projected cell count or column
+# count exceeds a threshold, those families are SKIPPED and only BASE families
+# are computed. On normally-sized datasets both estimates are well below the
+# thresholds — this gate is a complete NO-OP on datasets that currently work.
+FEATURE_BUDGET_CELL_THRESHOLD: int = 2_000_000_000   # 2 billion projected cells
+FEATURE_BUDGET_COL_THRESHOLD:  int = 1_000           # projected extra columns
+
+# Families that are gated (skipped when budget exceeded):
+_EXPANSIVE_FAMILIES = [
+    "cov_rolls_ext",   # 8b — extended covariate rolling windows
+    "cov_ratios",      # 8c — covariate ratios
+    "cov_group_stats", # 8d — group-level covariate aggregates
+    "slope_features",  # 8e — slope features per group
+    "cov_entropy",     # 8g — entropy features for covariate prefix groups
+]
+# ==============================================================================
+
+# === RAIL 3: Granularity ambiguity detection thresholds =======================
+# Used by _detect_granularity() to flag irregular / boundary-straddling cadences.
+# When fired, cycle-specific sin/cos seasonal features are replaced with simple
+# relative-time features that carry no cycle assumption.
+# On cleanly-sampled datasets all thresholds are comfortably satisfied — NO-OP.
+#
+# Granularity cutoff boundaries (hours):
+#   < 2h  → hourly  |  2–48h  → daily  |  48–216h  → weekly  |  ≥ 216h → monthly
+#
+# GRANULARITY_BOUNDARY_MARGIN_HOURS:
+#   If the median inter-obs step is within this many hours of a cutoff boundary
+#   AND the cadence is irregular, the classification is considered ambiguous.
+#   12h keeps overdose weekly (168h, 48h from boundary) cleanly non-ambiguous.
+GRANULARITY_BOUNDARY_MARGIN_HOURS: float = 12.0
+
+# GRANULARITY_REGULARITY_MIN_MODAL_FRACTION:
+#   Minimum fraction of inter-obs gaps that must equal the modal gap for the
+#   cadence to be "regular".  Below this → "irregular".
+#   0.60 is permissive: business-day data (~4/5 equal weekday gaps) scores ≈ 0.80 ✓.
+GRANULARITY_REGULARITY_MIN_MODAL_FRACTION: float = 0.60
+
+# GRANULARITY_REGULARITY_MAX_CV:
+#   Maximum coefficient of variation (std / mean) of inter-obs gaps.
+#   Above this → "irregular".
+GRANULARITY_REGULARITY_MAX_CV: float = 0.50
+# ==============================================================================
+
 # ── Convert datetime/opaque time_col to numeric ordinal BEFORE sorting ────────
 _time_col_numeric = f"{time_col}_ord"
 _is_datetime_time = False
@@ -835,9 +881,62 @@ val   = val.sort_values(group_cols + [_tc]).reset_index(drop=True)
 print(f"Train: {train.shape}   Val: {val.shape}")
 
 # ── Detect time granularity ────────────────────────────────────────────────────
-def _detect_granularity() -> str:
-    """Return 'hourly', 'daily', 'weekly', or 'monthly' from median inter-obs step."""
-    # When a codebook maps opaque IDs → real dates, use actual dates for detection
+def _detect_granularity() -> tuple:
+    """Return (granularity_label, meta_dict).
+
+    granularity_label: 'hourly', 'daily', 'weekly', 'monthly', or 'agnostic'
+      'agnostic' is returned when the cadence is both irregular AND near a cutoff
+      boundary — skipping cycle-specific seasonal features is safer than guessing.
+
+    meta_dict keys (always present):
+      detected, median_step_hours, modal_gap_fraction, step_cv,
+      near_boundary, irregular, ambiguous, fallback_used, reason
+    """
+    _meta: dict = {
+        "detected":            None,
+        "median_step_hours":   None,
+        "modal_gap_fraction":  None,
+        "step_cv":             None,
+        "near_boundary":       False,
+        "irregular":           False,
+        "ambiguous":           False,
+        "fallback_used":       False,
+        "reason":              "normal",
+    }
+
+    # Helper: regularity statistics from a numeric-steps Series.
+    # Returns (modal_gap_fraction, cv); both 1.0 / 0.0 on any error so the
+    # gate is a no-op when the computation fails.
+    def _regularity_stats(steps_s: "pd.Series") -> tuple:
+        try:
+            if len(steps_s) < 2:
+                return 1.0, 0.0
+            counts      = steps_s.value_counts()
+            modal_frac  = float(counts.iloc[0]) / len(steps_s)
+            _s_std      = float(steps_s.std())
+            _s_mean     = float(steps_s.mean())
+            cv          = _s_std / _s_mean if _s_mean > 1e-9 else 0.0
+            return modal_frac, cv
+        except Exception:
+            return 1.0, 0.0   # assume regular on error → gate stays closed
+
+    # Helper: is `med_h` within BOUNDARY_MARGIN of any cutoff boundary?
+    _GRAN_CUTOFFS_H = [2.0, 48.0, 216.0]   # h/d, d/w, w/m boundaries
+
+    def _near_boundary(med_h: float) -> bool:
+        return any(
+            abs(med_h - cut) < GRANULARITY_BOUNDARY_MARGIN_HOURS
+            for cut in _GRAN_CUTOFFS_H
+        )
+
+    # Helper: map median hours to a label.
+    def _classify_h(med_h: float) -> str:
+        if med_h < 2:    return "hourly"
+        if med_h < 48:   return "daily"
+        if med_h < 216:  return "weekly"
+        return "monthly"
+
+    # ── Codebook path: opaque string time → real dates ─────────────────────────
     _cb_info = profile.get("time_codebook", {})
     if _cb_info.get("available") and not _is_datetime_time:
         try:
@@ -853,33 +952,124 @@ def _detect_granularity() -> str:
                 _unique_ids.astype(str).map(_id_to_date), errors="coerce"
             ).dropna()
             if len(_resolved) >= 2:
-                _sorted = _resolved.sort_values()
-                _diffs  = _sorted.diff().dropna().abs()
-                med_hours = float(_diffs.median().total_seconds()) / 3600.0
-                if med_hours < 2:    return "hourly"
-                if med_hours < 48:   return "daily"
-                if med_hours < 216:  return "weekly"
-                return "monthly"
+                _sorted    = _resolved.sort_values()
+                _diffs_td  = _sorted.diff().dropna().abs()
+                _diffs_h   = _diffs_td.dt.total_seconds() / 3600.0
+                med_h      = float(_diffs_h.median())
+                mfrac, cv  = _regularity_stats(_diffs_h)
+                _nb        = _near_boundary(med_h)
+                _irr       = (mfrac < GRANULARITY_REGULARITY_MIN_MODAL_FRACTION
+                              or cv > GRANULARITY_REGULARITY_MAX_CV)
+                _amb       = _irr and _nb
+                _label     = _classify_h(med_h)
+
+                _meta.update({
+                    "detected":           _label,
+                    "median_step_hours":  round(med_h, 2),
+                    "modal_gap_fraction": round(mfrac, 4),
+                    "step_cv":            round(cv, 4),
+                    "near_boundary":      _nb,
+                    "irregular":          _irr,
+                    "ambiguous":          _amb,
+                })
+
+                if _amb:
+                    _meta["fallback_used"] = True
+                    _meta["reason"] = (
+                        f"ambiguous_cadence: median={med_h:.1f}h "
+                        f"modal_frac={mfrac:.2f} cv={cv:.2f} near_boundary={_nb} "
+                        f"→ using relative-time fallback"
+                    )
+                    return "agnostic", _meta
+
+                _meta["reason"] = (
+                    f"codebook_path: regular cadence median={med_h:.1f}h "
+                    f"modal_frac={mfrac:.2f} cv={cv:.2f}"
+                )
+                return _label, _meta
         except Exception as _e:
             print(f"Codebook granularity detection failed ({_e}); falling back to raw column")
 
-    ref = train.sort_values(group_cols + [_tc]) if group_cols else train.sort_values(_tc)
+    # ── Raw steps path ─────────────────────────────────────────────────────────
+    _ref = train.sort_values(group_cols + [_tc]) if group_cols else train.sort_values(_tc)
     if group_cols:
-        steps = ref.groupby(group_cols)[_tc].diff().dropna().abs()
+        _steps = _ref.groupby(group_cols)[_tc].diff().dropna().abs()
     else:
-        steps = ref[_tc].diff().dropna().abs()
-    med = float(steps.median()) if len(steps) > 0 else 1.0
-    if _is_datetime_time:
-        # _tc units are hours since epoch
-        if med < 2:    return "hourly"
-        if med < 48:   return "daily"
-        if med < 216:  return "weekly"
-        return "monthly"
-    # Integer time column (e.g. retail week numbers) — assume weekly cadence
-    return "weekly"
+        _steps = _ref[_tc].diff().dropna().abs()
+    _med = float(_steps.median()) if len(_steps) > 0 else 1.0
 
-_granularity = _detect_granularity()
+    if _is_datetime_time:
+        # _tc is in hours since epoch
+        _mfrac, _cv = _regularity_stats(_steps)
+        _nb          = _near_boundary(_med)
+        _irr         = (_mfrac < GRANULARITY_REGULARITY_MIN_MODAL_FRACTION
+                        or _cv > GRANULARITY_REGULARITY_MAX_CV)
+        _amb         = _irr and _nb
+        _label       = _classify_h(_med)
+
+        _meta.update({
+            "detected":           _label,
+            "median_step_hours":  round(_med, 2),
+            "modal_gap_fraction": round(_mfrac, 4),
+            "step_cv":            round(_cv, 4),
+            "near_boundary":      _nb,
+            "irregular":          _irr,
+            "ambiguous":          _amb,
+        })
+
+        if _amb:
+            _meta["fallback_used"] = True
+            _meta["reason"] = (
+                f"ambiguous_cadence: median={_med:.1f}h "
+                f"modal_frac={_mfrac:.2f} cv={_cv:.2f} near_boundary={_nb} "
+                f"→ using relative-time fallback"
+            )
+            return "agnostic", _meta
+
+        _meta["reason"] = (
+            f"datetime_path: regular cadence median={_med:.1f}h "
+            f"modal_frac={_mfrac:.2f} cv={_cv:.2f}"
+        )
+        return _label, _meta
+
+    # ── Integer time column — no boundary ambiguity (weekly by convention) ──────
+    # Steps are opaque ordinal units; boundary check in hours is not meaningful.
+    # Assume "weekly" cadence as before; record regularity stats for observability.
+    _mfrac, _cv = _regularity_stats(_steps)
+    _meta.update({
+        "detected":           "weekly",
+        "median_step_hours":  None,   # unit is not hours
+        "modal_gap_fraction": round(_mfrac, 4),
+        "step_cv":            round(_cv, 4),
+        "near_boundary":      False,
+        "irregular":          False,
+        "ambiguous":          False,
+        "reason":             (
+            f"integer_time_column: assumed weekly (no boundary check); "
+            f"modal_frac={_mfrac:.2f} cv={_cv:.2f}"
+        ),
+    })
+    return "weekly", _meta
+
+_granularity, _granularity_meta = _detect_granularity()
+_gran_fallback = _granularity_meta.get("fallback_used", False)
+
 print(f"Detected time granularity: {_granularity}")
+print(
+    f"RAIL-3 time_granularity: "
+    f"detected={_granularity_meta['detected']}  "
+    f"median_step_h={_granularity_meta['median_step_hours']}  "
+    f"modal_frac={_granularity_meta['modal_gap_fraction']}  "
+    f"cv={_granularity_meta['step_cv']}  "
+    f"near_boundary={_granularity_meta['near_boundary']}  "
+    f"irregular={_granularity_meta['irregular']}  "
+    f"fallback_used={_gran_fallback}"
+)
+if _gran_fallback:
+    print(
+        f"WARNING RAIL-3: Ambiguous cadence — substituting relative-time features "
+        f"for cycle-specific sin/cos.  Reason: {_granularity_meta['reason']}"
+    )
 
 train_time_max = int(train[_tc].max())
 min_periods    = int(train.groupby(group_cols)[_tc].count().min()) if group_cols else len(train)
@@ -935,24 +1125,37 @@ for g in group_cols:
 _reg("group_encodings", [f"{g}_enc" for g in group_cols])
 
 # ── 2. Trig seasonality (annual cycle) ───────────────────────────────────────
-# Use numeric ordinal for arithmetic; for datetime columns use 24-hour modulus
-# so PERIOD_H = 52*24 = 1248 hours covers an approximate annual cycle unit.
-if _is_datetime_time:
-    t = full[_tc]
-    PERIOD_H = PERIOD * 24  # hours per "annual unit" (52 * 24 = 1248)
-    full[f"{time_col}_sin"]  = np.sin(2 * np.pi * (t % PERIOD_H) / PERIOD_H)
-    full[f"{time_col}_cos"]  = np.cos(2 * np.pi * (t % PERIOD_H) / PERIOD_H)
-    full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
-    full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
+# RAIL 3 gate: skip cycle sin/cos when granularity is ambiguous — a wrong period
+# assumption corrupts features silently.  Instead, add a granularity-agnostic
+# relative-time position feature.  On clean data _gran_fallback is always False.
+if not _gran_fallback:
+    # Use numeric ordinal for arithmetic; for datetime columns use 24-hour modulus
+    # so PERIOD_H = 52*24 = 1248 hours covers an approximate annual cycle unit.
+    if _is_datetime_time:
+        t = full[_tc]
+        PERIOD_H = PERIOD * 24  # hours per "annual unit" (52 * 24 = 1248)
+        full[f"{time_col}_sin"]  = np.sin(2 * np.pi * (t % PERIOD_H) / PERIOD_H)
+        full[f"{time_col}_cos"]  = np.cos(2 * np.pi * (t % PERIOD_H) / PERIOD_H)
+        full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
+        full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD_H) / PERIOD_H)
+    else:
+        # For opaque string IDs _tc is the numeric ordinal; for true integer time_col use it directly.
+        t = full[_tc]
+        full[f"{time_col}_sin"]  = np.sin(2 * np.pi * (t % PERIOD) / PERIOD)
+        full[f"{time_col}_cos"]  = np.cos(2 * np.pi * (t % PERIOD) / PERIOD)
+        full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD) / PERIOD)
+        full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD) / PERIOD)
+    _reg("seasonality", [f"{time_col}_sin", f"{time_col}_cos",
+                         f"{time_col}_sin2", f"{time_col}_cos2"])
 else:
-    # For opaque string IDs _tc is the numeric ordinal; for true integer time_col use it directly.
-    t = full[_tc]
-    full[f"{time_col}_sin"]  = np.sin(2 * np.pi * (t % PERIOD) / PERIOD)
-    full[f"{time_col}_cos"]  = np.cos(2 * np.pi * (t % PERIOD) / PERIOD)
-    full[f"{time_col}_sin2"] = np.sin(4 * np.pi * (t % PERIOD) / PERIOD)
-    full[f"{time_col}_cos2"] = np.cos(4 * np.pi * (t % PERIOD) / PERIOD)
-_reg("seasonality", [f"{time_col}_sin", f"{time_col}_cos",
-                     f"{time_col}_sin2", f"{time_col}_cos2"])
+    # Granularity ambiguous — replace cycle features with a simple relative
+    # time position in [0, 1] that requires no period assumption.
+    _t_min_fb  = float(full[_tc].min())
+    _t_max_fb  = float(full[_tc].max())
+    _t_rng_fb  = max(_t_max_fb - _t_min_fb, 1.0)
+    full[f"{time_col}_rel_pos"] = (full[_tc] - _t_min_fb) / _t_rng_fb
+    _reg("relative_time", [f"{time_col}_rel_pos"])
+    print(f"RAIL-3 fallback: added {time_col}_rel_pos instead of cycle sin/cos features")
 
 # ── 2b. Granularity-specific seasonality (adds to existing, does not replace) ──
 if _granularity == "hourly" and _is_datetime_time:
@@ -1036,19 +1239,31 @@ elif _granularity == "monthly" and _is_datetime_time:
     print("Added monthly seasonality: month_sin/cos + quarter")
 
 # ── 3. Time-derived features (week_of_year, quarter, month, linear trend) ─────
+# RAIL 3 gate: when granularity is ambiguous, the cycle modulo (_of_cycle,
+# _quarter, _month) would embed the wrong period — skip those and keep only the
+# linear trend which makes no cycle assumption.
 t_num = full[_tc]   # always numeric
-if _is_datetime_time:
-    PERIOD_H = PERIOD * 24
-    full[f"{time_col}_of_cycle"] = t_num % PERIOD_H
-    full[f"{time_col}_quarter"]  = (t_num % PERIOD_H) // (13 * 24)
-    full[f"{time_col}_month"]    = (t_num % PERIOD_H) // (4 * 24)
+if not _gran_fallback:
+    if _is_datetime_time:
+        PERIOD_H = PERIOD * 24
+        full[f"{time_col}_of_cycle"] = t_num % PERIOD_H
+        full[f"{time_col}_quarter"]  = (t_num % PERIOD_H) // (13 * 24)
+        full[f"{time_col}_month"]    = (t_num % PERIOD_H) // (4 * 24)
+    else:
+        full[f"{time_col}_of_cycle"] = t_num % PERIOD
+        full[f"{time_col}_quarter"]  = (t_num % PERIOD) // 13
+        full[f"{time_col}_month"]    = (t_num % PERIOD) // 4
+    full[f"{time_col}_trend"] = t_num                    # global linear trend
+    _reg("time_derived", [f"{time_col}_of_cycle", f"{time_col}_quarter",
+                          f"{time_col}_month",    f"{time_col}_trend"])
 else:
-    full[f"{time_col}_of_cycle"] = t_num % PERIOD
-    full[f"{time_col}_quarter"]  = (t_num % PERIOD) // 13
-    full[f"{time_col}_month"]    = (t_num % PERIOD) // 4
-full[f"{time_col}_trend"] = t_num                    # global linear trend
-_reg("time_derived", [f"{time_col}_of_cycle", f"{time_col}_quarter",
-                      f"{time_col}_month",    f"{time_col}_trend"])
+    # Skip cycle-modulo features; keep the cycle-agnostic linear trend.
+    full[f"{time_col}_trend"] = t_num
+    _reg("time_derived", [f"{time_col}_trend"])
+    print(
+        f"RAIL-3 fallback: skipped {time_col}_of_cycle/_quarter/_month "
+        f"(cycle period unknown — ambiguous cadence)"
+    )
 
 # ── 4. Group baselines (train-only, no leakage) ───────────────────────────────
 for g in group_cols:
@@ -1109,8 +1324,96 @@ _reg("cov_lags",   [f"{cov}_lag1"       for cov in numeric_cols])
 _reg("cov_deltas", [f"{cov}_change"     for cov in numeric_cols])
 _reg("cov_rolls",  [f"{cov}_roll_mean4" for cov in numeric_cols])
 
+# ── RAIL 1: feature-budget gate — computed once, before all expansive families ─
+_feature_budget: dict = {
+    "estimated_cells":     None,
+    "estimated_extra_cols": None,
+    "threshold_cells":     FEATURE_BUDGET_CELL_THRESHOLD,
+    "threshold_cols":      FEATURE_BUDGET_COL_THRESHOLD,
+    "downgraded":          False,
+    "skipped_families":    [],
+    "skip_reason":         None,
+    "available_memory_gb": None,
+}
+_skip_expansive = False  # when True all expansive families below are no-ops
+
+try:
+    _n_rows_est = len(full)
+    _n_cov_est  = len(numeric_cols)
+    _n_grp_est  = len(group_cols)
+
+    # Extended rolling: up to 4 cols/cov (2 mean windows [8,13] + 2 std windows [4,8])
+    _n_ext_mean = len([w for w in [8, 13] if min_periods >= w + 1])
+    _n_ext_std  = len([w for w in [4, 8]  if min_periods >= w + 1])
+    _proj_ext   = _n_cov_est * (_n_ext_mean + _n_ext_std)
+
+    # Ratios: O(n_cov^2), capped at 20
+    _proj_ratio = min(20, max(0, _n_cov_est * (_n_cov_est - 1) // 2))
+
+    # Group-level covariate aggregates: 3 stats × n_cov × n_group_cols
+    _proj_grp   = _n_cov_est * _n_grp_est * 3
+
+    # Slope features: at most one col per window in [6, 12]
+    _proj_slope = len([w for w in [6, 12] if min_periods >= w])
+
+    # Entropy features: at most n_cov cols (one per distinct prefix group)
+    _proj_ent   = _n_cov_est
+
+    _proj_extra_cols = _proj_ext + _proj_ratio + _proj_grp + _proj_slope + _proj_ent
+    _proj_cells      = _n_rows_est * _proj_extra_cols
+
+    _feature_budget["estimated_extra_cols"] = int(_proj_extra_cols)
+    _feature_budget["estimated_cells"]      = int(_proj_cells)
+
+    # Optional lightweight RAM check (fails gracefully when psutil absent)
+    _avail_gb: float | None = None
+    try:
+        import psutil as _psutil_fb
+        _avail_gb = _psutil_fb.virtual_memory().available / (1024 ** 3)
+        _feature_budget["available_memory_gb"] = round(_avail_gb, 2)
+    except ImportError:
+        pass
+
+    _over_col  = _proj_extra_cols > FEATURE_BUDGET_COL_THRESHOLD
+    _over_cell = _proj_cells      > FEATURE_BUDGET_CELL_THRESHOLD
+    _low_ram   = _avail_gb is not None and _avail_gb < 2.0
+
+    print(
+        f"RAIL-1 budget: n_rows={_n_rows_est:,}  n_cov={_n_cov_est}  "
+        f"n_grp={_n_grp_est}  proj_extra_cols={_proj_extra_cols}  "
+        f"proj_cells={_proj_cells:,}"
+        + (f"  avail_RAM={_avail_gb:.1f}GB" if _avail_gb is not None else "")
+    )
+
+    if _over_col or _over_cell or _low_ram:
+        _skip_expansive = True
+        _feature_budget["downgraded"]       = True
+        _feature_budget["skipped_families"] = list(_EXPANSIVE_FAMILIES)
+        _reason_parts: list[str] = []
+        if _over_col:
+            _reason_parts.append(
+                f"proj_extra_cols={_proj_extra_cols} > {FEATURE_BUDGET_COL_THRESHOLD}")
+        if _over_cell:
+            _reason_parts.append(
+                f"proj_cells={_proj_cells:,} > {FEATURE_BUDGET_CELL_THRESHOLD:,}")
+        if _low_ram:
+            _reason_parts.append(f"avail_RAM={_avail_gb:.1f}GB < 2.0GB")
+        _feature_budget["skip_reason"] = "; ".join(_reason_parts)
+        print(
+            f"RAIL-1 TRIGGERED — skipping expansive families: {_EXPANSIVE_FAMILIES}\n"
+            f"  Reason: {_feature_budget['skip_reason']}"
+        )
+    else:
+        print("RAIL-1 budget OK — all families will be computed (downgraded=False)")
+
+except Exception as _budget_exc:
+    # If the gate itself fails, proceed normally — never crash from a safety rail
+    print(f"RAIL-1 budget check failed ({_budget_exc}) — proceeding with all families")
+    _feature_budget["skip_reason"] = f"gate_error: {str(_budget_exc)[:200]}"
+    _skip_expansive = False
+
 # ── 8b. Extended covariate rolling windows ────────────────────────────────────
-if numeric_cols and group_cols:
+if numeric_cols and group_cols and not _skip_expansive:
     _ext_mean_wins = [w for w in [8, 13] if min_periods >= w + 1]
     _ext_std_wins  = [w for w in [4, 8]  if min_periods >= w + 1]
     _new_roll_cols: list[str] = []
@@ -1131,7 +1434,7 @@ if numeric_cols and group_cols:
         print(f"Extended covariate rolling features: {len(_new_roll_cols)}")
 
 # ── 8c. Covariate ratios ──────────────────────────────────────────────────────
-if len(numeric_cols) >= 2:
+if len(numeric_cols) >= 2 and not _skip_expansive:
     _prefix_groups: dict[str, list] = {}
     for _c in numeric_cols:
         _prefix_groups.setdefault(_c.split("_")[0], []).append(_c)
@@ -1172,7 +1475,7 @@ if len(numeric_cols) >= 2:
               f"pairs: {_ratio_dedup[:3]}{'...' if len(_ratio_dedup) > 3 else ''}")
 
 # ── 8d. Group-level covariate aggregates ─────────────────────────────────────
-if numeric_cols and group_cols:
+if numeric_cols and group_cols and not _skip_expansive:
     _grp_cov_feat_cols: list[str] = []
     _recent_cut = train_time_max - 3
     _train_rec4 = train[train[_tc] >= _recent_cut]
@@ -1192,7 +1495,7 @@ if numeric_cols and group_cols:
     print(f"Group-level covariate aggregate features: {len(_grp_cov_feat_cols)}")
 
 # ── 8e. Slope features per group ─────────────────────────────────────────────
-if numeric_cols and group_cols and min_periods >= 4:
+if numeric_cols and group_cols and min_periods >= 4 and not _skip_expansive:
     _slope_feat_cols: list[str] = []
     for _sw in [w for w in [6, 12] if min_periods >= w]:
         _slope_col = f"target_slope_w{_sw}"
@@ -1237,7 +1540,7 @@ if numeric_cols:
     print(f"Covariate minus-mean features: {len(_centered_cols)}")
 
 # ── 8g. Entropy features for covariate prefix groups ─────────────────────────
-if len(numeric_cols) >= 2:
+if len(numeric_cols) >= 2 and not _skip_expansive:
     _ent_groups: dict[str, list] = {}
     for _ec in numeric_cols:
         _ent_groups.setdefault(_ec.split("_")[0], []).append(_ec)
@@ -1767,6 +2070,8 @@ features_meta = {
     "val_shape":              list(features_val.shape),
     "adversarial_validation": _av_meta,
     "image_embedding_features": _img_emb_meta,
+    "feature_budget": _feature_budget,
+    "time_granularity": _granularity_meta,
     "notes": [
         "Group baselines computed from train rows only — no leakage.",
         "Rolling stats use shift(1) before rolling to prevent target leakage.",

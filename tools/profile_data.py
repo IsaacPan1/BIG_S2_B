@@ -48,6 +48,13 @@ CODEBOOK_CANDIDATES: tuple[str, ...] = (
     "time_codebook.json",
 )
 
+# RAIL 2: keywords used for fuzzy codebook file detection (case-insensitive).
+# A JSON file whose stem contains any of these words is treated as a candidate
+# codebook even when its exact name is not in CODEBOOK_CANDIDATES.
+_CODEBOOK_FUZZY_KEYWORDS: tuple[str, ...] = (
+    "codebook", "period", "dates", "time",
+)
+
 # ---------------------------------------------------------------------------
 # 1.  DATA_DESCRIPTION.md parsing
 # ---------------------------------------------------------------------------
@@ -267,10 +274,19 @@ def identify_files(
       4. Filename contains "val"/"test"/"eval"/"feature"  → val
       5. Description hints (unreliable; same CSV often appears in both train
          and val sections of the markdown, so only use as a tiebreaker)
+
+    RAIL 2 additions:
+      - Every assignment is logged with the reason that triggered it.
+      - Post-classification content swap check: any file assigned to val by
+        filename heuristic that actually has target with >50% non-null values is
+        moved to train (prevents silent train/val inversion on oddly-named files).
     """
     train_frames: dict[str, pd.DataFrame] = {}
     val_frames:   dict[str, pd.DataFrame] = {}
     sub_frames:   dict[str, pd.DataFrame] = {}
+
+    # RAIL 2: role log — records reason for every file assignment
+    _role_log: list[dict] = []
 
     desc_val_hints   = set(desc.get("val_file_hints",   []))
     desc_train_hints = set(desc.get("train_file_hints", []))
@@ -281,6 +297,8 @@ def identify_files(
         # 1. Explicit submission files
         if "submission" in lname or "sample" in lname:
             sub_frames[name] = df
+            _role_log.append({"file": name, "role": "submission",
+                              "reason": "filename_contains_submission_or_sample"})
             continue
 
         # 2. Contains target column with mostly non-null values → training
@@ -288,19 +306,27 @@ def identify_files(
             null_ratio = df[target_col].isna().mean()
             if null_ratio < 0.5:
                 train_frames[name] = df
+                _role_log.append({"file": name, "role": "train",
+                                  "reason": f"content:target_col_present_null_ratio={null_ratio:.2f}"})
             else:
                 sub_frames[name] = df   # all-null target = held-out submission
+                _role_log.append({"file": name, "role": "submission",
+                                  "reason": f"content:target_col_all_null_null_ratio={null_ratio:.2f}"})
             continue
 
         # 3. Filename says "train" → training (even without the target column,
         #    e.g. covariates_train.csv which will be merged with target_train.csv)
         if any(x in lname for x in ("train", "fit")):
             train_frames[name] = df
+            _role_log.append({"file": name, "role": "train",
+                              "reason": "filename_keyword:train_or_fit"})
             continue
 
         # 4. Filename says "val" / "test" / "feature" → validation
         if any(x in lname for x in ("val", "test", "eval", "feature")):
             val_frames[name] = df
+            _role_log.append({"file": name, "role": "val",
+                              "reason": "filename_keyword:val_test_eval_feature"})
             continue
 
         # 5. Use description hints only as tiebreaker for ambiguous filenames
@@ -308,10 +334,16 @@ def identify_files(
         only_in_train = name in desc_train_hints  and name not in desc_val_hints
         if only_in_val:
             val_frames[name] = df
+            _role_log.append({"file": name, "role": "val",
+                              "reason": "description_hint:val_only"})
         elif only_in_train:
             train_frames[name] = df
+            _role_log.append({"file": name, "role": "train",
+                              "reason": "description_hint:train_only"})
         else:
             train_frames[name] = df   # conservative default
+            _role_log.append({"file": name, "role": "train",
+                              "reason": "default:conservative_fallback"})
 
     # If no val frames were found, grab everything not yet classified
     if not val_frames:
@@ -320,6 +352,42 @@ def identify_files(
             if n not in train_frames and n not in sub_frames
         }
         val_frames = remaining
+        for _rn in remaining:
+            _role_log.append({"file": _rn, "role": "val",
+                              "reason": "fallback:no_val_found_using_unclassified"})
+
+    # RAIL 2: content-based swap check — catches name-based misassignments.
+    # If any file was sent to val by filename heuristic but actually contains the
+    # target column with non-null values → move it to train.
+    # Only fires when target_col is known; on standard datasets the content check
+    # (priority 2 above) would have already routed it correctly → this is a no-op.
+    if target_col:
+        _to_promote: list[str] = []
+        for _vf, _vdf in list(val_frames.items()):
+            _prev_reason = next(
+                (r["reason"] for r in _role_log if r["file"] == _vf), "")
+            # Only re-examine files that were NOT routed via content check
+            if "content:" in _prev_reason:
+                continue
+            if target_col in _vdf.columns and _vdf[target_col].notna().mean() > 0.5:
+                _to_promote.append(_vf)
+        for _vf in _to_promote:
+            _vdf = val_frames.pop(_vf)
+            train_frames[_vf] = _vdf
+            _swap_reason = (
+                "rail2_content_swap:target_nonnull_in_val_candidate"
+            )
+            _role_log.append({"file": _vf, "role": "train", "reason": _swap_reason})
+            print(
+                f"RAIL-2 FILE SWAP: {_vf!r} → train "
+                f"(target col present with non-null values; was assigned to val by "
+                f"filename heuristic — corrected by content check)"
+            )
+
+    # Print the assignment log so every decision is visible in stdout
+    print("RAIL-2 file-role assignments:")
+    for _entry in _role_log:
+        print(f"  [{_entry['role']:12s}]  {_entry['file']!r:<40s}  via {_entry['reason']}")
 
     return {
         "train_files":      list(train_frames.keys()),
@@ -327,6 +395,7 @@ def identify_files(
         "submission_files": list(sub_frames.keys()),
         "train_frames":     train_frames,
         "val_frames":       val_frames,
+        "file_role_log":    _role_log,
     }
 
 
@@ -1038,10 +1107,32 @@ def detect_time_codebook(
         return _empty
 
     try:
-        for fname in CODEBOOK_CANDIDATES:
-            candidate = data_dir / fname
-            if not candidate.exists():
+        # RAIL 2: case-insensitive + fuzzy codebook detection.
+        # Build an ordered candidate list: exact-name matches first (highest priority),
+        # then fuzzy keyword matches on any *.json in data_dir.
+        # Exact match ALWAYS wins over fuzzy — behaviour is unchanged on datasets that
+        # already use the standard naming convention.
+        _all_json_in_dir = sorted(data_dir.glob("*.json"))
+        _exact_lower_set = {c.lower() for c in CODEBOOK_CANDIDATES}
+        _seen_cb: set = set()
+        _cb_cands: list[tuple[Path, str]] = []
+
+        # Priority 1 — exact name match (case-insensitive)
+        for _jf in _all_json_in_dir:
+            if _jf.name.lower() in _exact_lower_set and _jf not in _seen_cb:
+                _cb_cands.append((_jf, f"exact_candidate:{_jf.name}"))
+                _seen_cb.add(_jf)
+
+        # Priority 2 — fuzzy keyword match (any JSON whose stem contains a keyword)
+        for _jf in _all_json_in_dir:
+            if _jf in _seen_cb:
                 continue
+            _stem_lc = _jf.stem.lower()
+            if any(_kw in _stem_lc for _kw in _CODEBOOK_FUZZY_KEYWORDS):
+                _cb_cands.append((_jf, f"fuzzy_keyword:{_jf.name}"))
+                _seen_cb.add(_jf)
+
+        for candidate, _cb_match_reason in _cb_cands:
             try:
                 raw = json.loads(candidate.read_text(encoding="utf-8"))
             except Exception:
@@ -1080,10 +1171,11 @@ def detect_time_codebook(
                 continue
 
             sample_pairs = dict(list(id_to_date.items())[:5])
+            print(f"RAIL-2 codebook: {candidate.name!r} matched via {_cb_match_reason}")
 
             return {
                 "available":           True,
-                "path":                fname,  # relative to data_dir
+                "path":                candidate.name,  # actual filename on disk
                 "n_entries":           len(raw),
                 "direction_detected":  direction,
                 "sample_mappings":     sample_pairs,
@@ -1220,12 +1312,28 @@ def main() -> None:
             **_train_frames,
             **_val_frames,
         }
+        # RAIL 2: log kaggle_subfolder role assignments (directory-based, no heuristic)
+        _kag_role_log: list[dict] = []
+        for _fn in _train_frames:
+            _kag_role_log.append({"file": _fn, "role": "train",
+                                  "reason": "kaggle_subfolder:train_directory"})
+        for _fn in _val_frames:
+            _kag_role_log.append({"file": _fn, "role": "val",
+                                  "reason": "kaggle_subfolder:val_or_test_directory"})
+        for _fn in _sub_files:
+            _kag_role_log.append({"file": _fn, "role": "submission",
+                                  "reason": "kaggle_subfolder:submission_filename"})
+        print("RAIL-2 file-role assignments (kaggle_subfolder convention):")
+        for _entry in _kag_role_log:
+            print(f"  [{_entry['role']:12s}]  {_entry['file']!r:<40s}  via {_entry['reason']}")
+
         file_split: dict[str, Any] = {
             "train_files":      list(_train_frames),
             "val_files":        list(_val_frames),
             "submission_files": _sub_files,
             "train_frames":     _train_frames,
             "val_frames":       _val_frames,
+            "file_role_log":    _kag_role_log,
         }
     else:
         # Flat convention (split or combined)
@@ -1359,6 +1467,7 @@ def main() -> None:
         "train_files":              file_split["train_files"],
         "val_files":                file_split["val_files"],
         "file_paths":               file_paths,
+        "file_role_log":            file_split.get("file_role_log", []),
         "image_data":               img_info,
         "time_codebook":            codebook_info,
         "warnings":                 warns,
