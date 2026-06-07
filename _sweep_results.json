@@ -5,9 +5,9 @@
       "profile_returncode": 0,
       "profile_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\profile_data.py:1184: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.\n  parsed = pd.to_datetime(strings, errors=\"coerce\")\n",
       "scheme_returncode": 0,
-      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:520: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
+      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:570: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
       "verify_returncode": 0,
-      "verify_stdout": "plan_id        : cvplan_29657510\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesSliding\ntime_column    : period_id\ngroup_columns  : ['jurisdiction', 'overdose_category']\nhorizon        : 7   valid_size: 7   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 31416   cols: ['period_id', 'jurisdiction', 'unemployment_rate', 'labor_force', 'temp_avg_f', 'precip_in', 'gtrends_overdose', 'gtrends_fentanyl']...\nunique period_id: 77  (rank range 0\u00e2\u20ac\u201c76)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a441  valid 42\u00e2\u20ac\u201c48  gap=1\n  fold 1: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a448  valid 49\u00e2\u20ac\u201c55  gap=1\n  fold 2: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a455  valid 56\u00e2\u20ac\u201c62  gap=1\n  fold 3: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a462  valid 63\u00e2\u20ac\u201c69  gap=1\n  fold 4: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c76  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
+      "verify_stdout": "plan_id        : cvplan_892325f2\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : period_id\ngroup_columns  : ['jurisdiction', 'overdose_category']\nhorizon        : 7   valid_size: 7   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 31416   cols: ['period_id', 'jurisdiction', 'unemployment_rate', 'labor_force', 'temp_avg_f', 'precip_in', 'gtrends_overdose', 'gtrends_fentanyl']...\nunique period_id: 77  (rank range 0\u00e2\u20ac\u201c76)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train= 17136  n_valid= 2856  train\u00e2\u2030\u00a441  valid 42\u00e2\u20ac\u201c48  gap=1\n  fold 1: n_train= 19992  n_valid= 2856  train\u00e2\u2030\u00a448  valid 49\u00e2\u20ac\u201c55  gap=1\n  fold 2: n_train= 22848  n_valid= 2856  train\u00e2\u2030\u00a455  valid 56\u00e2\u20ac\u201c62  gap=1\n  fold 3: n_train= 25704  n_valid= 2856  train\u00e2\u2030\u00a462  valid 63\u00e2\u20ac\u201c69  gap=1\n  fold 4: n_train= 28560  n_valid= 2856  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c76  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
       "verify_skipped": false,
       "profile": {
         "problem_type": "panel_forecasting",
@@ -38,9 +38,9 @@
         ],
         "horizon": 7,
         "cv": {
-          "cv_type": "TimeSeriesSliding",
+          "cv_type": "TimeSeriesExpanding",
           "n_splits": 5,
-          "window_size": 21,
+          "window_size": null,
           "gap": 0,
           "step": null,
           "min_train_size": null,
@@ -50,12 +50,13 @@
         }
       },
       "cv_selection_reason": {
-        "selected_cv_type": "TimeSeriesSliding",
+        "selected_cv_type": "TimeSeriesExpanding",
         "default_for_problem_type": "TimeSeriesExpanding",
-        "rule_branch": "sliding (drift is recency-reducible: rel=0.623 >= 0.25 AND frac_improved=0.556 >= 0.4)",
+        "rule_branch": "expanding (conservative default; sliding not affirmatively justified \u2014 insufficient features to assess drift breadth (n_features=9 < 12); frac_improved=0.556 < 0.6 (primary gate))",
         "thresholds": {
           "rel": 0.25,
-          "frac_improved": 0.4,
+          "frac_improved": 0.6,
+          "min_features_for_sliding": 12,
           "recent_periods": 14
         },
         "drift_metrics": {
@@ -73,11 +74,11 @@
         }
       },
       "fold_lines": [
-        "  fold 0: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a441  valid 42\u00e2\u20ac\u201c48  gap=1",
-        "  fold 1: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a448  valid 49\u00e2\u20ac\u201c55  gap=1",
-        "  fold 2: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a455  valid 56\u00e2\u20ac\u201c62  gap=1",
-        "  fold 3: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a462  valid 63\u00e2\u20ac\u201c69  gap=1",
-        "  fold 4: n_train=  8568  n_valid= 2856  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c76  gap=1"
+        "  fold 0: n_train= 17136  n_valid= 2856  train\u00e2\u2030\u00a441  valid 42\u00e2\u20ac\u201c48  gap=1",
+        "  fold 1: n_train= 19992  n_valid= 2856  train\u00e2\u2030\u00a448  valid 49\u00e2\u20ac\u201c55  gap=1",
+        "  fold 2: n_train= 22848  n_valid= 2856  train\u00e2\u2030\u00a455  valid 56\u00e2\u20ac\u201c62  gap=1",
+        "  fold 3: n_train= 25704  n_valid= 2856  train\u00e2\u2030\u00a462  valid 63\u00e2\u20ac\u201c69  gap=1",
+        "  fold 4: n_train= 28560  n_valid= 2856  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c76  gap=1"
       ],
       "tail_flag_silent": true,
       "verify_flags": []
@@ -87,9 +88,9 @@
       "profile_returncode": 0,
       "profile_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\profile_data.py:1334: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.\n  parsed = pd.to_datetime(pd.Series(values), errors=\"coerce\")\n",
       "scheme_returncode": 0,
-      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:520: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
+      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:570: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
       "verify_returncode": 0,
-      "verify_stdout": "plan_id        : cvplan_332924bf\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : week\ngroup_columns  : ['store_id', 'product_id']\nhorizon        : 10   valid_size: 10   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 135000   cols: ['store_id', 'product_id', 'week', 'price', 'promotion_active', 'holiday_flag', 'weather_index', 'weekly_sales']...\nunique week    : 90  (rank range 0\u00e2\u20ac\u201c89)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train= 60000  n_valid=15000  train\u00e2\u2030\u00a439  valid 40\u00e2\u20ac\u201c49  gap=1\n  fold 1: n_train= 75000  n_valid=15000  train\u00e2\u2030\u00a449  valid 50\u00e2\u20ac\u201c59  gap=1\n  fold 2: n_train= 90000  n_valid=15000  train\u00e2\u2030\u00a459  valid 60\u00e2\u20ac\u201c69  gap=1\n  fold 3: n_train=105000  n_valid=15000  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c79  gap=1\n  fold 4: n_train=120000  n_valid=15000  train\u00e2\u2030\u00a479  valid 80\u00e2\u20ac\u201c89  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
+      "verify_stdout": "plan_id        : cvplan_ad88566b\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : week\ngroup_columns  : ['store_id', 'product_id']\nhorizon        : 10   valid_size: 10   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 135000   cols: ['store_id', 'product_id', 'week', 'price', 'promotion_active', 'holiday_flag', 'weather_index', 'weekly_sales']...\nunique week    : 90  (rank range 0\u00e2\u20ac\u201c89)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train= 60000  n_valid=15000  train\u00e2\u2030\u00a439  valid 40\u00e2\u20ac\u201c49  gap=1\n  fold 1: n_train= 75000  n_valid=15000  train\u00e2\u2030\u00a449  valid 50\u00e2\u20ac\u201c59  gap=1\n  fold 2: n_train= 90000  n_valid=15000  train\u00e2\u2030\u00a459  valid 60\u00e2\u20ac\u201c69  gap=1\n  fold 3: n_train=105000  n_valid=15000  train\u00e2\u2030\u00a469  valid 70\u00e2\u20ac\u201c79  gap=1\n  fold 4: n_train=120000  n_valid=15000  train\u00e2\u2030\u00a479  valid 80\u00e2\u20ac\u201c89  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
       "verify_skipped": false,
       "profile": {
         "problem_type": "panel_forecasting",
@@ -134,10 +135,11 @@
       "cv_selection_reason": {
         "selected_cv_type": "TimeSeriesExpanding",
         "default_for_problem_type": "TimeSeriesExpanding",
-        "rule_branch": "expanding (drift not recency-reducible: rel=0.022, frac_improved=0.200; thresholds rel>=0.25, frac_improved>=0.4)",
+        "rule_branch": "expanding (conservative default; sliding not affirmatively justified \u2014 insufficient features to assess drift breadth (n_features=5 < 12); frac_improved=0.200 < 0.6 (primary gate); rel=0.022 < 0.25 (secondary gate))",
         "thresholds": {
           "rel": 0.25,
-          "frac_improved": 0.4,
+          "frac_improved": 0.6,
+          "min_features_for_sliding": 12,
           "recent_periods": 14
         },
         "drift_metrics": {
@@ -169,9 +171,9 @@
       "profile_returncode": 0,
       "profile_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\profile_data.py:1334: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.\n  parsed = pd.to_datetime(pd.Series(values), errors=\"coerce\")\n",
       "scheme_returncode": 0,
-      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:520: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
+      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:570: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
       "verify_returncode": 0,
-      "verify_stdout": "plan_id        : cvplan_9c91d5d7\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : time_step\ngroup_columns  : ['patient_id']\nhorizon        : 2   valid_size: 2   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 50   cols: ['patient_id', 'time_step', 'temperature', 'heart_rate', 'dose_sys', '__period_rank__']\nunique time_step: 10  (rank range 0\u00e2\u20ac\u201c9)\n----------------------------------------------------------------\nn_splits materialized: 4\n  fold 0: n_train=    10  n_valid=   10  train\u00e2\u2030\u00a41  valid 2\u00e2\u20ac\u201c3  gap=1\n  fold 1: n_train=    20  n_valid=   10  train\u00e2\u2030\u00a43  valid 4\u00e2\u20ac\u201c5  gap=1\n  fold 2: n_train=    30  n_valid=   10  train\u00e2\u2030\u00a45  valid 6\u00e2\u20ac\u201c7  gap=1\n  fold 3: n_train=    40  n_valid=   10  train\u00e2\u2030\u00a47  valid 8\u00e2\u20ac\u201c9  gap=1\n----------------------------------------------------------------\nFLAGS:\n  [!] only 4/5 folds materialized \u00e2\u20ac\u201d not enough unique time_step for valid_size=2\n",
+      "verify_stdout": "plan_id        : cvplan_5f47a24f\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : time_step\ngroup_columns  : ['patient_id']\nhorizon        : 2   valid_size: 2   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 50   cols: ['patient_id', 'time_step', 'temperature', 'heart_rate', 'dose_sys', '__period_rank__']\nunique time_step: 10  (rank range 0\u00e2\u20ac\u201c9)\n----------------------------------------------------------------\nn_splits materialized: 4\n  fold 0: n_train=    10  n_valid=   10  train\u00e2\u2030\u00a41  valid 2\u00e2\u20ac\u201c3  gap=1\n  fold 1: n_train=    20  n_valid=   10  train\u00e2\u2030\u00a43  valid 4\u00e2\u20ac\u201c5  gap=1\n  fold 2: n_train=    30  n_valid=   10  train\u00e2\u2030\u00a45  valid 6\u00e2\u20ac\u201c7  gap=1\n  fold 3: n_train=    40  n_valid=   10  train\u00e2\u2030\u00a47  valid 8\u00e2\u20ac\u201c9  gap=1\n----------------------------------------------------------------\nFLAGS:\n  [!] only 4/5 folds materialized \u00e2\u20ac\u201d not enough unique time_step for valid_size=2\n",
       "verify_skipped": false,
       "profile": {
         "problem_type": "panel_forecasting",
@@ -217,7 +219,8 @@
         "rule_branch": "expanding (fallback \u2014 drift diagnostic could not run: train spans 10 periods < RECENT_PERIODS=14)",
         "thresholds": {
           "rel": 0.25,
-          "frac_improved": 0.4,
+          "frac_improved": 0.6,
+          "min_features_for_sliding": 12,
           "recent_periods": 14
         },
         "drift_metrics": {
@@ -250,7 +253,7 @@
       "profile_returncode": 0,
       "profile_stderr_tail": "",
       "scheme_returncode": 0,
-      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:520: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
+      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:570: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
       "verify_returncode": 0,
       "verify_stdout": "",
       "verify_skipped": true,
@@ -294,7 +297,8 @@
         "rule_branch": "StratifiedKFold (not a time-series scheme; diagnostic not applied)",
         "thresholds": {
           "rel": 0.25,
-          "frac_improved": 0.4,
+          "frac_improved": 0.6,
+          "min_features_for_sliding": 12,
           "recent_periods": 14
         },
         "drift_metrics": {
@@ -320,9 +324,9 @@
       "profile_returncode": 0,
       "profile_stderr_tail": "",
       "scheme_returncode": 0,
-      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:520: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
+      "scheme_stderr_tail": "C:\\Users\\isaac\\OneDrive\\Desktop\\BIG_S2_B\\tools\\scheme_analysis.py:570: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).\n  \"created_at_utc\": datetime.datetime.utcnow().isoformat() + \"Z\",\n",
       "verify_returncode": 0,
-      "verify_stdout": "plan_id        : cvplan_6d037da9\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : timestamp\ngroup_columns  : ['region_id']\nhorizon        : 96   valid_size: 96   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 12480   cols: ['region_id', 'timestamp', 'hour_of_day', 'day_of_week', 'temperature', 'is_holiday', 'load_mw', '__period_rank__']\nunique timestamp: 624  (rank range 0\u00e2\u20ac\u201c623)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train=  2880  n_valid= 1920  train\u00e2\u2030\u00a4143  valid 144\u00e2\u20ac\u201c239  gap=1\n  fold 1: n_train=  4800  n_valid= 1920  train\u00e2\u2030\u00a4239  valid 240\u00e2\u20ac\u201c335  gap=1\n  fold 2: n_train=  6720  n_valid= 1920  train\u00e2\u2030\u00a4335  valid 336\u00e2\u20ac\u201c431  gap=1\n  fold 3: n_train=  8640  n_valid= 1920  train\u00e2\u2030\u00a4431  valid 432\u00e2\u20ac\u201c527  gap=1\n  fold 4: n_train= 10560  n_valid= 1920  train\u00e2\u2030\u00a4527  valid 528\u00e2\u20ac\u201c623  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
+      "verify_stdout": "plan_id        : cvplan_19a9bb8c\nproblem_type   : grouped_time_series\ncv_type        : TimeSeriesExpanding\ntime_column    : timestamp\ngroup_columns  : ['region_id']\nhorizon        : 96   valid_size: 96   gap: 0\nn_splits planned: 5\n----------------------------------------------------------------\nframe rows     : 12480   cols: ['region_id', 'timestamp', 'hour_of_day', 'day_of_week', 'temperature', 'is_holiday', 'load_mw', '__period_rank__']\nunique timestamp: 624  (rank range 0\u00e2\u20ac\u201c623)\n----------------------------------------------------------------\nn_splits materialized: 5\n  fold 0: n_train=  2880  n_valid= 1920  train\u00e2\u2030\u00a4143  valid 144\u00e2\u20ac\u201c239  gap=1\n  fold 1: n_train=  4800  n_valid= 1920  train\u00e2\u2030\u00a4239  valid 240\u00e2\u20ac\u201c335  gap=1\n  fold 2: n_train=  6720  n_valid= 1920  train\u00e2\u2030\u00a4335  valid 336\u00e2\u20ac\u201c431  gap=1\n  fold 3: n_train=  8640  n_valid= 1920  train\u00e2\u2030\u00a4431  valid 432\u00e2\u20ac\u201c527  gap=1\n  fold 4: n_train= 10560  n_valid= 1920  train\u00e2\u2030\u00a4527  valid 528\u00e2\u20ac\u201c623  gap=1\n----------------------------------------------------------------\nOK \u00e2\u20ac\u201d folds materialized cleanly, no sanity flags.\n",
       "verify_skipped": false,
       "profile": {
         "problem_type": "panel_forecasting",
@@ -364,10 +368,11 @@
       "cv_selection_reason": {
         "selected_cv_type": "TimeSeriesExpanding",
         "default_for_problem_type": "TimeSeriesExpanding",
-        "rule_branch": "expanding (drift not recency-reducible: rel=-0.514, frac_improved=0.500; thresholds rel>=0.25, frac_improved>=0.4)",
+        "rule_branch": "expanding (conservative default; sliding not affirmatively justified \u2014 insufficient features to assess drift breadth (n_features=4 < 12); frac_improved=0.500 < 0.6 (primary gate); rel=-0.514 < 0.25 (secondary gate))",
         "thresholds": {
           "rel": 0.25,
-          "frac_improved": 0.4,
+          "frac_improved": 0.6,
+          "min_features_for_sliding": 12,
           "recent_periods": 14
         },
         "drift_metrics": {
@@ -402,7 +407,7 @@
       "features_val.parquet"
     ],
     "cv_type": "TimeSeriesExpanding",
-    "rule_branch": "expanding (drift not recency-reducible: rel=-0.062, frac_improved=0.159; thresholds rel>=0.25, frac_improved>=0.4)",
+    "rule_branch": "expanding (conservative default; sliding not affirmatively justified \u2014 frac_improved=0.159 < 0.6 (primary gate); rel=-0.062 < 0.25 (secondary gate))",
     "drift_metrics": {
       "ok": true,
       "reason": null,
