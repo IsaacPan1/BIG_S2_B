@@ -61,7 +61,7 @@ try:
 except Exception:
     pass
 
-import lightgbm as lgb
+import catboost as _cb_module
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error
@@ -118,15 +118,12 @@ def _strict_cv_one_seed(
         splits = [(train_df.index[:cut], train_df.index[cut:])]
 
     params = {
-        "objective":    "regression_l1",
-        "metric":       "mae",
-        "n_estimators": n_estimators,
-        "bagging_freq": 5,
-        "reg_alpha":    0.1,
-        "reg_lambda":   0.1,
-        "verbose":      -1,
-        "n_jobs":       -1,
-        "random_state": seed,
+        "iterations":    n_estimators,
+        "loss_function": "MAE",
+        "eval_metric":   "MAE",
+        "verbose":       False,
+        "allow_writing_files": False,
+        "random_seed":   seed,
         **hparams,
     }
     fold_maes: list[float] = []
@@ -138,8 +135,8 @@ def _strict_cv_one_seed(
         y_tr    = fold_tr[target_col].values.astype(np.float32)
         X_vl    = fold_vl[feature_cols].fillna(fill).values.astype(np.float32)
         y_vl    = fold_vl[target_col].values.astype(np.float32)
-        model   = lgb.LGBMRegressor(**params)
-        model.fit(X_tr, y_tr, callbacks=[lgb.log_evaluation(-1)])
+        model   = _cb_module.CatBoostRegressor(**params)
+        model.fit(X_tr, y_tr, verbose=False)
         preds   = np.clip(model.predict(X_vl), 0, None)
         fold_maes.append(float(mean_absolute_error(y_vl, preds)))
 
@@ -294,12 +291,12 @@ def run_family_ablation(
 
     hparams = (
         model_results.get("best_params")
-        or model_results.get("families", {}).get("lightgbm", {}).get("best_params")
+        or model_results.get("families", {}).get("catboost", {}).get("best_params")
         or {}
     )
     n_estimators = int(
         model_results.get("n_estimators")
-        or model_results.get("families", {}).get("lightgbm", {}).get("n_estimators", 500)
+        or model_results.get("families", {}).get("catboost", {}).get("n_estimators", 500)
     )
 
     train_df = pd.read_parquet(data_dir / "features_train.parquet")

@@ -104,8 +104,8 @@ The profiler also emits a `problem_subtype` field with refined classification:
 | `time_series` | time detected, no groups | existing time-series path |
 | `continuous_regression` | float target or > 50 unique values | full regression ensemble |
 | `ordinal_regression` | integer target, 3–50 consecutive unique values (count/score/days) | **same as continuous_regression** (full ensemble) |
-| `binary_classification` | exactly 2 unique target values | LightGBM only (limitation) |
-| `multiclass_classification` | 3–50 unordered string or categorical-int values | LightGBM only (limitation) |
+| `binary_classification` | exactly 2 unique target values | CatBoost only |
+| `multiclass_classification` | 3–50 unordered string or categorical-int values | CatBoost only |
 
 **Ordinal detection signals** (used by `classify_problem_subtype`):
 1. Keywords in `DATA_DESCRIPTION.md` — "days", "score", "count", "rating", "level", "severity", "stage", "grade", "rank", "visit", "admission", "number" → favour `ordinal_regression`.
@@ -196,7 +196,7 @@ List any concerns found in Steps 1–4:
 - Any profiler warnings
 
 ## Recommended Approach
-One or two paragraphs. Name the specific technique (e.g. LightGBM with
+One or two paragraphs. Name the specific technique (e.g. CatBoost with
 lag features and grouped cross-validation). Name the relevant downstream
 agents or tools. Reference the forecasting horizon and any shift concerns
 the modeler should account for.

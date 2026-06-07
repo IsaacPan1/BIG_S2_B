@@ -70,44 +70,46 @@ Key: `feature_families` is a **dict** (family_name → list or dict of feature s
 ### reports/model_results.json
 ```
 {
-  "algorithm": "Lightgbm+Xgboost+Ridge ensemble",
+  "algorithm": "CatBoost (Ridge diagnostic)",
   "adaptive_choice": {
     "branch": 1,
-    "families_selected": ["lightgbm", "xgboost", "ridge"],
-    "families_included_in_ensemble": ["lightgbm", "xgboost", "ridge"],
-    "reasoning": "panel_forecasting, n_train=135000>=1000: full 3-family ensemble",
-    "ensemble_weighting": "ridge_weighted_1.5x",
-    "weighting_reason": "max_ks=0.56 > 0.40 threshold; weighting Ridge to hedge against severe shift"
+    "families_selected": ["catboost", "ridge_diagnostic"],
+    "families_included_in_ensemble": ["catboost"],
+    "reasoning": "CatBoost sole predictor; Ridge runs as a diagnostic baseline (not in submission)",
+    "ensemble_weighting": "single_model",
+    "weighting_reason": "single CatBoost predictor; no ensemble weighting required",
+    "ensemble_blend": "single_catboost"
   },
   "families": {
-    "lightgbm": {"best_params": {...}, "oof_mae": 9.3, "training_time_seconds": 120,
+    "catboost": {"best_params": {"learning_rate": 0.05, "depth": 6, "l2_leaf_reg": 3.0},
+                 "oof_mae": 9.3, "n_estimators": 638, "training_time_seconds": 180,
                  "succeeded": true, "included_in_ensemble": true},
-    "xgboost":  {"best_params": {...}, "oof_mae": 9.5, "training_time_seconds": 90,
-                 "succeeded": true, "included_in_ensemble": true},
-    "ridge":    {"best_alpha": 1.0,   "oof_mae": 10.1, "training_time_seconds": 5,
-                 "succeeded": true, "included_in_ensemble": true}
+    "ridge":    {"role": "diagnostic_only", "best_alpha": 1.0, "oof_mae": 10.1,
+                 "top_coefficients": [{"feature": "lag_1", "abs_coef": 0.82}, ...],
+                 "training_time_seconds": 5, "succeeded": true,
+                 "included_in_ensemble": false}
   },
   "ensemble_oof_mae": 9.3,
-  "n_families_in_ensemble": 3,
+  "n_families_in_ensemble": 1,
   "ensemble_disagreement": {"mean_disagreement": 1.2, "n_high_disagreement_rows": 45},
   "ridge_top_coefficients": [{"feature": "lag_1", "abs_coef": 0.82}, ...],
-  "objective": "regression_l1",
-  "best_params": {"learning_rate": 0.01, "num_leaves": 153, ...},
+  "objective": "MAE",
+  "best_params": {"learning_rate": 0.05, "depth": 6, "l2_leaf_reg": 3.0},
   "n_estimators": 638,
   "n_seeds": 5,
   "oof_mae": 9.3,
-  "oof_cv_scheme": "WalkForward(cutoff=...)",
+  "oof_cv_scheme": "walk_forward_80_20",
   "walk_forward_mae": 9.3,
   "training_time_seconds": 220,
   "optuna_trials_completed": 15,
   "feature_importance_top10": [
-    {"feature": "sp_mean_sales", "importance": 8144},
+    {"feature": "sp_mean_sales", "importance": 8144.0},
     ...
   ]
 }
 ```
 
-Note: `algorithm` is now dynamic based on which families succeeded and were included. The `adaptive_choice` block explains which branch was selected and why. `families` contains per-family OOF MAE and training time. `ensemble_oof_mae` is the median across included families' OOF MAEs. `oof_mae` (top-level) is LightGBM's OOF MAE for backward compatibility with the validator.
+Note: `algorithm` is `"CatBoost (Ridge diagnostic)"`. The `adaptive_choice` block records the single-model decision. `families` contains the CatBoost predictor and the Ridge diagnostic. `ensemble_oof_mae` and the top-level `oof_mae` are both the CatBoost walk-forward MAE.
 
 ### reports/submission_summary.json
 ```
@@ -671,10 +673,11 @@ else:
         )
 
     lims.append(
-        "<b>Single model family.</b> Only LightGBM was evaluated. Cross-family ensembling "
-        "(e.g., LightGBM + linear model or XGBoost) was not attempted due to the time budget. "
-        "Ensemble diversity typically reduces variance on held-out data; the impact here "
-        "is bounded by the seed-ensemble variance already captured across the 5 training seeds."
+        "<b>Single model family.</b> Only CatBoost was used for predictions (Ridge runs as a "
+        "diagnostic linear baseline but is not in the submission). Cross-family ensembling was "
+        "deliberately removed in favour of a leaner, leak-proof pipeline. Ensemble diversity "
+        "typically reduces variance on held-out data; the impact here is bounded by the "
+        "seed-ensemble variance already captured across the 5 CatBoost training seeds."
     )
 
     # Under-dispersion check

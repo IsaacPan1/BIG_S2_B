@@ -703,7 +703,7 @@ else:
     fam_selected = _ac.get("families_selected", [])
     fam_included = _ac.get("families_included_in_ensemble", [])
     fam_excluded = [f for f in fam_selected if f not in fam_included]
-    # Build blend weights string — e.g. "lightgbm=0.333, xgboost=0.333, catboost=0.333"
+    # Build blend weights string — e.g. "catboost=1.0"
     blend_w_str = (", ".join(f"{k}={v:.4f}" for k, v in blend_weights.items())
                    if blend_weights else "N/A")
     arch_rows = [
@@ -787,10 +787,10 @@ else:
         _applied = (adv_info_model or adv_val or {}).get("weights_applied", False)
         story.append(Spacer(1, 0.2*cm))
         story.append(callout(
-            "Adversarial Sample Weights Applied to All Families",
+            "Adversarial Sample Weights Applied to CatBoost",
             [f"Adversarial AUC: {fmt(_adv_auc, 3)}",
-             "Weights passed to: LightGBM OOF folds + retraining, "
-             "XGBoost Optuna objective + final fit, Ridge",
+             "Weights passed to: CatBoost OOF probe + full-data retrain (all seeds), "
+             "and to the Ridge diagnostic baseline",
              "Rows resembling the validation distribution receive higher training weight"],
             title_bg='#D35400', body_bg='#FDEBD0',
         ))

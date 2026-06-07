@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import lightgbm as lgb
+import catboost as _cb_module
 import numpy as np
 import pandas as pd
 import pytest
@@ -303,11 +303,11 @@ class TestRetailSalesModeler:
 
 
 # ===========================================================================
-# energy_load — inline simple LightGBM pipeline
+# energy_load — inline simple CatBoost pipeline
 # ===========================================================================
 
 def _build_energy_load_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run a simple (no-lag) LightGBM pipeline on energy_load practice data.
+    """Run a simple (no-lag) CatBoost pipeline on energy_load practice data.
     Returns (predictions_df, truth_df).
     """
     data = PRACTICE / "energy_load"
@@ -331,12 +331,12 @@ def _build_energy_load_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
     X_vl = val[feat_cols].fillna(fill_vals)
     y_tr = train[target].values
 
-    model = lgb.LGBMRegressor(
-        objective="regression_l1", n_estimators=300,
-        learning_rate=0.05, num_leaves=31,
-        verbose=-1, random_state=42, n_jobs=-1,
+    model = _cb_module.CatBoostRegressor(
+        iterations=300, learning_rate=0.05, depth=6,
+        loss_function="MAE", eval_metric="MAE",
+        verbose=False, allow_writing_files=False, random_seed=42,
     )
-    model.fit(X_tr, y_tr)
+    model.fit(X_tr, y_tr, verbose=False)
     preds = np.clip(model.predict(X_vl), 0, None)
 
     preds_df = val[["region_id", "timestamp"]].copy().reset_index(drop=True)
@@ -431,11 +431,11 @@ class TestEnergyLoadPipeline:
 
 
 # ===========================================================================
-# medical_imaging — inline simple LightGBM pipeline
+# medical_imaging — inline simple CatBoost pipeline
 # ===========================================================================
 
 def _build_medical_imaging_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run a simple tabular LightGBM pipeline on medical_imaging practice data.
+    """Run a simple tabular CatBoost pipeline on medical_imaging practice data.
     Returns (predictions_df, truth_df).
     """
     data = PRACTICE / "medical_imaging"
@@ -461,12 +461,12 @@ def _build_medical_imaging_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
     X_vl = cov_vl[feat_cols].fillna(fill_vals)
     y_tr = train[target].values
 
-    model = lgb.LGBMRegressor(
-        objective="regression_l1", n_estimators=300,
-        learning_rate=0.05, num_leaves=31,
-        verbose=-1, random_state=42, n_jobs=-1,
+    model = _cb_module.CatBoostRegressor(
+        iterations=300, learning_rate=0.05, depth=6,
+        loss_function="MAE", eval_metric="MAE",
+        verbose=False, allow_writing_files=False, random_seed=42,
     )
-    model.fit(X_tr, y_tr)
+    model.fit(X_tr, y_tr, verbose=False)
     preds = np.clip(model.predict(X_vl), 0, None)
 
     preds_df = cov_vl[["patient_id"]].copy().reset_index(drop=True)

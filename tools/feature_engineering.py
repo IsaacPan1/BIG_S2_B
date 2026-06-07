@@ -97,7 +97,7 @@ def _run_adversarial_validation(
     val_rows: "pd.DataFrame",
     numeric_cov_cols: list,
 ) -> tuple:
-    """Detect multivariate shift via a binary train-vs-val LightGBM classifier.
+    """Detect multivariate shift via a binary train-vs-val CatBoost classifier.
 
     Returns (meta_dict, sample_weights_for_train | None).
     Weights are parallel to train_rows; None means no weighting applied.
@@ -140,7 +140,7 @@ def _run_adversarial_validation(
         print(f"Adversarial validation: ACTIVATED — n_train={n_tr}, n_val={n_vl}, "
               f"n_cov_cols={len(cand)}")
 
-        import lightgbm as _lgb_av
+        import catboost as _cb_av
         from sklearn.model_selection import StratifiedKFold as _SKF_av
         from sklearn.metrics import roc_auc_score as _roc_av
 
@@ -153,10 +153,14 @@ def _run_adversarial_validation(
             [np.ones(n_tr, dtype=np.int8), np.zeros(n_vl, dtype=np.int8)]
         )
         _clf_p = {
-            "objective": "binary", "metric": "auc",
-            "n_estimators": 100, "learning_rate": 0.05,
-            "num_leaves": 31, "min_child_samples": 20,
-            "verbose": -1, "n_jobs": -1, "random_state": 42,
+            "iterations":    200,
+            "learning_rate": 0.05,
+            "depth":         6,
+            "loss_function": "Logloss",
+            "eval_metric":   "AUC",
+            "verbose":       False,
+            "allow_writing_files": False,
+            "random_seed":   42,
         }
         _oof_p  = np.zeros(n_tr + n_vl)
         _fi_acc = np.zeros(len(cand))
@@ -164,11 +168,10 @@ def _run_adversarial_validation(
         for _, (_tri, _vai) in enumerate(
             _SKF_av(n_splits=5, shuffle=True, random_state=42).split(_X_adv, _y_adv)
         ):
-            _clf = _lgb_av.LGBMClassifier(**_clf_p)
-            _clf.fit(_X_adv.iloc[_tri], _y_adv[_tri],
-                     callbacks=[_lgb_av.log_evaluation(-1)])
-            _oof_p[_vai]  = _clf.predict_proba(_X_adv.iloc[_vai])[:, 1]
-            _fi_acc       += _clf.feature_importances_
+            _clf = _cb_av.CatBoostClassifier(**_clf_p)
+            _clf.fit(_X_adv.iloc[_tri].values, _y_adv[_tri], verbose=False)
+            _oof_p[_vai]  = _clf.predict_proba(_X_adv.iloc[_vai].values)[:, 1]
+            _fi_acc       += _clf.get_feature_importance()
 
         auc = float(_roc_av(_y_adv, _oof_p))
         meta["activated"]        = True

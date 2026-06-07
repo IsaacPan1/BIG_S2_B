@@ -27,7 +27,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-import lightgbm as lgb
+import catboost as _cb_module
 import numpy as np
 import pandas as pd
 import pytest
@@ -365,15 +365,16 @@ def _build_leak_fixture(tmp_dir: Path) -> None:
     }
     (tmp_dir / "reports" / "features.json").write_text(json.dumps(features_meta))
 
-    # Train a quick LightGBM to get feature importances
+    # Train a quick CatBoost to get feature importances
     X = train[feature_cols].values
     y = train["weekly_sales"].values
-    m = lgb.LGBMRegressor(
-        objective="regression_l1", n_estimators=200,
-        learning_rate=0.1, num_leaves=31, verbose=-1, random_state=42,
+    m = _cb_module.CatBoostRegressor(
+        iterations=200, learning_rate=0.1, depth=6,
+        loss_function="MAE", eval_metric="MAE",
+        verbose=False, allow_writing_files=False, random_seed=42,
     )
-    m.fit(X, y)
-    importances = m.feature_importances_
+    m.fit(X, y, verbose=False)
+    importances = m.get_feature_importance()
     total_imp = int(importances.sum()) or 1
     imp_all = [
         {"feature": feature_cols[i], "importance": int(importances[i])}
@@ -389,7 +390,7 @@ def _build_leak_fixture(tmp_dir: Path) -> None:
     wf_mae = float(np.mean(np.abs(y_vl - wf_preds)))
 
     model_results = {
-        "algorithm": "LightGBM",
+        "algorithm": "CatBoost",
         "objective": "regression_l1",
         "best_params": {
             "learning_rate": 0.1, "num_leaves": 31,
@@ -511,22 +512,23 @@ def _build_simple_lgbm_results(
     X: np.ndarray, y: np.ndarray, feature_cols: list[str],
     hparams: dict, n_estimators: int = 200,
 ) -> dict:
-    """Train a quick LightGBM and build a model_results dict."""
-    m = lgb.LGBMRegressor(
-        objective="regression_l1", n_estimators=n_estimators,
-        verbose=-1, random_state=42, n_jobs=-1,
+    """Train a quick CatBoost and build a model_results dict."""
+    m = _cb_module.CatBoostRegressor(
+        iterations=n_estimators,
+        loss_function="MAE", eval_metric="MAE",
+        verbose=False, allow_writing_files=False, random_seed=42,
         **hparams,
     )
-    m.fit(X, y)
+    m.fit(X, y, verbose=False)
     cut = int(len(X) * 0.8)
     wf_preds = np.clip(m.predict(X[cut:]), 0, None)
     wf_mae = float(np.mean(np.abs(y[cut:] - wf_preds)))
-    imp = m.feature_importances_
+    imp = m.get_feature_importance()
     imp_all = [{"feature": feature_cols[i], "importance": int(imp[i])}
                for i in range(len(feature_cols))]
     return {
-        "algorithm": "LightGBM",
-        "objective": "regression_l1",
+        "algorithm": "CatBoost",
+        "objective": "MAE",
         "best_params": hparams,
         "n_estimators": n_estimators,
         "n_seeds": 1,
@@ -544,10 +546,8 @@ def _build_simple_lgbm_results(
 
 HPARAMS_DEFAULT = {
     "learning_rate": 0.05,
-    "num_leaves": 31,
-    "min_child_samples": 20,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
+    "depth":         6,
+    "l2_leaf_reg":   3.0,
 }
 
 

@@ -32,7 +32,7 @@ try:
 except Exception:
     pass
 
-import lightgbm as lgb
+import catboost as _cb_module
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error
@@ -76,24 +76,20 @@ def _fit_one_fold(
     X_vl: np.ndarray,
     hparams: dict,
     n_estimators: int,
-    objective: str = "regression_l1",
     seed: int = 42,
-) -> tuple[lgb.LGBMRegressor, np.ndarray]:
-    """Train one LightGBM fold and return (model, val_predictions)."""
+) -> tuple["_cb_module.CatBoostRegressor", np.ndarray]:
+    """Train one CatBoost fold and return (model, val_predictions)."""
     params = {
-        "objective": objective,
-        "metric": "mae",
-        "n_estimators": n_estimators,
-        "bagging_freq": 5,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
-        "verbose": -1,
-        "n_jobs": -1,
-        "random_state": seed,
+        "iterations":    n_estimators,
+        "loss_function": "MAE",
+        "eval_metric":   "MAE",
+        "verbose":       False,
+        "allow_writing_files": False,
+        "random_seed":   seed,
         **hparams,
     }
-    model = lgb.LGBMRegressor(**params)
-    model.fit(X_tr, y_tr, callbacks=[lgb.log_evaluation(-1)])
+    model = _cb_module.CatBoostRegressor(**params)
+    model.fit(X_tr, y_tr, verbose=False)
     preds = np.clip(model.predict(X_vl), 0, None)
     return model, preds
 
@@ -161,7 +157,7 @@ def compute_strict_cv(
     problem_type: str,
     hparams: dict,
     n_estimators: int,
-) -> tuple[float, str, list[lgb.LGBMRegressor], list[float], list[int]]:
+) -> tuple[float, str, list, list[float], list[int]]:
     """
     Run strict CV and return
     (mean_mae, scheme_description, fold_models, fold_maes, fold_train_sizes).
@@ -192,7 +188,7 @@ def compute_strict_cv(
             scheme = "80/20 sequential split (no group column available)"
 
     fold_maes: list[float] = []
-    fold_models: list[lgb.LGBMRegressor] = []
+    fold_models: list = []
     fold_train_sizes: list[int] = []
 
     for tr_idx, vl_idx in splits:
@@ -293,11 +289,11 @@ def structural_check(
 # ── IMPORTANCE FROM FOLD MODELS ────────────────────────────────────────────
 
 def average_importances(
-    fold_models: list[lgb.LGBMRegressor],
+    fold_models: list,
     feature_cols: list[str],
 ) -> dict[str, float]:
-    """Return mean split importance across folds, normalised to sum=1."""
-    arrays = [m.feature_importances_ for m in fold_models]
+    """Return mean CatBoost feature importance across folds, normalised to sum=1."""
+    arrays = [m.get_feature_importance() for m in fold_models]
     mean_imp = np.mean(arrays, axis=0)
     total = mean_imp.sum()
     if total == 0:
@@ -389,10 +385,8 @@ def main() -> None:
 
     hparams = model_results.get("best_params", {
         "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_child_samples": 20,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+        "depth":         6,
+        "l2_leaf_reg":   3.0,
     })
     n_estimators   = int(model_results.get("n_estimators", 500))
     # Try several candidate key names for the reported CV MAE
@@ -407,7 +401,7 @@ def main() -> None:
     train_df = pd.read_parquet(data / "features_train.parquet")
     exclude  = set(group_cols + ([time_col] if time_col else []) + [target_col])
     # Only keep numeric columns — string/categorical columns cannot be
-    # median-filled or fed directly into LightGBM as float arrays.
+    # median-filled or fed directly into CatBoost as float arrays.
     numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
     feature_cols = [c for c in numeric_cols if c not in exclude]
     fill_vals = train_df[feature_cols].median()

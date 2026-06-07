@@ -178,7 +178,7 @@ story.append(add_table(feat_data, col_widths=[5*cm, 2*cm, 9*cm]))
 story.append(Spacer(1, 10))
 story.append(Paragraph("5. Modeling", h1_style))
 story.append(Paragraph(
-    "<b>Model:</b> LightGBM with MAE (L1) objective - appropriate for retail sales "
+    "<b>Model:</b> CatBoost with MAE loss - appropriate for retail sales "
     "forecasting where outliers should not dominate. Direct multi-step forecasting was "
     "used with the horizon index (1-10) as a feature, allowing a single model to serve "
     "all 10 prediction steps without recursive error accumulation.",
@@ -188,7 +188,7 @@ story.append(Spacer(1, 6))
 
 model_data = [
     ["Parameter", "Value"],
-    ["Algorithm", model_results.get("model", "LightGBM")],
+    ["Algorithm", model_results.get("model", "CatBoost")],
     ["Objective", "regression_l1 (MAE)"],
     ["Num estimators (final)", str(model_results.get("best_iteration", "N/A"))],
     ["Learning rate", str(model_results.get("hyperparams", {}).get("learning_rate", "0.05"))],
@@ -253,8 +253,8 @@ story.append(Paragraph(
 ))
 story.append(Spacer(1, 4))
 story.append(Paragraph(
-    "<b>Hardware:</b> CPU-only. No GPU acceleration used. LightGBM was configured with "
-    "n_jobs=-1 for full multi-core utilization.",
+    "<b>Hardware:</b> CPU-only. No GPU acceleration used. CatBoost was configured "
+    "to use all available CPU cores.",
     body_style
 ))
 

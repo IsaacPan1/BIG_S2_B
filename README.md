@@ -92,42 +92,18 @@ Ordinal regression uses the regression path (not classification) because:
 
 **Ordinal post-processing.** After ensembling, predictions for `ordinal_regression` targets are rounded to the nearest valid integer class observed in training. The rounding threshold is optimized on OOF predictions: the modeler tries a small grid of offsets (–0.5 to +0.5 in steps of 0.1) and selects the offset that minimises OOF MAE before clipping to the training min/max. This converts continuous ensemble outputs to valid ordinal integers without sacrificing the distance-aware MAE objective. The chosen offset is logged in `model_results.json` under `ordinal_rounding`.
 
-## Model Selection and Ensembling
+## Model Selection
 
-The modeler selects its ensemble from `profile.json` based on `problem_type` and training set size.
+The modeler uses a single predictor family: **CatBoost**. **Ridge** is trained as a linear diagnostic baseline but its predictions are never written to the submission. All multi-family ensemble, blend-gate, and family-competence logic was intentionally removed in favour of a leaner, leak-proof pipeline.
 
-**Family selection.**
+| Family   | Role                       | In submission? |
+|----------|----------------------------|----------------|
+| CatBoost | Sole predictor             | Yes            |
+| Ridge    | Linear diagnostic baseline | No             |
 
-| Condition | Ensemble |
-|-----------|----------|
-| panel_forecasting or tabular_regression, n_train ≥ 1,000 | LightGBM + XGBoost + CatBoost (conditional) + Ridge |
-| panel_forecasting or tabular_regression, n_train < 1,000 | LightGBM + Ridge |
-| classification (any size) | LightGBM only |
+**Hyperparameter tuning with boundary recentering.** CatBoost is tuned with 15 Optuna trials and final predictions are aggregated across 5 random seeds. When Optuna's search hits a parameter boundary — for example, the best trial lands at the maximum `depth` or minimum `learning_rate` — the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring the best configuration, without consuming the critic-triggered retune cycle. Recentering is logged in `model_results.json` under `optuna_reflection`.
 
-**Hyperparameter tuning with boundary recentering.** Each tree family is tuned with 15 Optuna trials (10 for CatBoost) and predictions are aggregated across 5 random seeds before ensembling. When Optuna's search hits a parameter boundary — for example, when the best trial lands on the maximum `num_leaves` or minimum `learning_rate` — the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring a family's best configuration, without consuming the single critic-triggered retune cycle reserved for cross-family changes. Recentering is logged in `model_results.json` under `optuna_recentering`.
-
-**Family competence checks.** Ridge predictions pass two sanity checks before inclusion: predicted values must not exceed 5× the training maximum, and predicted mean must not deviate more than 100% from the training mean. Beyond those sanity checks, Ridge is also excluded from the ensemble entirely when its OOF MAE exceeds 1.5× the best tree family's OOF MAE; when excluded, the ensemble becomes LightGBM + XGBoost only, and the decision is logged under `adaptive_choice.ridge_excluded_reason`. The same 1.5× competence threshold applies to CatBoost; its decision is logged under `adaptive_choice.catboost_decision`. LightGBM always remains as the last-resort fallback.
-
-**Ensemble blending.** Rather than a fixed equal-weight median, the final ensemble weights each surviving family inversely proportional to its OOF MAE (softmax over negative MAEs). Families with substantially worse OOF performance contribute less without being fully excluded. When any covariate's KS statistic exceeds 0.40, Ridge receives an additional 1.5× up-weight in the final ensemble — Ridge's conservative extrapolation hedges against tree models overfitting shifted regions. This shift-weight is applied only when Ridge is competitive (OOF MAE within 1.5× of the best family); if Ridge is substantially worse, the ensemble falls back to equal-weight median. The applied weights are logged under `adaptive_choice.ensemble_weights`.
-
-**Time safeguards.** If total elapsed time exceeds 20 minutes when XGBoost would start, XGBoost is skipped. If two families have completed and elapsed time exceeds 30 minutes when Ridge would start, Ridge is skipped.
-
-## Conditional CatBoost Addition
-
-CatBoost is conditionally added as a fourth tree family when the data and time budget permit. CatBoost's symmetric oblivious trees and ordered boosting provide different inductive biases from LightGBM and XGBoost, offering ensemble diversity beyond what two leaf-wise boosters can capture.
-
-Activation conditions require all of the following:
-
-- catboost can be imported without errors (graceful fallback if not installed)
-- n_train is at least 500 (ordered boosting requires sufficient data)
-- Pipeline elapsed time is under 40 minutes when CatBoost would start (preserves budget for Ridge, validator, critic, submission_writer, and report_writer)
-- Problem type is panel_forecasting, tabular_regression, or classification
-
-When activated, CatBoost runs with 10 Optuna trials (fewer than LightGBM and XGBoost's 15 trials to manage compute), 5-seed multi-seed aggregation, and MAE loss for regression or Logloss for classification. Categorical features are passed via cat_features as column indices.
-
-The same competence check applied to Ridge is applied to CatBoost for ensemble inclusion: CatBoost is excluded if its OOF MAE exceeds 1.5x the best tree family's OOF MAE. When included, CatBoost participates in the median or weighted ensemble alongside other surviving families.
-
-If catboost cannot be imported or any activation condition fails, the pipeline runs with the existing 3-family ensemble (LightGBM + XGBoost + Ridge) with no interruption. All decisions are logged in model_results.json under adaptive_choice.catboost_decision.
+**Ridge diagnostic.** Ridge is fit on the walk-forward holdout with alpha selected via probe split from `{0.01, 0.1, 1.0, 10.0, 100.0}`, then used for two diagnostic outputs in `model_results.json`: a linear-baseline OOF MAE to compare against CatBoost, and the top-10 absolute coefficients as a linear-importance signal. Ridge does not participate in `predictions.csv`.
 
 ## Distribution-Shift-Aware Features
 
@@ -180,14 +156,14 @@ The benefit of recursive forecasting appears in the `lag_forecasting` holdout co
 
 ## Adversarial Validation
 
-`feature_engineering.py` trains a binary LightGBM classifier (5-fold StratifiedKFold, 100 estimators) to distinguish training rows (label 1) from validation rows (label 0). The classifier's OOF AUC measures multivariate covariate shift that per-column KS tests may miss.
+`feature_engineering.py` trains a binary CatBoost classifier (5-fold StratifiedKFold, 200 iterations) to distinguish training rows (label 1) from validation rows (label 0). The classifier's OOF AUC measures multivariate covariate shift that per-column KS tests may miss.
 
 **Activation conditions**: at least 500 combined rows, at least 100 training rows, at least 100 validation rows, and at least 3 numeric covariate columns. Datasets that do not meet all four conditions skip adversarial validation silently.
 
 **AUC < 0.55**: no meaningful shift detected; uniform sample weights are used.  
 **AUC ≥ 0.55**: each training row receives weight `w = clip(1 − P(is_train), 0.1, 10.0)`, then normalized so the mean weight equals 1.0. Rows that "look like" validation rows receive higher weight, nudging the model toward the actual prediction distribution.
 
-The weights are stored as an `adversarial_weights` column in `data/features_train.parquet`. The modeler reads this column and passes it as `sample_weight` to all three model families — LightGBM OOF folds, LightGBM full-data retraining, XGBoost Optuna objective, XGBoost final fit, and Ridge. The top five shift-revealing features (by classifier importance), the AUC, and whether weights were applied are logged in `features.json` under `adversarial_validation` and propagated to `model_results.json` under `adaptive_choice.adversarial_validation`.
+The weights are stored as an `adversarial_weights` column in `data/features_train.parquet`. The modeler reads this column and passes it as `sample_weight` to CatBoost (Optuna probe, WF probe, all 5 full-data retrain seeds) and to the Ridge diagnostic baseline. The top five shift-revealing features (by classifier importance), the AUC, and whether weights were applied are logged in `features.json` under `adversarial_validation` and propagated to `model_results.json` under `adaptive_choice.adversarial_validation`.
 
 ## Codebook-Based Date Features
 
@@ -213,7 +189,7 @@ Granularity (hourly / daily / weekly / monthly) is detected from the median inte
 - CPU only (no GPU)
 - No network access or external data during analysis
 - 2-hour wall-clock budget; 1M token budget (input + output, all agents combined)
-- Up to four-family ensemble (LightGBM + XGBoost + Ridge always, CatBoost conditionally)
+- Single-predictor pipeline (CatBoost) with Ridge as a diagnostic-only linear baseline
 
 ## Known Limitations
 
@@ -245,8 +221,8 @@ Granularity (hourly / daily / weekly / monthly) is detected from the median inte
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.
 - Expanded covariate features add substantial feature count, often doubling or tripling the feature set on datasets with many numeric covariates. Runtime increases proportionally during feature engineering and training. The benefit varies by dataset: datasets where existing features already capture the predictive signal show minimal change, while datasets with rich covariate information show meaningful improvement on strict CV.
 
-- CatBoost adds 1-3 minutes to pipeline runtime when activated. On datasets where CatBoost provides similar OOF performance to LightGBM and XGBoost, the median ensemble may show minimal improvement because the three tree families converge on similar predictions. Real benefit varies by dataset characteristics.
+- The pipeline uses a single predictor family (CatBoost). Cross-family ensembling was deliberately removed; variance reduction relies solely on the 5-seed CatBoost ensemble and the recursive-vs-imputation method selection.
 
-- True multiclass classification (unordered categories like species or diagnosis codes) uses LightGBM-only path. Multi-family classification ensembling would require logloss-based competence checks and probability aggregation, which are not implemented. Ordinal regression targets (integer counts/scores with natural order) use the full regression ensemble correctly and are not affected by this limitation.
+- True multiclass classification (unordered categories like species or diagnosis codes) uses the CatBoost classifier path with Logloss. Probability aggregation across families is not implemented because the pipeline only has one predictor family. Ordinal regression targets (integer counts/scores with natural order) use the regression path correctly and are not affected by this limitation.
 
 The `report.pdf` produced during analysis contains detailed methodology and results for the specific run.
