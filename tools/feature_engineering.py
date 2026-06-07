@@ -608,18 +608,9 @@ if time_col is None:
             out[col] = df[bc].map(mapping).astype(np.int8)
         _rg("group_encodings", [f"{bc}_enc" for bc in true_binary_covs])
 
-        # ── 2. Group baselines (sex-level mean/std from train stats) ──────────
-        if is_train:
-            _build_features._sex_stats = (
-                df.groupby("sex")[target_col].agg(["mean", "std"])
-                if target_col in df.columns and "sex" in df.columns
-                else None
-            )
-        sex_stats = getattr(_build_features, "_sex_stats", None)
-        if sex_stats is not None and "sex" in out.columns:
-            out["sex_mean_target"] = out["sex"].map(sex_stats["mean"])
-            out["sex_std_target"]  = out["sex"].map(sex_stats["std"])
-            _rg("group_baselines", ["sex_mean_target", "sex_std_target"])
+        # ── 2. (REMOVED) Group baselines (sex-level mean/std from train stats) ──
+        # Now declared as a target_encode adaptive step on the "sex" column and
+        # fit per-fold by the modeler Pipeline.
 
         # ── 3. Polynomial / interaction features ──────────────────────────────
         # Squared terms
@@ -1268,36 +1259,11 @@ else:
         f"(cycle period unknown — ambiguous cadence)"
     )
 
-# ── 4. Group baselines (train-only, no leakage) ───────────────────────────────
-for g in group_cols:
-    col = f"{g}_mean_{target_col}"
-    full[col] = full[g].map(train.groupby(g)[target_col].mean())
-    _reg("group_baselines", [col])
-
-if len(group_cols) >= 2:
-    pair_key = "_".join(group_cols)
-    sp_mean = train.groupby(group_cols)[target_col].mean().rename(f"{pair_key}_mean")
-    sp_std  = train.groupby(group_cols)[target_col].std().rename(f"{pair_key}_std")
-    full = full.merge(sp_mean, on=group_cols, how="left")
-    full = full.merge(sp_std,  on=group_cols, how="left")
-    _reg("group_baselines", [f"{pair_key}_mean", f"{pair_key}_std"])
-
-# ── 5. Recent group-pair stats (last 4 / 8 training periods) ──────────────────
-if len(group_cols) >= 2:
-    pair_key = "_".join(group_cols)
-    for w in [4, 8]:
-        col = f"{pair_key}_recent{w}_mean"
-        recent_vals = train[train[_tc] >= train_time_max - w + 1]
-        recent_mean = recent_vals.groupby(group_cols)[target_col].mean().rename(col)
-        full = full.merge(recent_mean, on=group_cols, how="left")
-        _reg("recent_stats", [col])
-
-    ratio_col = f"{pair_key}_recent4_vs_hist_ratio"
-    hist_mean = train.groupby(group_cols)[target_col].mean()
-    r4_mean   = train[train[_tc] >= train_time_max - 3].groupby(group_cols)[target_col].mean()
-    ratio     = (r4_mean / hist_mean.replace(0, np.nan)).rename(ratio_col)
-    full = full.merge(ratio, on=group_cols, how="left")
-    _reg("recent_stats", [ratio_col])
+# ── 4-5. (REMOVED) Adaptive group target stats moved to modeler Pipeline ─────
+# Group baselines ({g}_mean_target, pair_mean/std) and recent-window stats were
+# previously computed globally from train target values. Both leak across CV
+# folds. They are now declared as `target_encode` adaptive steps in
+# pipeline_config.json and fit per-fold by the modeler.
 
 # ── 6. AR lag features ────────────────────────────────────────────────────────
 grp_tgt = full.groupby(group_cols)[target_col]
@@ -1477,70 +1443,12 @@ if len(numeric_cols) >= 2 and not _skip_expansive:
         print(f"Covariate ratio features: {len(_ratio_cols)}  "
               f"pairs: {_ratio_dedup[:3]}{'...' if len(_ratio_dedup) > 3 else ''}")
 
-# ── 8d. Group-level covariate aggregates ─────────────────────────────────────
-if numeric_cols and group_cols and not _skip_expansive:
-    _grp_cov_feat_cols: list[str] = []
-    _recent_cut = train_time_max - 3
-    _train_rec4 = train[train[_tc] >= _recent_cut]
-    for _cov_g in numeric_cols:
-        for _g in group_cols:
-            _hist_m   = train.groupby(_g)[_cov_g].mean()
-            _recent_m = _train_rec4.groupby(_g)[_cov_g].mean()
-            _drift    = _recent_m - _hist_m
-            _hcol = f"{_cov_g}_{_g}_hist_mean"
-            _rcol = f"{_cov_g}_{_g}_recent4_mean"
-            _dcol = f"{_cov_g}_{_g}_drift"
-            full[_hcol] = full[_g].map(_hist_m)
-            full[_rcol] = full[_g].map(_recent_m)
-            full[_dcol] = full[_g].map(_drift)
-            _grp_cov_feat_cols.extend([_hcol, _rcol, _dcol])
-    _reg("cov_group_stats", _grp_cov_feat_cols)
-    print(f"Group-level covariate aggregate features: {len(_grp_cov_feat_cols)}")
-
-# ── 8e. Slope features per group ─────────────────────────────────────────────
-if numeric_cols and group_cols and min_periods >= 4 and not _skip_expansive:
-    _slope_feat_cols: list[str] = []
-    for _sw in [w for w in [6, 12] if min_periods >= w]:
-        _slope_col = f"target_slope_w{_sw}"
-        _slope_map: dict = {}
-        for _skey, _sgrp in train.groupby(group_cols):
-            _srecent = _sgrp.nlargest(_sw, _tc)
-            if len(_srecent) < 2:
-                _slope_map[_skey] = 0.0
-                continue
-            _sx = _srecent[_tc].values.astype(float)
-            _sy = _srecent[target_col].values.astype(float)
-            _sxc = _sx - _sx.mean()
-            _sdenom = float(np.dot(_sxc, _sxc))
-            _slope_map[_skey] = float(np.dot(_sxc, _sy) / (_sdenom + 1e-9))
-
-        if len(group_cols) == 1:
-            full[_slope_col] = full[group_cols[0]].map(_slope_map)
-        else:
-            _sl_df = pd.DataFrame(
-                [{**dict(zip(group_cols,
-                              _sk if isinstance(_sk, tuple) else (_sk,))),
-                  _slope_col: _sv}
-                 for _sk, _sv in _slope_map.items()]
-            )
-            full = full.merge(_sl_df, on=group_cols, how="left")
-            tr_mask = full[_tc] <= train_time_max
-            vl_mask = full[_tc] >  train_time_max
-        _slope_feat_cols.append(_slope_col)
-    if _slope_feat_cols:
-        _reg("slope_features", _slope_feat_cols)
-        print(f"Slope features added: {_slope_feat_cols}")
-
-# ── 8f. Covariate minus overall mean ─────────────────────────────────────────
-if numeric_cols:
-    _centered_cols: list[str] = []
-    for _cov_c in numeric_cols:
-        _tr_cov_mean = float(train[_cov_c].mean())
-        _ccol = f"{_cov_c}_minus_mean"
-        full[_ccol] = full[_cov_c] - _tr_cov_mean
-        _centered_cols.append(_ccol)
-    _reg("cov_centered", _centered_cols)
-    print(f"Covariate minus-mean features: {len(_centered_cols)}")
+# ── 8d-8f. (REMOVED) Adaptive group/slope/centering features ─────────────────
+# Group-level covariate aggregates (8d), per-group slope on training target (8e),
+# and covariate-minus-train-mean (8f) were all globally fit on training rows and
+# leaked across CV folds. The Pipeline's FoldScaler (for Ridge) centers numeric
+# covariates per-fold; CatBoost is scale-invariant. CatBoost can also rediscover
+# group-level dynamics from raw covariates + group label encodings.
 
 # ── 8g. Entropy features for covariate prefix groups ─────────────────────────
 if len(numeric_cols) >= 2 and not _skip_expansive:
@@ -1563,19 +1471,9 @@ if len(numeric_cols) >= 2 and not _skip_expansive:
         _reg("cov_entropy", _ent_cols)
         print(f"Entropy features added: {_ent_cols}")
 
-# ── 9. Primary covariate deviation / ratio vs group baseline ──────────────────
-# Captures "is this week's price higher or lower than the product's usual price?"
-if numeric_cols and len(group_cols) >= 2:
-    primary_cov  = numeric_cols[0]   # typically the price-like covariate
-    ref_group    = group_cols[-1]    # e.g. product_id
-    mean_col     = f"{ref_group}_mean_{primary_cov}"
-    grp_cov_mean = train.groupby(ref_group)[primary_cov].mean()
-    full[mean_col]                      = full[ref_group].map(grp_cov_mean)
-    full[f"{primary_cov}_deviation"]    = full[primary_cov] - full[mean_col]
-    full[f"{primary_cov}_ratio"]        = full[primary_cov] / (full[mean_col] + 1e-9)
-    _reg("price_derived", [mean_col,
-                           f"{primary_cov}_deviation",
-                           f"{primary_cov}_ratio"])
+# ── 9. (REMOVED) Primary covariate deviation/ratio vs group baseline ─────────
+# This used train-only group means of a covariate. Per-fold equivalents can be
+# learned by CatBoost directly from raw covariates + group label encodings.
 
 # ── 10. Interaction features ──────────────────────────────────────────────────
 # Numeric × binary
@@ -1632,14 +1530,14 @@ if "temperature" in full.columns:
     full["temperature_sq"] = full["temperature"] ** 2
     _reg("interactions", ["temperature_sq"])
 
-# Region fixed effect std (complement to existing mean)
-if len(group_cols) == 1:
-    g0 = group_cols[0]
-    std_col = f"{g0}_std_{target_col}"
-    full[std_col] = full[g0].map(train.groupby(g0)[target_col].std())
-    _reg("group_baselines", [std_col])
+# (REMOVED) Single-group target std baseline — moved to per-fold target_encode
 
-# ── 12c. Distribution-shift-aware features ────────────────────────────────────
+# ── 12c. (REMOVED) Distribution-shift-aware features ─────────────────────────
+# Z-scores, rank CDFs, group deviations, and time-interaction features all used
+# global training statistics and leaked across CV folds. Per-fold scaling (Ridge
+# path) gives a leak-clean equivalent of z-score; CatBoost is scale-invariant.
+# The shift-aware feature block below is preserved as a dead function so legacy
+# notes/refs still resolve, but it is no longer called.
 def _add_shift_aware_features(
     df: pd.DataFrame,
     prof: dict,
@@ -1748,16 +1646,8 @@ def _add_shift_aware_features(
 
     return added_cols, added_descs, pd.DataFrame(new_cols_dict, index=df.index)
 
-_shift_cols, _shift_descs, _shift_df = _add_shift_aware_features(full, profile, tr_mask)
-if _shift_cols:
-    # Concat all shift-aware columns in one shot to avoid DataFrame fragmentation
-    full = pd.concat([full, _shift_df], axis=1)
-    # Refresh masks after concat (index is unchanged but reassignment is safe)
-    tr_mask = full[_tc] <= train_time_max
-    vl_mask = full[_tc] >  train_time_max
-    _reg("shift_aware", _shift_descs)
-    print(f"Shift-aware features added: {len(_shift_cols)}  "
-          f"{_shift_cols[:4]}{'...' if len(_shift_cols) > 4 else ''}")
+_shift_cols, _shift_descs, _shift_df = [], [], pd.DataFrame()
+# (REMOVED) Shift-aware features are no longer attached; the helper above is dead code.
 
 # ── 12d. Codebook date features ──────────────────────────────────────────────
 _codebook_info = profile.get("time_codebook", {})
@@ -2100,6 +1990,75 @@ features_meta = {
 with open(REPORTS_DIR / "features.json", "w", encoding="utf-8") as fh:
     json.dump(features_meta, fh, indent=2)
 print("reports/features.json written")
+
+# ── 16b. Write pipeline_config.json — contract for the modeler ────────────────
+# Declares which features are Expert (deterministic, computed above) and which
+# Adaptive transforms the modeler must fit per-fold (impute, scale, target_encode).
+_expert_columns = list(feature_cols)
+
+# Categorical-like columns that should be target-encoded for Ridge and passed as
+# cat_features for CatBoost. Group columns are always cat-like; pass-through
+# string/object covariates also qualify.
+_te_targets: list[str] = []
+for _c in group_cols:
+    if _c in features_train.columns and _c not in _te_targets:
+        _te_targets.append(_c)
+for _c in (cov_cols if isinstance(cov_cols, list) else []):
+    if _c in features_train.columns and not pd.api.types.is_numeric_dtype(features_train[_c]):
+        if _c not in _te_targets:
+            _te_targets.append(_c)
+
+# Numeric columns (excluding identifiers + target + adversarial_weights + TE targets)
+# are candidates for scaling (used only on the Ridge path) and imputation.
+_id_set = set(group_cols + ([time_col] if time_col else []) + [target_col, "adversarial_weights"])
+if _is_datetime_time:
+    _id_set.add(_time_col_numeric)
+_numeric_feat = [
+    c for c in features_train.columns
+    if c not in _id_set
+    and c not in _te_targets
+    and pd.api.types.is_numeric_dtype(features_train[c])
+]
+
+# Impute targets: any numeric feature that contains NaN in train OR val.
+# Lag features at val rows are the main source of NaN — those must be filled
+# per-fold by the FoldImputer.
+_train_nan_cols = features_train[_numeric_feat].isna().any()
+_val_nan_cols   = features_val[_numeric_feat].isna().any() if len(features_val) > 0 else pd.Series(False, index=_numeric_feat)
+_impute_targets = [c for c in _numeric_feat if bool(_train_nan_cols.get(c, False) or _val_nan_cols.get(c, False))]
+
+_pipeline_config = {
+    "_schema_version": "1.0",
+    "_description": (
+        "Contract between feature_engineering.py (writer) and run_modeler.py "
+        "(reader). Expert features are deterministic and already present in "
+        "data/features_train.parquet. Adaptive steps must be fit on the "
+        "training fold only inside the modeler's nested CV loop."
+    ),
+    "expert_features": {
+        "description": "Deterministic features pre-calculated globally by feature_engineering.py.",
+        "columns": _expert_columns,
+    },
+    "adaptive_steps": [
+        {"name": "impute_missing", "strategy": "median", "targets": _impute_targets},
+        {"name": "scale_features", "method":   "standard_scaler", "targets": _numeric_feat},
+        {"name": "target_encode",  "smoothing": 10,    "targets": _te_targets},
+    ],
+    "model_settings": {
+        "family":           "catboost",
+        "objective":        "MAE",
+        "ridge_diagnostic": True,
+    },
+}
+
+_pc_path = REPO / "pipeline_config.json"
+with open(_pc_path, "w", encoding="utf-8") as fh:
+    json.dump(_pipeline_config, fh, indent=2)
+print(f"pipeline_config.json written: "
+      f"{len(_expert_columns)} expert cols, "
+      f"{len(_impute_targets)} impute, "
+      f"{len(_numeric_feat)} scale, "
+      f"{len(_te_targets)} target_encode")
 
 # ── 17. Marker file ───────────────────────────────────────────────────────────
 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
