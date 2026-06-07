@@ -535,6 +535,40 @@ _GROUP_ENTITY_KEYWORDS = (
     "entity", "patient", "item", "series",
 )
 
+# Group-detection guard rails. A repeated-entity grouping is, by construction,
+# low-uniqueness — many rows per group. Anything more unique than this is a
+# row-id sidecar (image_filename, hash, etc.) and must not be a group key.
+_GROUP_UNIQUENESS_MAX = 0.5
+
+# Substrings in a column name that mark it as a file-path / filename column.
+# Underscore-anchored entries are deliberate: bare "uri" matches "jurisdiction",
+# bare "url" / "path" would catch any column whose name happens to contain those
+# letters. The underscore prefix forces a word-boundary-ish match.
+_FILE_NAME_SUBSTRINGS = (
+    "filename", "filepath", "file_name", "file_path",
+    "_path", "_url", "_uri",
+)
+
+# File extensions that indicate the column holds paths/names of binary assets.
+_FILE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp",
+    ".wav", ".mp3", ".mp4", ".pdf", ".npz", ".npy", ".h5", ".parquet",
+)
+
+
+def _looks_like_file_column(col: str, series: pd.Series) -> bool:
+    """Heuristic: does this column hold file paths / image filenames?"""
+    col_lower = col.lower()
+    if any(sub in col_lower for sub in _FILE_NAME_SUBSTRINGS):
+        return True
+    if series.dtype != object:
+        return False
+    sample = series.dropna().astype(str).head(50)
+    if len(sample) == 0:
+        return False
+    ext_hits = sum(1 for v in sample if v.lower().endswith(_FILE_EXTENSIONS))
+    return ext_hits / len(sample) >= 0.5
+
 
 def find_time_col(df: pd.DataFrame, target_col: str | None = None) -> str | None:
     """Return the primary time column, scoring by datetime-parseability and name."""
@@ -608,7 +642,21 @@ def find_group_cols(
     target_col: str | None,
     id_col: str | None,
 ) -> list[str]:
-    """Detect panel group columns: low-cardinality, typically categorical."""
+    """Detect panel group columns: low-cardinality, typically categorical.
+
+    A group column defines a repeated entity ACROSS a time axis (same entity,
+    multiple time points). Without a time column there are no groups — a tabular
+    IID set has none; treat its low-card categoricals as features instead.
+
+    Excluded by construction (independent of the group-keyword logic):
+        - any column when time_col is None (no time → no groups)
+        - high-uniqueness columns with n_unique/n_rows > _GROUP_UNIQUENESS_MAX
+          (rules out row-id sidecars like image_filename)
+        - columns whose name or values look like file paths / image filenames
+    """
+    if time_col is None:
+        return []
+
     n_rows = max(len(df), 1)
     exclude = {c for c in [time_col, target_col, id_col] if c}
     groups: list[str] = []
@@ -618,7 +666,14 @@ def find_group_cols(
             continue
         s = df[col]
         col_lower = col.lower()
-        n_unique = s.nunique()
+        n_unique = int(s.nunique())
+
+        # High-uniqueness → quasi row identifier, never a group key.
+        if n_unique / n_rows > _GROUP_UNIQUENESS_MAX:
+            continue
+        # File-path / filename–shaped column → not a group key.
+        if _looks_like_file_column(col, s):
+            continue
 
         is_categorical = not pd.api.types.is_numeric_dtype(s)
         low_cardinality = n_unique <= max(500, n_rows * 0.02)
@@ -1244,6 +1299,90 @@ def detect_time_codebook(
 # 10b.  Period-rank resolution (chronological dense int axis from codebook)
 # ---------------------------------------------------------------------------
 
+def resolve_period_ranks_generic(
+    train_df: pd.DataFrame,
+    val_df:   pd.DataFrame,
+    time_col: str,
+) -> dict | None:
+    """Build a dense integer rank over the union of train+val periods for time
+    columns that DON'T have a codebook — datetime-parseable strings, integers,
+    or any orderable scalar. Returned schema mirrors resolve_period_ranks().
+
+    Resolution order:
+        1. Parse values as datetime (pd.to_datetime, errors='coerce'). If ≥90%
+           of unique non-null values parse, the column is a datetime axis.
+        2. Otherwise parse as numeric (pd.to_numeric, errors='coerce'). If
+           ≥90% parse, the column is an integer/orderable axis.
+        3. Otherwise return None — the time axis can't be ordered, and the
+           caller will skip rank attachment.
+
+    Keys in id_to_rank are ALWAYS the str form of the raw column value, so that
+    downstream `df[time_col].astype(str).map(id_to_rank)` resolves cleanly.
+    """
+    has_train_col = time_col in train_df.columns
+    has_val_col   = (not val_df.empty) and (time_col in val_df.columns)
+    if not has_train_col and not has_val_col:
+        return None
+
+    train_vals = train_df[time_col].dropna().astype(str).unique().tolist() if has_train_col else []
+    val_vals   = val_df[time_col].dropna().astype(str).unique().tolist()   if has_val_col   else []
+    all_vals = sorted({*train_vals, *val_vals})
+    if not all_vals:
+        return None
+
+    def _parse_datetime(values: list[str]) -> list[tuple]:
+        parsed = pd.to_datetime(pd.Series(values), errors="coerce")
+        ok_frac = float(parsed.notna().mean()) if len(parsed) else 0.0
+        if ok_frac < 0.9:
+            return []
+        return [(parsed.iloc[i], values[i], parsed.iloc[i].strftime("%Y-%m-%dT%H:%M:%S"))
+                for i in range(len(values)) if pd.notna(parsed.iloc[i])]
+
+    def _parse_numeric(values: list[str]) -> list[tuple]:
+        parsed = pd.to_numeric(pd.Series(values), errors="coerce")
+        ok_frac = float(parsed.notna().mean()) if len(parsed) else 0.0
+        if ok_frac < 0.9:
+            return []
+        return [(float(parsed.iloc[i]), values[i], None)
+                for i in range(len(values)) if pd.notna(parsed.iloc[i])]
+
+    sortable = _parse_datetime(all_vals) or _parse_numeric(all_vals)
+    if not sortable:
+        return None
+
+    sortable.sort(key=lambda x: x[0])
+    id_to_rank: dict[str, int]      = {}
+    id_to_date: dict[str, str]      = {}
+    rank_to_id: dict[int, str]      = {}
+    rank_to_date: dict[int, str]    = {}
+    for rank, (_key, raw, iso) in enumerate(sortable):
+        id_to_rank[raw] = rank
+        rank_to_id[rank] = raw
+        if iso is not None:
+            id_to_date[raw] = iso
+            rank_to_date[rank] = iso
+
+    train_set = set(train_vals)
+    val_set   = set(val_vals)
+    train_ranks = sorted({id_to_rank[v] for v in train_set if v in id_to_rank})
+    val_ranks   = sorted({id_to_rank[v] for v in val_set   if v in id_to_rank})
+
+    return {
+        # Always return concrete dicts (even if empty for non-datetime axes) —
+        # downstream detect_horizons calls .get() on rank_to_date.
+        "id_to_date":      id_to_date,
+        "id_to_rank":      id_to_rank,
+        "rank_to_id":      rank_to_id,
+        "rank_to_date":    rank_to_date,
+        "train_ranks":     train_ranks,
+        "val_ranks":       val_ranks,
+        "n_train_periods": len(train_ranks),
+        "n_val_periods":   len(val_ranks),
+        "unmapped_train":  [],
+        "unmapped_val":    [],
+    }
+
+
 def resolve_period_ranks(
     codebook_id_to_date: dict,
     train_df: pd.DataFrame,
@@ -1513,25 +1652,38 @@ def main() -> None:
     # 6b. Optional time codebook (maps opaque IDs → real dates)
     codebook_info = detect_time_codebook(data_dir, train_df, time_col)
 
-    # 6c. Resolve chronological dense-integer ranks from the codebook.
-    # When the codebook is available, this rank is the canonical time axis
-    # for horizon/CV math; the raw ID stays as `time_col` for joins/submission.
+    # 6c. Resolve chronological dense-integer ranks for the time axis.
+    # The rank is the canonical axis for horizon/CV math; the raw time_col
+    # stays for joins/submission. Three sources, tried in order:
+    #   (1) codebook  — opaque IDs mapped to dates via a JSON sidecar
+    #   (2) generic   — datetime-parseable strings or integer/orderable values
+    #   (3) none      — column can't be ordered; downstream falls back gracefully
     rank_info: dict | None = None
-    if codebook_info.get("available") and codebook_info.get("id_to_date_map") and time_col:
-        rank_info = resolve_period_ranks(
-            codebook_info["id_to_date_map"], train_df, val_df, time_col
-        )
-        if rank_info["unmapped_train"] or rank_info["unmapped_val"]:
-            warns.append(
-                f"Codebook coverage incomplete: "
-                f"{len(rank_info['unmapped_train'])} train IDs and "
-                f"{len(rank_info['unmapped_val'])} val IDs unmapped."
+    if time_col:
+        if codebook_info.get("available") and codebook_info.get("id_to_date_map"):
+            rank_info = resolve_period_ranks(
+                codebook_info["id_to_date_map"], train_df, val_df, time_col
             )
-        print(
-            f"PERIOD-RANK: resolved {rank_info['n_train_periods']} train + "
-            f"{rank_info['n_val_periods']} val unique periods from codebook "
-            f"({codebook_info['path']})."
-        )
+            if rank_info["unmapped_train"] or rank_info["unmapped_val"]:
+                warns.append(
+                    f"Codebook coverage incomplete: "
+                    f"{len(rank_info['unmapped_train'])} train IDs and "
+                    f"{len(rank_info['unmapped_val'])} val IDs unmapped."
+                )
+            print(
+                f"PERIOD-RANK: resolved {rank_info['n_train_periods']} train + "
+                f"{rank_info['n_val_periods']} val unique periods from codebook "
+                f"({codebook_info['path']})."
+            )
+        else:
+            rank_info = resolve_period_ranks_generic(train_df, val_df, time_col)
+            if rank_info is not None:
+                _src = "datetime" if rank_info.get("id_to_date") else "integer/orderable"
+                print(
+                    f"PERIOD-RANK: resolved {rank_info['n_train_periods']} train + "
+                    f"{rank_info['n_val_periods']} val unique periods from "
+                    f"{_src} time column {time_col!r}."
+                )
 
     covariate_cols = [
         c for c in train_df.columns

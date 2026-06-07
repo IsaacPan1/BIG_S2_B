@@ -114,7 +114,10 @@ def _compute_drift_diagnostic(
     info = profile.get("period_rank_info") or {}
     id_to_rank = info.get("id_to_rank") or {}
     if id_to_rank:
-        tr_rank = train_df[time_col].map(id_to_rank)
+        # id_to_rank keys are strings (JSON round-trips int keys to str, and the
+        # rank resolver writes str keys by construction). Mirror the cast that
+        # cv_engine.attach_period_rank uses so an integer time_col still maps.
+        tr_rank = train_df[time_col].astype(str).map(id_to_rank)
     else:
         tr_rank = pd.to_numeric(train_df[time_col], errors="coerce")
     tr_rank_valid = tr_rank.dropna()
