@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,13 +7,21 @@ __pycache__/
 .venv/
 venv/
 
-# Data and reports (regenerated each run)
-data/*
-!data/.gitkeep
+# Generated artefacts — reports/ must be EMPTY in version control.
+# A fresh clone contains only reports/.gitkeep.
 reports/*
 !reports/.gitkeep
-*.pdf
+
+# Generated, fold-bound feature blocks (regenerated per run; data/ is inputs-only)
+data/features_*
+
+# Run-time outputs at the repo root
 submission.csv
+report.pdf
+report.txt
+
+# Inputs scaffolding (real input files are committed; this rule preserves the dir)
+!data/.gitkeep
 
 # Practice data (your local testing only)
 practice_data/
@@ -29,12 +37,12 @@ Thumbs.db
 # Notebook checkpoints
 .ipynb_checkpoints/
 
-# claude settings
+# Claude settings
 .claude/settings.local.json
+
+# Legacy agent-pipeline runtime artefacts
 tools/run_modeler_script.py
 tools/run_modeler_*.py
-
-# Runtime artifacts created by Claude Code
 tools/run_modeler_full.py
 tools/run_modeler_retune.py
 tools/run_modeler_v2.py

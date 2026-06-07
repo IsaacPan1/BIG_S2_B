@@ -54,6 +54,35 @@ mkdir -p reports
 python tools/profile_data.py --data-dir data/ --output reports/profile.json
 ```
 
+### Step 2b — Author the frozen CV_PLAN
+
+```bash
+python tools/scheme_analysis.py
+```
+
+`tools/scheme_analysis.py` is the **only** module allowed to write
+`reports/cv_plan.json`. It re-reads `data/` and `DATA_DESCRIPTION.md`,
+classifies the problem, and picks a CV scheme **driven by `problem_type`** so
+that the materialised folds replicate the held-out test split:
+
+| Detected problem_type            | `cv_type` chosen          |
+|----------------------------------|---------------------------|
+| `forecasting_multi_horizon`      | `RollingOriginCV`         |
+| `grouped_time_series` / `time_series` | `TimeSeriesExpanding` |
+| `tabular_iid` (with group_cols)  | `GroupKFold`              |
+| binary/multiclass, iid           | `StratifiedKFold`         |
+| regression, iid                  | `KFold`                   |
+
+The resulting `reports/cv_plan.json` carries `frozen: true` and is the
+authoritative CV contract for the modeler — it is consumed by
+`tools/cv_engine.CVEngine(plan, df).split()` when the modeler builds its
+evaluation folds. Downstream tier-2 (feature_engineer) does NOT read this
+file: feature engineering remains **global**, not fold-bound.
+
+`tools/scheme_analysis.py` also writes `reports/schema_analyst_was_here.txt`
+as its marker. Do NOT touch the `reports/profile.json` contract written in
+Step 2 — the feature engineer depends on that schema unchanged.
+
 Read **both** the human-readable stdout summary **and** the `reports/profile.json`
 file. The JSON contains:
 - `problem_type` and `problem_type_confidence`

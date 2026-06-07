@@ -100,18 +100,48 @@ all_feature_cols = [c for c in train_df.columns if c not in _exclude_ids]
 _te_step = next((s for s in adaptive_steps if s.get("name") == "target_encode"), {})
 cat_feature_cols = [c for c in _te_step.get("targets", []) if c in all_feature_cols]
 
-# Drop string/object columns that are not declared as target_encode targets —
-# CatBoost rejects raw strings unless they're in cat_features. Equivalent
-# columns like image_filename should not enter the model.
+# Defensive net (belt & suspenders for the upstream dtype+cardinality gate in
+# tools/feature_engineering.py): drop two classes of columns that must never
+# reach the model.
+#   (a) Non-numeric columns that are not declared as cat_features — CatBoost
+#       rejects raw strings unless listed as cat_features, and a raw text
+#       column would upcast the matrix to object dtype.
+#   (b) Numeric ID-LIKE columns that are not declared as cat_features — a
+#       hidden row_id / hash / timestamp would individually identify the row
+#       and act as a perfect (overfit) feature. Detected by UNIQUENESS RATIO
+#       only — n_unique == n_rows OR n_unique / n_rows > ID_RATIO_MAX — never
+#       by absolute count. Engineered numerics (lags, rolling stats, ratios)
+#       routinely have thousands of unique values and must NOT be flagged.
+#       This threshold is intentionally separate from CARD_MAX (the
+#       categorical ceiling used by the upstream gate) — they answer
+#       different questions and must not share a knob.
+ID_RATIO_MAX = 0.99
+
 _drop_nonnumeric = [
     c for c in all_feature_cols
     if not pd.api.types.is_numeric_dtype(train_df[c])
     and c not in cat_feature_cols
 ]
+_n_train_rows = len(train_df)
+_drop_idlike: list[tuple[str, int]] = []  # (name, n_unique)
+for c in all_feature_cols:
+    if c in _drop_nonnumeric or c in cat_feature_cols:
+        continue
+    _nu = int(train_df[c].nunique(dropna=True))
+    if _nu == _n_train_rows or (_n_train_rows > 0
+                                and _nu / _n_train_rows > ID_RATIO_MAX):
+        _drop_idlike.append((c, _nu))
 if _drop_nonnumeric:
     print(f"Dropping non-numeric, non-cat_feature columns: {_drop_nonnumeric[:5]} "
           f"(total {len(_drop_nonnumeric)})")
     all_feature_cols = [c for c in all_feature_cols if c not in _drop_nonnumeric]
+if _drop_idlike:
+    print(f"Dropping numeric id-like columns (uniqueness ratio > {ID_RATIO_MAX}, "
+          f"n_rows={_n_train_rows}):")
+    for _c, _nu in _drop_idlike:
+        print(f"  - {_c}  n_unique={_nu}  ratio={_nu/_n_train_rows:.4f}")
+    _drop_idlike_names = {c for c, _ in _drop_idlike}
+    all_feature_cols = [c for c in all_feature_cols if c not in _drop_idlike_names]
 
 print(f"Train: {train_df.shape}, Val: {val_df.shape}")
 print(f"Features handed to model: {len(all_feature_cols)} "

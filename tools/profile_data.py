@@ -893,8 +893,60 @@ def detect_horizons(
     train_df: pd.DataFrame,
     val_df:   pd.DataFrame,
     time_col: str,
+    rank_info: dict | None = None,
 ) -> dict:
-    """Compute forecasting horizon information from the validation time column."""
+    """Compute forecasting horizon information from the validation time column.
+
+    When `rank_info` is supplied (codebook-resolved chronological ranks), use the
+    dense integer rank as the time axis. This is the correct path when `time_col`
+    is an opaque hash that only resolves to a date via the codebook — calling
+    to_datetime on the raw hash would silently collapse all val times to NaT and
+    fall back to a default horizon.
+    """
+    if rank_info is not None:
+        train_ranks  = rank_info["train_ranks"]
+        val_ranks    = rank_info["val_ranks"]
+        rank_to_date = rank_info["rank_to_date"]
+        if not val_ranks or not train_ranks:
+            return {"n_horizons": 0, "horizons": []}
+
+        train_max_rank = max(train_ranks)
+        val_unique     = sorted(val_ranks)
+        relative       = sorted({v - train_max_rank for v in val_unique})
+        horizons       = [int(h) for h in relative]
+        val_min_rank   = val_unique[0]
+        val_max_rank   = val_unique[-1]
+        gap            = val_min_rank - train_max_rank
+
+        # Try to infer a calendar period from consecutive resolved dates
+        period_inferred: str | None = None
+        try:
+            all_dates = sorted(
+                pd.to_datetime(d, errors="coerce")
+                for d in rank_to_date.values()
+            )
+            all_dates = [d for d in all_dates if not pd.isna(d)]
+            if len(all_dates) > 1:
+                diffs = pd.Series(all_dates).diff().dropna()
+                if not diffs.empty:
+                    period_inferred = str(diffs.mode().iloc[0])
+        except Exception:
+            period_inferred = None
+
+        return {
+            "n_horizons":      len(val_unique),
+            "train_time_max":  rank_to_date.get(train_max_rank),
+            "val_time_min":    rank_to_date.get(val_min_rank),
+            "val_time_max":    rank_to_date.get(val_max_rank),
+            "horizons":        horizons[:20],
+            "gap_periods":     gap,
+            "period_inferred": period_inferred,
+            "train_max_rank":  train_max_rank,
+            "val_min_rank":    val_min_rank,
+            "val_max_rank":    val_max_rank,
+            "valid_size":      len(val_unique),
+        }
+
     if val_df.empty or time_col not in val_df.columns:
         return {"n_horizons": 0, "horizons": []}
 
@@ -1097,6 +1149,7 @@ def detect_time_codebook(
         "n_entries": None,
         "direction_detected": None,
         "sample_mappings": None,
+        "id_to_date_map": None,
     }
 
     if time_col is None or time_col not in train_df.columns:
@@ -1179,11 +1232,92 @@ def detect_time_codebook(
                 "n_entries":           len(raw),
                 "direction_detected":  direction,
                 "sample_mappings":     sample_pairs,
+                "id_to_date_map":      id_to_date,
             }
     except Exception:
         pass
 
     return _empty
+
+
+# ---------------------------------------------------------------------------
+# 10b.  Period-rank resolution (chronological dense int axis from codebook)
+# ---------------------------------------------------------------------------
+
+def resolve_period_ranks(
+    codebook_id_to_date: dict,
+    train_df: pd.DataFrame,
+    val_df:   pd.DataFrame,
+    time_col: str,
+) -> dict:
+    """Build a chronological dense-integer rank over the union of train+val periods.
+
+    The raw time column is an opaque ID; the codebook maps each ID to a real
+    calendar date. We sort the union of train+val IDs by their resolved date
+    and assign 0-based dense integer ranks. This rank is the canonical time
+    axis used for horizon/CV math; the raw ID is kept for joins/submission.
+
+    Returns dict with:
+        id_to_date     : {opaque_id: iso_date_str}   (only for IDs seen in data)
+        id_to_rank     : {opaque_id: int_rank}       (dense, 0-based, ascending in time)
+        rank_to_id     : {int_rank: opaque_id}
+        rank_to_date   : {int_rank: iso_date_str}
+        train_ranks    : sorted unique ranks present in train
+        val_ranks      : sorted unique ranks present in val
+        n_train_periods: int
+        n_val_periods  : int
+        unmapped_train : sorted list of train IDs NOT in the codebook
+        unmapped_val   : sorted list of val   IDs NOT in the codebook
+    """
+    has_train_col = time_col in train_df.columns
+    has_val_col   = (not val_df.empty) and (time_col in val_df.columns)
+
+    train_ids = set(train_df[time_col].dropna().astype(str).unique()) if has_train_col else set()
+    val_ids   = set(val_df[time_col].dropna().astype(str).unique())   if has_val_col   else set()
+
+    cb_keys = set(codebook_id_to_date.keys())
+    unmapped_train = sorted(train_ids - cb_keys)
+    unmapped_val   = sorted(val_ids   - cb_keys)
+
+    all_ids = train_ids | val_ids
+    seen_pairs: list[tuple[pd.Timestamp, str]] = []
+    for pid in all_ids:
+        d = codebook_id_to_date.get(pid)
+        if d is None:
+            continue
+        dt = pd.to_datetime(d, errors="coerce")
+        if pd.isna(dt):
+            continue
+        seen_pairs.append((dt, pid))
+
+    seen_pairs.sort(key=lambda x: x[0])
+
+    id_to_date:   dict[str, str] = {}
+    id_to_rank:   dict[str, int] = {}
+    rank_to_id:   dict[int, str] = {}
+    rank_to_date: dict[int, str] = {}
+    for rank, (dt, pid) in enumerate(seen_pairs):
+        iso = dt.strftime("%Y-%m-%d")
+        id_to_date[pid]   = iso
+        id_to_rank[pid]   = rank
+        rank_to_id[rank]  = pid
+        rank_to_date[rank] = iso
+
+    train_ranks = sorted({id_to_rank[i] for i in train_ids if i in id_to_rank})
+    val_ranks   = sorted({id_to_rank[i] for i in val_ids   if i in id_to_rank})
+
+    return {
+        "id_to_date":      id_to_date,
+        "id_to_rank":      id_to_rank,
+        "rank_to_id":      rank_to_id,
+        "rank_to_date":    rank_to_date,
+        "train_ranks":     train_ranks,
+        "val_ranks":       val_ranks,
+        "n_train_periods": len(train_ranks),
+        "n_val_periods":   len(val_ranks),
+        "unmapped_train":  unmapped_train,
+        "unmapped_val":    unmapped_val,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1232,6 +1366,15 @@ def print_summary(profile: dict) -> None:
         print(f"Horizon steps    : {display}")
         print(f"Val time start   : {profile.get('val_time_min', '?')}")
         print(f"Val time end     : {profile.get('val_time_max', '?')}")
+        print(f"Train time max   : {profile.get('train_time_max', '?')}")
+        print(f"Gap (val-train)  : {profile.get('gap_periods', '?')} period(s)")
+        pri = profile.get("period_rank_info") or {}
+        if pri.get("available"):
+            print(f"Period rank      : codebook-resolved, "
+                  f"train_periods={pri.get('n_train_periods')}, "
+                  f"val_periods={pri.get('n_val_periods')}, "
+                  f"train_max_rank={pri.get('train_max_rank')}, "
+                  f"val_ranks=[{pri.get('val_min_rank')}..{pri.get('val_max_rank')}]")
 
     flagged = [s for s in profile.get("distribution_shifts", []) if s.get("flagged")]
     all_ks  = profile.get("distribution_shifts", [])
@@ -1370,6 +1513,26 @@ def main() -> None:
     # 6b. Optional time codebook (maps opaque IDs → real dates)
     codebook_info = detect_time_codebook(data_dir, train_df, time_col)
 
+    # 6c. Resolve chronological dense-integer ranks from the codebook.
+    # When the codebook is available, this rank is the canonical time axis
+    # for horizon/CV math; the raw ID stays as `time_col` for joins/submission.
+    rank_info: dict | None = None
+    if codebook_info.get("available") and codebook_info.get("id_to_date_map") and time_col:
+        rank_info = resolve_period_ranks(
+            codebook_info["id_to_date_map"], train_df, val_df, time_col
+        )
+        if rank_info["unmapped_train"] or rank_info["unmapped_val"]:
+            warns.append(
+                f"Codebook coverage incomplete: "
+                f"{len(rank_info['unmapped_train'])} train IDs and "
+                f"{len(rank_info['unmapped_val'])} val IDs unmapped."
+            )
+        print(
+            f"PERIOD-RANK: resolved {rank_info['n_train_periods']} train + "
+            f"{rank_info['n_val_periods']} val unique periods from codebook "
+            f"({codebook_info['path']})."
+        )
+
     covariate_cols = [
         c for c in train_df.columns
         if c not in {target_col, time_col, id_col}
@@ -1394,7 +1557,7 @@ def main() -> None:
     # 9. Horizon detection
     horizon_info: dict = {}
     if problem_type in ("panel_forecasting", "time_series") and time_col:
-        horizon_info = detect_horizons(train_df, val_df, time_col)
+        horizon_info = detect_horizons(train_df, val_df, time_col, rank_info=rank_info)
 
     # 10. Distribution shift
     ks_results = compute_distribution_shifts(
@@ -1461,6 +1624,26 @@ def main() -> None:
         "train_time_max":           horizon_info.get("train_time_max"),
         "gap_periods":              horizon_info.get("gap_periods"),
         "period_inferred":          horizon_info.get("period_inferred"),
+        "n_val_periods":            horizon_info.get("valid_size",
+                                                     horizon_info.get("n_horizons", 0)),
+        "valid_size":               horizon_info.get("valid_size",
+                                                     horizon_info.get("n_horizons", 0)),
+        "period_rank_info": {
+            "available":       rank_info is not None,
+            "n_train_periods": rank_info["n_train_periods"] if rank_info else None,
+            "n_val_periods":   rank_info["n_val_periods"]   if rank_info else None,
+            "train_max_rank":  horizon_info.get("train_max_rank") if rank_info else None,
+            "val_min_rank":    horizon_info.get("val_min_rank")   if rank_info else None,
+            "val_max_rank":    horizon_info.get("val_max_rank")   if rank_info else None,
+            "horizon":         horizon_info.get("gap_periods")    if rank_info else None,
+            "train_val_gap":   horizon_info.get("gap_periods")    if rank_info else None,
+            "id_to_date":      rank_info["id_to_date"]   if rank_info else None,
+            "id_to_rank":      rank_info["id_to_rank"]   if rank_info else None,
+            "rank_to_date":    {str(k): v for k, v in rank_info["rank_to_date"].items()}
+                                if rank_info else None,
+            "unmapped_train":  rank_info["unmapped_train"] if rank_info else [],
+            "unmapped_val":    rank_info["unmapped_val"]   if rank_info else [],
+        },
         "distribution_shifts":      ks_results,
         "n_train_rows":             len(train_df),
         "n_val_rows":               len(val_df),

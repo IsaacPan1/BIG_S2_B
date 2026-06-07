@@ -36,6 +36,31 @@ REPO        = Path(__file__).resolve().parent.parent
 DATA_DIR    = REPO / "data"
 REPORTS_DIR = REPO / "reports"
 
+# ── dtype + cardinality gate ──────────────────────────────────────────────────
+# Maximum n_unique for a non-numeric column to be admitted as a categorical
+# (target-encoded for Ridge / cat_feature for CatBoost). Above this threshold a
+# non-numeric column is treated as free text / quasi-identifier and DROPPED from
+# the model contract entirely: not in feature_columns, not in expert_features,
+# not in any adaptive_steps targets list. Rationale: target-encoding a near-
+# unique string keys the per-fold target mean on row identity, which is a
+# direct label leak; and a raw text column also upcasts the model matrix to
+# object dtype. Decision is by TYPE + n_unique, never by column name, so the
+# gate generalises across datasets. Tune CARD_MAX up if a legitimate high-card
+# discrete category (e.g. ZIP code) must be admitted.
+CARD_MAX = 50
+
+
+def extract_numeric_from_text(series: "pd.Series") -> "pd.Series | None":
+    """No-op placeholder hook for deriving NUMERIC features from a dropped
+    high-cardinality text column (e.g. presence flag, character length,
+    recency counter, keyword indicators). Intentionally unimplemented — the
+    cardinality gate currently drops such columns from the model contract.
+    When derived numerics are desired later, implement this and call it for
+    each name in features.json["dropped_columns"], then append the resulting
+    numeric series to the train/val frames BEFORE the enumeration block."""
+    _ = series
+    return None
+
 # ── Load profile ───────────────────────────────────────────────────────────────
 with open(REPORTS_DIR / "profile.json") as f:
     profile = json.load(f)
@@ -730,16 +755,57 @@ if time_col is None:
         train_feat["adversarial_weights"] = _av_weights
         print("adversarial_weights column added to features_train")
 
+    # Parquet write is deferred until AFTER the dtype+cardinality gate (below)
+    # so columns flagged by the gate are physically removed from the written
+    # parquet — the modeler reads raw parquet columns and does not honor the
+    # expert_features contract.
+
+    # ── Enumerate feature columns ──────────────────────────────────────────────
+    id_and_target_set = {id_col, target_col, image_link_col, "adversarial_weights"} | set(group_cols)
+    _xs_candidate_cols = [c for c in train_feat.columns
+                          if c not in id_and_target_set and c != target_col]
+    # Same dtype + cardinality gate as the panel path (see CARD_MAX at module top).
+    feature_cols: list[str] = []
+    dropped_columns: list[dict] = []
+    for _c in _xs_candidate_cols:
+        _s = train_feat[_c]
+        if pd.api.types.is_numeric_dtype(_s):
+            feature_cols.append(_c)
+            continue
+        _nu = int(_s.nunique(dropna=True))
+        if _nu <= CARD_MAX:
+            feature_cols.append(_c)
+        else:
+            dropped_columns.append({
+                "name":     _c,
+                "dtype":    str(_s.dtype),
+                "n_unique": _nu,
+                "reason":   "high-cardinality non-numeric / free text",
+            })
+    if dropped_columns:
+        print("Dropped from model contract by dtype+cardinality gate "
+              f"(CARD_MAX={CARD_MAX}):")
+        for _d in dropped_columns:
+            print(f"  - {_d['name']}  dtype={_d['dtype']}  "
+                  f"n_unique={_d['n_unique']}  ({_d['reason']})")
+    print(f"Total feature columns: {len(feature_cols)}")
+
+    # Physically remove gated columns from train_feat / val_feat before writing.
+    # Identifiers (id_col, group_cols, time_col, target_col, image_link_col,
+    # adversarial_weights) cannot appear in dropped_columns — they were excluded
+    # from _xs_candidate_cols via id_and_target_set.
+    _dropped_names_for_parquet = [d["name"] for d in dropped_columns]
+    if _dropped_names_for_parquet:
+        train_feat = train_feat.drop(columns=_dropped_names_for_parquet)
+        val_feat   = val_feat.drop(
+            columns=[c for c in _dropped_names_for_parquet if c in val_feat.columns]
+        )
+        print(f"Dropped from written parquet: {_dropped_names_for_parquet}")
+
     train_feat.to_parquet(DATA_DIR / "features_train.parquet", index=False)
     val_feat.to_parquet(  DATA_DIR / "features_val.parquet",   index=False)
     print(f"features_train: {train_feat.shape}")
     print(f"features_val:   {val_feat.shape}")
-
-    # ── Enumerate feature columns ──────────────────────────────────────────────
-    id_and_target_set = {id_col, target_col, image_link_col, "adversarial_weights"} | set(group_cols)
-    feature_cols = [c for c in train_feat.columns
-                    if c not in id_and_target_set and c != target_col]
-    print(f"Total feature columns: {len(feature_cols)}")
 
     # ── Write features.json ───────────────────────────────────────────────────
     features_meta = {
@@ -751,6 +817,8 @@ if time_col is None:
         "feature_families":       _families,
         "feature_columns":        feature_cols,
         "total_features_planned": len(feature_cols),
+        "dropped_columns":        dropped_columns,
+        "card_max":               CARD_MAX,
         "lag_periods":            [],
         "rolling_windows":        [],
         "train_shape":            list(train_feat.shape),
@@ -1934,17 +2002,71 @@ features_val   = full[full[_tc] >  train_time_max].copy()
 assert features_val[target_col].isna().all(),    "Val target should be all NaN"
 assert features_train[target_col].notna().all(), "Train target has unexpected NaN"
 
-features_train.to_parquet(DATA_DIR / "features_train.parquet", index=False)
-features_val.to_parquet(  DATA_DIR / "features_val.parquet",   index=False)
-print(f"features_train: {features_train.shape}")
-print(f"features_val:   {features_val.shape}")
+# Parquet write is deferred until AFTER the dtype+cardinality gate (below) so
+# that columns flagged by the gate are physically removed from the written
+# parquet — the modeler reads raw parquet columns and does not honor the
+# expert_features contract, so the contract alone is not enough.
 
 # ── 15. Enumerate feature columns ─────────────────────────────────────────────
 id_and_target = set(group_cols + [time_col, target_col, "adversarial_weights"])
 if _is_datetime_time:
     id_and_target.add(_time_col_numeric)  # exclude the internal ordinal column
-feature_cols  = [c for c in features_train.columns if c not in id_and_target]
+_candidate_cols = [c for c in features_train.columns if c not in id_and_target]
+
+# Dtype + cardinality gate. Numeric → kept as a model feature; non-numeric with
+# n_unique <= CARD_MAX → kept as a low-card categorical (later target-encoded);
+# non-numeric with n_unique > CARD_MAX → DROPPED from the model contract and
+# recorded in features.json["dropped_columns"] for audit. Decision is by type +
+# n_unique, never by name.
+feature_cols: list[str] = []
+_low_card_categoricals: list[str] = []
+dropped_columns: list[dict] = []
+for _c in _candidate_cols:
+    _s = features_train[_c]
+    if pd.api.types.is_numeric_dtype(_s):
+        feature_cols.append(_c)
+        continue
+    _nu = int(_s.nunique(dropna=True))
+    if _nu <= CARD_MAX:
+        feature_cols.append(_c)
+        _low_card_categoricals.append(_c)
+    else:
+        dropped_columns.append({
+            "name":     _c,
+            "dtype":    str(_s.dtype),
+            "n_unique": _nu,
+            "reason":   "high-cardinality non-numeric / free text",
+        })
+        # Hook: a future implementation may extract derived numerics via
+        # extract_numeric_from_text(_s) and append them to features_train/val
+        # before this block. Intentionally not invoked here.
+
+if dropped_columns:
+    print("Dropped from model contract by dtype+cardinality gate "
+          f"(CARD_MAX={CARD_MAX}):")
+    for _d in dropped_columns:
+        print(f"  - {_d['name']}  dtype={_d['dtype']}  "
+              f"n_unique={_d['n_unique']}  ({_d['reason']})")
 print(f"Total feature columns: {len(feature_cols)}")
+
+# Physically remove gated columns from features_train / features_val before
+# writing the parquet. Identifiers (group_cols, time_col, target_col,
+# adversarial_weights) cannot appear in dropped_columns because they were
+# excluded from _candidate_cols via id_and_target — so the drop only affects
+# gated covariates. The modeler reads raw parquet columns; this prevents the
+# object-dtype upcast / silent CatBoost hang regardless of the contract.
+_dropped_names_for_parquet = [d["name"] for d in dropped_columns]
+if _dropped_names_for_parquet:
+    features_train = features_train.drop(columns=_dropped_names_for_parquet)
+    features_val   = features_val.drop(
+        columns=[c for c in _dropped_names_for_parquet if c in features_val.columns]
+    )
+    print(f"Dropped from written parquet: {_dropped_names_for_parquet}")
+
+features_train.to_parquet(DATA_DIR / "features_train.parquet", index=False)
+features_val.to_parquet(  DATA_DIR / "features_val.parquet",   index=False)
+print(f"features_train: {features_train.shape}")
+print(f"features_val:   {features_val.shape}")
 
 # ── 16. Write features.json ────────────────────────────────────────────────────
 features_meta = {
@@ -1956,6 +2078,8 @@ features_meta = {
     "feature_families":       _families,
     "feature_columns":        feature_cols,
     "total_features_planned": len(feature_cols),
+    "dropped_columns":        dropped_columns,
+    "card_max":               CARD_MAX,
     "lag_periods":            LAG_PERIODS,
     "rolling_windows":        ROLL_WINDOWS,
     "smart_lag_imputation":   _smart_lag_meta,
@@ -1998,13 +2122,21 @@ _expert_columns = list(feature_cols)
 
 # Categorical-like columns that should be target-encoded for Ridge and passed as
 # cat_features for CatBoost. Group columns are always cat-like; pass-through
-# string/object covariates also qualify.
+# string/object covariates qualify only if they survived the CARD_MAX gate
+# above (i.e. appear in feature_cols / _low_card_categoricals). High-cardinality
+# text columns dropped by the gate must NEVER reach _te_targets — encoding a
+# near-unique string with the target is a row-id leak.
+_dropped_names = {_d["name"] for _d in dropped_columns}
 _te_targets: list[str] = []
 for _c in group_cols:
-    if _c in features_train.columns and _c not in _te_targets:
+    if (_c in features_train.columns
+            and _c not in _dropped_names
+            and _c not in _te_targets):
         _te_targets.append(_c)
 for _c in (cov_cols if isinstance(cov_cols, list) else []):
-    if _c in features_train.columns and not pd.api.types.is_numeric_dtype(features_train[_c]):
+    if (_c in features_train.columns
+            and _c not in _dropped_names
+            and not pd.api.types.is_numeric_dtype(features_train[_c])):
         if _c not in _te_targets:
             _te_targets.append(_c)
 

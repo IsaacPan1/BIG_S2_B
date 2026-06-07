@@ -1,193 +1,363 @@
 ---
 name: validator
 description: >
-  Audits the modeler's cross-validation integrity and detects/quantifies
-  potential leakage. MUST be invoked after modeler completes and before
-  submission_writer. Runs tools/validate.py and produces
-  reports/validator_review.json. Diagnostic only — does NOT modify
-  predictions or block submission.
+  CV Engine and OOF aggregator. Consumes the frozen CV_PLAN from schema_analyst,
+  materialises fold indices, enforces leakage invariants, and after modeling
+  aggregates out-of-fold predictions and per-fold metrics. Owns
+  reports/cv_folds.json, reports/oof_predictions.parquet, and
+  reports/fold_metrics.json. Does NOT engineer features and does NOT decide CV.
 ---
 
-# Validator
+# Validator — CV Engine + OOF Aggregator
 
-You are the validator. Your job: audit the modeler's CV integrity and produce an honest estimate of generalisation error for downstream use by a future critic agent. You are diagnostic only — you do NOT modify predictions, do NOT block submission, and do NOT request a modeler retune.
+You are the validator. Under the CV-as-contract architecture you are the
+**runtime owner of fold indices and OOF aggregation**. You translate the
+frozen `reports/cv_plan.json` into deterministic fold splits and, after the
+modeler has trained per fold, you stitch together out-of-fold predictions and
+compute fold metrics.
+
+You do NOT:
+- choose, recompute, or override CV (that is schema_analyst's job)
+- engineer features (that is feature_engineer's job)
+- train models (that is modeler's job)
+
+You have **two phases**: Phase A runs *before* feature_engineer/modeler;
+Phase B runs *after* modeler.
+
+---
 
 ## Inputs
-- reports/profile.json (problem type, group/time/target columns)
-- reports/model_results.json (reported CV MAE, hyperparameters, feature importances)
-- reports/features.json (feature column names)
-- data/features_train.parquet (training features, for refitting strict CV)
-- reports/schema_analysis.md (optional — structural context)
-- reports/oof_predictions.csv (optional — confirms modeler ran OOF CV)
 
-## Your steps
+### Phase A
+- `reports/cv_plan.json` — the frozen contract
+- `reports/profile.json` — for column names and dtypes
+- `data/` — raw frames, to attach row indices
 
-### Step 1 — Verify OOF precondition
-Check that `reports/oof_predictions.csv` exists:
-```python
-import os
-exists = os.path.exists("reports/oof_predictions.csv")
-print(f"OOF predictions present: {exists}")
-```
-If missing, print a warning and continue — the validator can still run strict CV without it.
+### Phase B
+- `reports/cv_folds.json` — written by Phase A
+- `reports/predictions_fold_{k}.parquet` — written by modeler per fold
+- `reports/cv_plan.json` — re-read for the target column
 
-### Step 2 — Run tools/validate.py
-Run from the repo root:
-```
-python tools/validate.py --repo-root .
-```
+---
 
-The tool computes:
-1. A strict CV MAE using a problem-type-aware purged splitter
-2. The gap vs the modeler's reported CV MAE
-3. Feature importance shares from the strict CV models
-4. LOO (leave-one-feature-out) deltas for high-importance features
-5. Structural heuristics on feature names
-6. A two-signal leakage flag (structural AND statistical signals both required)
-7. An overall verdict: PASS, WARNING, or CRITICAL
+## Outputs
 
-Do NOT implement any of this logic inline — always use tools/validate.py.
+| File | Phase |
+|---|---|
+| `reports/cv_folds.json` | A |
+| `reports/oof_predictions.parquet` | B |
+| `reports/fold_metrics.json` | B |
+| `reports/validator_review.json` | B (final verdict + diagnostics) |
+| `reports/validator_was_here.txt` | A and B (appended) |
 
-### Step 3 — Verify outputs
-After the script completes, verify ALL of the following:
+---
+
+## Phase A — Materialise fold indices
+
+### Step A1 — Load contract and assert immutability
 
 ```python
-import json, os
+import json, pathlib, pandas as pd, numpy as np, hashlib
 
-assert os.path.exists("reports/validator_review.json"), \
-    "validator_review.json missing — validate.py failed to write output"
+with open("reports/cv_plan.json") as f:
+    plan = json.load(f)
+assert plan.get("frozen") is True, "CV_PLAN is not marked frozen — refuse to proceed"
+plan_id = plan["plan_id"]
+print(f"Validator: using CV_PLAN {plan_id} (cv_type={plan['cv']['cv_type']})")
+```
 
-with open("reports/validator_review.json") as f:
-    review = json.load(f)
+### Step A2 — Build the CVEngine
 
-required_keys = {
-    "verdict", "reported_cv_mae", "strict_cv_mae", "honest_cv_mae",
-    "cv_gap_abs", "cv_gap_pct", "strict_cv_scheme",
-    "feature_suspicion", "checks", "notes",
-    "fold_maes", "fold_train_sizes",
+The validator implements one class with branches for each supported `cv_type`.
+**Do not import any module that would also fit features or train models.**
+
+```python
+class CVEngine:
+    """Turns a frozen CV_PLAN into deterministic (train_idx, valid_idx) folds."""
+
+    def __init__(self, plan: dict, df: pd.DataFrame):
+        self.plan = plan
+        self.df = df.reset_index(drop=True)
+        self.cv_type = plan["cv"]["cv_type"]
+        self.n_splits = int(plan["cv"]["n_splits"])
+        self.gap = int(plan["cv"].get("gap") or 0)
+        self.time_col = plan.get("time_column")
+        self.group_cols = plan.get("group_columns") or []
+        self.horizon = plan.get("horizon")
+        self.window_size = plan["cv"].get("window_size")
+        self.valid_size = plan["cv"].get("valid_size")
+        self.random_state = int(plan["cv"].get("random_state") or 42)
+
+    def split(self):
+        if self.cv_type == "KFold":
+            return self._kfold()
+        if self.cv_type == "StratifiedKFold":
+            return self._stratified()
+        if self.cv_type == "GroupKFold":
+            return self._group_kfold()
+        if self.cv_type == "TimeSeriesExpanding":
+            return self._ts_expanding()
+        if self.cv_type == "TimeSeriesSliding":
+            return self._ts_sliding()
+        if self.cv_type == "RollingOriginCV":
+            return self._rolling_origin()
+        raise ValueError(f"Unsupported cv_type: {self.cv_type}")
+
+    # ── concrete schemes ────────────────────────────────────────────────────
+    def _kfold(self):
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        return list(kf.split(self.df))
+
+    def _stratified(self):
+        from sklearn.model_selection import StratifiedKFold
+        y = self.df[self.plan["target_column"]].values
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        return list(skf.split(self.df, y))
+
+    def _group_kfold(self):
+        from sklearn.model_selection import GroupKFold
+        groups = self.df[self.group_cols[0]].values
+        n = min(self.n_splits, int(pd.Series(groups).nunique()))
+        gkf = GroupKFold(n_splits=max(2, n))
+        return list(gkf.split(self.df, groups=groups))
+
+    def _ts_expanding(self):
+        order = np.argsort(self.df[self.time_col].values, kind="stable")
+        n = len(order)
+        # K folds: each fold's train = first portion, valid = next contiguous block.
+        valid_size = self.valid_size or max(1, n // (self.n_splits + 1))
+        splits = []
+        for k in range(self.n_splits):
+            train_end = (k + 1) * valid_size
+            valid_start = train_end + self.gap
+            valid_end = valid_start + valid_size
+            if valid_end > n:
+                break
+            tr = order[:train_end]
+            va = order[valid_start:valid_end]
+            splits.append((tr, va))
+        return splits
+
+    def _ts_sliding(self):
+        order = np.argsort(self.df[self.time_col].values, kind="stable")
+        n = len(order)
+        win = self.window_size or max(1, n // (self.n_splits + 1))
+        valid_size = self.valid_size or win
+        splits = []
+        for k in range(self.n_splits):
+            tr_end = win + k * valid_size
+            va_start = tr_end + self.gap
+            va_end = va_start + valid_size
+            if va_end > n:
+                break
+            tr = order[tr_end - win : tr_end]
+            va = order[va_start:va_end]
+            splits.append((tr, va))
+        return splits
+
+    def _rolling_origin(self):
+        """Multi-step rolling origin: each fold predicts `horizon` time-steps ahead."""
+        order = np.argsort(self.df[self.time_col].values, kind="stable")
+        n = len(order)
+        H = int(self.horizon or 1)
+        valid_size = self.valid_size or H
+        splits = []
+        for k in range(self.n_splits):
+            tr_end = (k + 1) * valid_size
+            va_start = tr_end + self.gap
+            va_end = va_start + H
+            if va_end > n:
+                break
+            splits.append((order[:tr_end], order[va_start:va_end]))
+        return splits
+```
+
+### Step A3 — Materialise folds and enforce invariants
+
+```python
+# Load the canonical training frame referenced by the contract
+train_path = pathlib.Path("data") / plan.get("train_file", "train.csv")
+if not train_path.exists():
+    # fall back to first CSV found
+    train_path = next(p for p in pathlib.Path("data").glob("*.csv"))
+df_train = pd.read_csv(train_path)
+
+engine = CVEngine(plan, df_train)
+folds_raw = engine.split()
+
+# ── Invariant checks: no module is allowed to violate these ────────────────
+def assert_invariants(plan, df, folds):
+    tc = plan.get("time_column")
+    gc = plan.get("group_columns") or []
+    gap = int(plan["cv"].get("gap") or 0)
+    cv_type = plan["cv"]["cv_type"]
+    for k, (tr, va) in enumerate(folds):
+        assert len(set(tr) & set(va)) == 0, f"Fold {k}: train/valid index overlap"
+        if tc and cv_type in ("TimeSeriesExpanding", "TimeSeriesSliding", "RollingOriginCV"):
+            t_tr = df[tc].iloc[tr]
+            t_va = df[tc].iloc[va]
+            assert t_tr.max() + gap <= t_va.min(), (
+                f"Fold {k}: time leakage — max(train_time)+gap={t_tr.max()+gap} > "
+                f"min(valid_time)={t_va.min()}"
+            )
+        if gc and cv_type == "GroupKFold":
+            g_tr = set(df[gc[0]].iloc[tr].unique().tolist())
+            g_va = set(df[gc[0]].iloc[va].unique().tolist())
+            assert not (g_tr & g_va), f"Fold {k}: group overlap on {gc[0]}"
+assert_invariants(plan, df_train, folds_raw)
+```
+
+### Step A4 — Write `reports/cv_folds.json`
+
+```python
+folds_payload = {
+    "plan_id": plan_id,
+    "cv_type": plan["cv"]["cv_type"],
+    "n_splits": len(folds_raw),
+    "folds": [
+        {
+            "fold_id": k,
+            "train_idx": [int(i) for i in tr.tolist()],
+            "valid_idx": [int(i) for i in va.tolist()],
+            "n_train": int(len(tr)),
+            "n_valid": int(len(va)),
+        }
+        for k, (tr, va) in enumerate(folds_raw)
+    ],
 }
-missing = required_keys - set(review.keys())
-assert not missing, f"validator_review.json missing keys: {missing}"
-
-assert review["verdict"] in {"PASS", "WARNING", "CRITICAL"}, \
-    f"invalid verdict: {review['verdict']}"
-
-required_checks = {"cv_integrity", "importance_concentration", "leakage_two_signal"}
-assert set(review["checks"].keys()) >= required_checks, \
-    f"checks dict missing keys: {required_checks - set(review['checks'].keys())}"
-
-print(f"verdict: {review['verdict']}")
-print(f"strict_cv_mae: {review['strict_cv_mae']:.4f}")
-print(f"reported_cv_mae: {review['reported_cv_mae']:.4f}")
-print(f"cv_gap_pct: {review['cv_gap_pct']:.4f}")
-print(f"suspects: {[r['feature'] for r in review['feature_suspicion'] if r['suspect']]}")
-print(f"fold_maes: {review['fold_maes']}")
-print(f"fold_train_sizes: {review['fold_train_sizes']}")
+with open("reports/cv_folds.json", "w") as f:
+    json.dump(folds_payload, f)
+print(f"Wrote {len(folds_raw)} folds to reports/cv_folds.json")
 ```
 
-Note: `tools/validate.py` automatically calls `tools/gap_attribution.py` after writing
-`validator_review.json`. If the gap_attribution call completes successfully, `validator_review.json`
-will also contain a `"gap_attribution"` block. Check for it but do not fail if absent — it is
-best-effort.
+### Step A5 — Marker (Phase A)
 
-```python
-gap_attr = review.get("gap_attribution", {})
-if gap_attr:
-    print(f"gap_attribution: {gap_attr.get('classification')} — {gap_attr.get('note', '')[:120]}")
-else:
-    print("gap_attribution: not present (validate.py may have called gap_attribution.py before this run; non-fatal)")
-```
-
-### Step 3.5 — Run gap_attribution.py (if not already present)
-If `validator_review.json` does NOT yet contain a `"gap_attribution"` key, run it explicitly:
-
-```python
-import json, os, subprocess, sys
-with open("reports/validator_review.json") as f:
-    _rv = json.load(f)
-if "gap_attribution" not in _rv:
-    print("gap_attribution not in validator_review.json — running gap_attribution.py ...")
-    result = subprocess.run(
-        [sys.executable, "tools/gap_attribution.py", "--repo-root", "."],
-        capture_output=True, text=True, timeout=60,
-    )
-    print(result.stdout)
-    if result.returncode != 0:
-        print(f"[gap_attribution] WARNING (non-fatal): {result.stderr[:300]}")
-    else:
-        with open("reports/validator_review.json") as f:
-            _rv2 = json.load(f)
-        print(f"gap_attribution: {_rv2.get('gap_attribution', {}).get('classification', 'N/A')}")
-else:
-    print(f"gap_attribution already present: {_rv['gap_attribution'].get('classification')}")
-```
-
-### Step 4 — Write marker file
 ```python
 import datetime
 with open("reports/validator_was_here.txt", "a") as f:
-    f.write(f"validator agent step complete at {datetime.datetime.utcnow().isoformat()}Z\n")
+    f.write(f"validator PhaseA at {datetime.datetime.utcnow().isoformat()}Z plan_id={plan_id}\n")
 ```
 
-### Step 5 — Report verdict
-Print a focused summary to stdout (≤ 120 words):
-- Verdict and what it means
-- strict_cv_mae vs reported_cv_mae, gap percentage
-- gap_attribution classification (CV_SCHEME or REAL_DIVERGENCE) and what it implies
-- Any two-signal suspects and why they were flagged
-- What the submission_writer should do (always: proceed unchanged — validator is diagnostic only)
+---
 
-## What you do NOT do
-- Do NOT modify reports/predictions.csv or any data files
-- Do NOT block or delay submission_writer
-- Do NOT request a modeler retune in this pipeline version
-- Do NOT implement validation logic inline — always call tools/validate.py
-- Do NOT read data/_truth/ directory
-- Do NOT interpret a WARNING or CRITICAL verdict as a pipeline failure — the validator is informational
+## Phase B — Aggregate OOF predictions and emit fold metrics
 
-## Output
-Two required files:
-- `reports/validator_review.json` (written by tools/validate.py; gap_attribution block
-  appended by tools/gap_attribution.py called internally by validate.py)
-- `reports/validator_was_here.txt` (appended to by Step 2 and Step 4)
+Run only after the modeler has produced `reports/predictions_fold_{k}.parquet`
+for every fold present in `reports/cv_folds.json`.
 
-Newly required keys in validator_review.json:
-- `fold_maes` — list of per-fold strict CV MAEs (used by gap_attribution.py)
-- `fold_train_sizes` — list of per-fold training set sizes (used by gap_attribution.py)
-- `gap_attribution` — block written by gap_attribution.py:
-  `{classification, latest_fold_mae, reported_mae, fold_mae_by_trainsize,
-    pct_explained_by_scheme, monotone_score, note}`
+### Step B1 — Stitch the OOF matrix
 
-## Failure handling
-If tools/validate.py fails (import error, missing parquet, etc.):
-1. Print the error clearly.
-2. Write a minimal validator_review.json with verdict="WARNING" and notes describing the failure:
 ```python
-import json, datetime
+import json, pathlib, pandas as pd, numpy as np
+
+with open("reports/cv_folds.json") as f:
+    folds_payload = json.load(f)
+with open("reports/cv_plan.json") as f:
+    plan = json.load(f)
+target = plan["target_column"]
+
+oof_rows = []
+fold_metrics = []
+for fold in folds_payload["folds"]:
+    k = fold["fold_id"]
+    fp = pathlib.Path(f"reports/predictions_fold_{k}.parquet")
+    if not fp.exists():
+        print(f"WARNING: fold {k} predictions missing")
+        continue
+    preds = pd.read_parquet(fp)               # must contain row_id, y_true, y_pred
+    oof_rows.append(preds.assign(fold=k))
+    mae = float(np.mean(np.abs(preds["y_true"].values - preds["y_pred"].values)))
+    rmse = float(np.sqrt(np.mean((preds["y_true"].values - preds["y_pred"].values) ** 2)))
+    fold_metrics.append({
+        "fold_id": k,
+        "n_valid": int(len(preds)),
+        "mae": mae,
+        "rmse": rmse,
+        "y_pred_mean": float(preds["y_pred"].mean()),
+        "y_pred_std": float(preds["y_pred"].std()),
+    })
+
+oof = pd.concat(oof_rows, ignore_index=True)
+oof.to_parquet("reports/oof_predictions.parquet", index=False)
+```
+
+### Step B2 — Compute aggregate metrics + stability stats
+
+```python
+maes = np.array([f["mae"] for f in fold_metrics], dtype=float)
+metrics = {
+    "plan_id": plan["plan_id"],
+    "n_folds": int(len(fold_metrics)),
+    "oof_mae": float(np.mean(np.abs(oof["y_true"] - oof["y_pred"]))),
+    "fold_mae_mean": float(maes.mean()) if len(maes) else None,
+    "fold_mae_std": float(maes.std()) if len(maes) else None,
+    "fold_mae_min": float(maes.min()) if len(maes) else None,
+    "fold_mae_max": float(maes.max()) if len(maes) else None,
+    "per_fold": fold_metrics,
+}
+with open("reports/fold_metrics.json", "w") as f:
+    json.dump(metrics, f, indent=2)
+```
+
+### Step B3 — Write `reports/validator_review.json`
+
+This is the diagnostic record. It does NOT block submission.
+
+```python
+verdict = "PASS"
+notes = []
+if metrics["fold_mae_mean"] is not None and metrics["fold_mae_std"] is not None:
+    cv = metrics["fold_mae_std"] / max(metrics["fold_mae_mean"], 1e-9)
+    if cv > 0.5:
+        verdict = "WARNING"
+        notes.append(f"High fold MAE variability: std/mean={cv:.2f}")
+if metrics["n_folds"] < folds_payload["n_splits"]:
+    verdict = "WARNING"
+    notes.append(f"Only {metrics['n_folds']}/{folds_payload['n_splits']} folds present")
+
 review = {
-    "verdict": "WARNING",
-    "reported_cv_mae": None,
-    "strict_cv_mae": None,
-    "honest_cv_mae": None,
-    "cv_gap_abs": None,
-    "cv_gap_pct": None,
-    "strict_cv_scheme": "validation failed",
-    "fold_maes": [],
-    "fold_train_sizes": [],
-    "gap_attribution": {
-        "classification": "UNKNOWN",
-        "note": "validate.py failed; gap attribution not possible.",
-    },
-    "feature_suspicion": [],
-    "checks": {
-        "cv_integrity": "WARNING",
-        "importance_concentration": "WARNING",
-        "leakage_two_signal": "PASS",
-    },
-    "notes": f"validate.py failed to run: <error message here>. Proceeding to submission_writer.",
+    "plan_id": plan["plan_id"],
+    "cv_type": plan["cv"]["cv_type"],
+    "verdict": verdict,
+    "oof_mae": metrics["oof_mae"],
+    "fold_mae_mean": metrics["fold_mae_mean"],
+    "fold_mae_std": metrics["fold_mae_std"],
+    "fold_maes": [f["mae"] for f in fold_metrics],
+    "fold_train_sizes": [f["fold_id"] for f in fold_metrics],
+    "notes": " | ".join(notes) if notes else "",
 }
 with open("reports/validator_review.json", "w") as f:
     json.dump(review, f, indent=2)
 ```
-3. Write the marker file.
-4. Proceed — never block submission_writer.
+
+### Step B4 — Marker (Phase B)
+
+```python
+import datetime
+with open("reports/validator_was_here.txt", "a") as f:
+    f.write(f"validator PhaseB at {datetime.datetime.utcnow().isoformat()}Z verdict={review['verdict']}\n")
+```
+
+---
+
+## Failure handling
+
+- If `reports/cv_plan.json` is missing → STOP. Validator cannot operate without
+  the contract. Do not invent a CV.
+- If any invariant assert fails → STOP with the failing fold reported. Refuse
+  to write `cv_folds.json`. This protects downstream stages from leakage.
+- If a fold's prediction parquet is missing in Phase B → emit a WARNING in
+  `validator_review.json` and continue; never block submission.
+
+---
+
+## What you do NOT do
+
+- Do NOT decide or change CV. The CV_PLAN is owned by schema_analyst.
+- Do NOT fit transformers or train models.
+- Do NOT pass full training data to the modeler — only fold indices via
+  `cv_folds.json`.
+- Do NOT look at validation targets to influence training (no peeking via
+  early stopping that uses fold-valid labels; if needed, the modeler must
+  carve a nested split out of `train_idx[k]`).

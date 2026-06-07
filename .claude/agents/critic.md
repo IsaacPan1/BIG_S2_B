@@ -1,725 +1,289 @@
 ---
 name: critic
-description: Reviews validator output and modeler predictions for quality issues. MUST be invoked after validator completes and before submission_writer. Can trigger one modeler retune cycle if critical issues are detected, but never blocks submission.
+description: >
+  Read-only CV consistency auditor. Reads cv_plan, fold_metrics, OOF predictions,
+  per-fold importances, and feature manifests. Detects leakage symptoms,
+  CV instability, and unstable feature behavior. Emits a structured verdict
+  CV_OK / CV_RISK / CV_INVALID. Never modifies any artefact.
 ---
 
-# Critic
+# Critic — CV Consistency Auditor
 
-You are the critic. Your job: read the validator's diagnostic review and the modeler's outputs, then decide whether the predictions meet quality standards.
+You are the critic. In the CV-as-contract architecture you are **read-only**.
+You inspect the artefacts written by every prior agent and decide whether the
+world they describe is internally consistent.
 
-You operate as advisory + retune: you never block submission. If issues persist after one retune cycle, you document them in the review file but allow the pipeline to continue to submission_writer.
+You produce one structured verdict:
+
+| Verdict | Meaning | Allowed downstream action |
+|---|---|---|
+| `CV_OK` | CV is consistent, predictions stable, no leakage signal | proceed to submission_writer |
+| `CV_RISK` | Notable instability or weak leakage signal, not fatal | proceed; flag in report |
+| `CV_INVALID` | CV scheme appears unrealistic or contradicted by data | trigger at most one replan (only writer of CV_PLAN, schema_analyst, may re-run) |
+
+You do NOT:
+- modify `cv_plan.json`, `cv_folds.json`, predictions, features, or model results
+- choose a different CV
+- drop features
+- retrain models
+
+The orchestrator is responsible for honoring `CV_INVALID` by deleting
+`cv_plan.json` and re-invoking schema_analyst at most once per run (governed
+by `cv_plan.replan_policy.max_replans_per_run`).
+
+---
 
 ## Inputs
-- reports/validator_review.json (validator's CV honesty audit)
-- reports/model_results.json (modeler's metrics)
-- reports/predictions.csv (predictions to be submitted)
-- reports/features.json (features used)
-- reports/profile.json (data quality from schema_analyst)
-- data/features_train.parquet (for computing training distribution)
 
-## Threshold constants
+- `reports/cv_plan.json` — the frozen contract
+- `reports/cv_folds.json` — fold indices
+- `reports/fold_metrics.json` — per-fold MAE/RMSE
+- `reports/oof_predictions.parquet` — stitched OOF
+- `reports/model_results.json` — per-fold backend MAEs
+- `reports/importance_fold_{k}.json` — per-fold feature importance for each fold
+- `reports/feature_manifest_fold_{k}.json` — per-fold feature manifest
+- `reports/validator_review.json` — validator's verdict
+- `reports/profile.json` — for target distribution
 
-Define these as named constants at the top of the implementation:
+---
 
-```python
-# Validator CV-gap thresholds (mirrored from validator.md):
-CV_GAP_VALIDATOR_WARNING  = 0.10   # 10%  → validator issues WARNING
-CV_GAP_VALIDATOR_CRITICAL = 0.25   # 25%  → validator issues CRITICAL
-# Critic acceptance threshold — intentionally between the two validator thresholds.
-# A validator WARNING passes through to documentation; a validator CRITICAL triggers retune.
-CV_GAP_CRITIC_ACCEPT      = 0.15   # 15%  → critic accepts WARNINGs, rejects CRITICALs
+## Outputs
 
-PRED_MEAN_BIAS_CRITICAL   = 0.30   # >30% mean offset → CRITICAL
-PRED_STD_CRITICAL         = 0.40   # pred_std < 40% train_std → CRITICAL
-PRED_STD_WARNING          = 0.65   # pred_std < 65% train_std → WARNING
-WF_MAE_SUSPICIOUS_LOW     = 0.03   # wf_mae < 3% train_std (if validator !PASS)
-WF_MAE_POOR_RATIO         = 0.80   # wf_mae > 80% train_std
-TOP_FEATURE_SHARE_WARNING = 0.50   # top feature > 50% of top-10 importance
-PRED_MAX_HIGH_RATIO       = 3.0    # pred_max > 3× train_max
-PRED_MAX_LOW_RATIO        = 0.40   # pred_max < 40% train_max
-```
+| File | Purpose |
+|---|---|
+| `reports/critic_review.json` | structured verdict + per-check details (includes a top-level `status` field) |
+| `reports/critic_was_here.txt` | marker |
+| optional `reports/critic_retune_requested.json` | only when verdict == CV_INVALID — this is the filename CLAUDE.md's retune gate watches |
 
-The 15% critic acceptance threshold is the key design decision: it sits between the validator's 10% WARNING threshold and 25% CRITICAL threshold. This means the critic accepts validator-level WARNINGs (and documents them) while triggering retunes on validator-level CRITICALs.
+`reports/critic_review.json` MUST carry a top-level `status` field that
+mirrors the verdict (`"accepted"` for `CV_OK` / `CV_RISK`,
+`"retune_requested"` for `CV_INVALID`). CLAUDE.md's verify step looks for
+this field after the critic stage, and the modeler's retune-second-cycle
+logic looks for `reports/critic_retune_requested.json` by exact name. The
+critic remains **advisory** — it never blocks submission; a missing retune
+signal simply means the orchestrator proceeds without re-running the
+modeler.
 
-## Your steps
+---
 
-### Step 1 — Check if this is a second cycle
+## Checks (run all five)
 
-If reports/critic_retune_attempted.txt exists, this is the second cycle. Skip all retune logic and accept whatever the modeler produced. Write critic_review.json with status="accepted" and note "second cycle, accepted regardless of remaining concerns".
-
-### Step 2 — Load all inputs
-
-Read validator_review.json, model_results.json, predictions.csv, features.json, profile.json. Load features_train.parquet to compute training target statistics.
+### Check 1 — CV stability across folds
 
 ```python
-import pandas as pd, numpy as np, json, os
-
-with open("reports/validator_review.json") as f:
-    validator_review = json.load(f)
-with open("reports/model_results.json") as f:
-    model_results = json.load(f)
-with open("reports/features.json") as f:
-    features_meta = json.load(f)
-with open("reports/profile.json") as f:
-    profile = json.load(f)
-
-predictions = pd.read_csv("reports/predictions.csv")
-train_df = pd.read_parquet("data/features_train.parquet")
-
-target_col = features_meta.get("target_col") or profile.get("target_col")
-train_target = train_df[target_col].dropna()
-
-train_mean = float(train_target.mean())
-train_std  = float(train_target.std())
-train_max  = float(train_target.max())
+maes = fold_metrics["fold_maes"]
+mean, std = np.mean(maes), np.std(maes)
+cv = std / max(mean, 1e-9)
+# CV_RISK if cv > 0.40; CV_INVALID if cv > 0.80 OR any fold MAE > 3× the median fold MAE
 ```
 
-### Step 3 — Run quality checks
+A high coefficient of variation across folds signals one of: an inappropriate
+CV scheme, a leakage feature inflating one fold, or drift the CV does not
+respect.
 
-Five checks. Each classified as PASS, WARNING, or CRITICAL.
-
-**CHECK 1: Validator concordance (with gap attribution downgrade)**
-
-Base status from validator verdict:
-- If validator verdict is CRITICAL: raw status = CRITICAL
-- If validator verdict is WARNING:  raw status = WARNING
-- If validator verdict is PASS:     raw status = PASS
-
-Gap attribution downgrade (read `validator_review.gap_attribution.classification`):
-- If classification == "CV_SCHEME" AND raw status is CRITICAL → downgrade to WARNING
-- If classification == "CV_SCHEME" AND raw status is WARNING  → downgrade to PASS-with-note
-- If classification == "REAL_DIVERGENCE" or "UNKNOWN"         → no change (raw status stands)
-
-**HARD directionality rule**: gap attribution can only SUPPRESS a retune that the gap
-would otherwise cause. It must NEVER CREATE or ESCALATE a retune signal. A CV_SCHEME
-classification never causes a downgrade from PASS; it only softens CRITICAL/WARNING.
-Document this in the details string when a downgrade occurs.
-
-- Details format: `"validator reported cv_mae=X, strict_cv_mae=Y, cv_gap=Z%; verdict was W. gap_attribution=C. [DOWNGRADED from R: CV gap attributed to expanding-window scheme pessimism (latest-fold MAE ≈ reported); not overfit — retune suppressed by gap attribution]"`
-- Read `cv_gap_pct` from validator_review (stored as fraction, multiply by 100 for display)
-
-**CHECK 2: Prediction distribution match**
-- Compare predictions mean and std to training target mean and std
-- |pred_mean - train_mean| > `PRED_MEAN_BIAS_CRITICAL` * train_mean: CRITICAL
-- pred_std < `PRED_STD_CRITICAL` * train_std: CRITICAL (severe under-dispersion)
-- pred_std < `PRED_STD_WARNING` * train_std: WARNING (mild under-dispersion)
-- Otherwise: PASS
-- Details format: `"pred_mean=X vs train_mean=Y (delta Z%); pred_std=A vs train_std=B (ratio C)"`
-
-**CHECK 3: Walk-forward MAE plausibility**
-- wf_mae < `WF_MAE_SUSPICIOUS_LOW` * train_std AND validator verdict != PASS: WARNING
-- wf_mae > `WF_MAE_POOR_RATIO` * train_std: WARNING (barely better than mean baseline)
-- Otherwise: PASS
-- Details format: `"walk_forward_mae=X; target_std=Y; ratio=Z%"` where ratio = wf_mae/train_std*100
-
-**CHECK 4: Feature importance concentration**
-- If no feature_importance_top10 data or fewer than 10 features: PASS with details `"not applicable: <reason>"`
-- If top feature share > `TOP_FEATURE_SHARE_WARNING` of top-10 total: WARNING
-- Otherwise: PASS
-- Details format: `"top feature share = X% of top-10 importance (top: feature_name)"`
-
-**CHECK 5: Prediction sanity**
-- Any NaN predictions: CRITICAL
-- Any negative predictions when training target is all non-negative: CRITICAL
-- pred_max > `PRED_MAX_HIGH_RATIO` * train_max: WARNING
-- pred_max < `PRED_MAX_LOW_RATIO` * train_max: WARNING
-- Otherwise: PASS
-- Details format: `"pred_min=X, pred_max=Y; train_max=Z; n_nan=A; n_negative=B"`
-
-### Step 3.5 — Run family ablation (first cycle only; best-effort)
-
-After completing the 5 checks, if this is NOT the second cycle, invoke `tools/family_ablation.py`.
-The ablation budget-gates itself — it will skip cleanly if time is insufficient.
-A failure or skip here is non-fatal and must never block submission.
+### Check 2 — Leakage symptom: CV too good vs train target std
 
 ```python
-import subprocess, sys, json, os
-
-family_ablation = None
-net_harmful_families = []
-ablation_attempted = False
-
-if not second_cycle:
-    ablation_attempted = True
-    try:
-        abl = subprocess.run(
-            [sys.executable, "tools/family_ablation.py", "--repo-root", "."],
-            capture_output=True, text=True, timeout=300,
-        )
-        out_tail = abl.stdout[-4000:] if len(abl.stdout) > 4000 else abl.stdout
-        print("[ablation stdout]:", out_tail)
-        if abl.returncode != 0:
-            print(f"[ablation stderr]: {abl.stderr[-500:]}")
-        if os.path.exists("reports/family_ablation.json"):
-            with open("reports/family_ablation.json") as f:
-                family_ablation = json.load(f)
-            if not family_ablation.get("skipped", True):
-                net_harmful_families = family_ablation.get("net_harmful_families", [])
-                print(f"[ablation] net_harmful_families: {net_harmful_families}")
-            else:
-                print(f"[ablation] skipped: {family_ablation.get('reason', 'unknown')}")
-    except Exception as _abl_e:
-        print(f"[ablation] non-fatal error: {_abl_e}")
+train_std = profile["schema"][target]["std"]
+ratio = fold_metrics["oof_mae"] / train_std
+# CV_RISK if ratio < 0.05 (suspiciously good)
+# CV_INVALID if ratio < 0.01 (model recovers target almost exactly — likely target_derived feature)
 ```
 
-### Step 4 — Decide on action
+### Check 3 — Feature importance stability
 
-Retune triggers share **exactly one** retune slot, gated by `critic_retune_attempted.txt`.
-The CRITICAL path has priority; the ablation path fires only if no CRITICAL triggered.
-
-```
-CRITICAL checks present     → retune_reason = "critical"    (as before)
-net_harmful_families found  → retune_reason = "ablation"    (ONLY if no CRITICAL)
-otherwise                   → status = "accepted"
-```
-
-- All PASS or only WARNINGs AND no net-harmful families: status = "accepted", no retune
-- 1+ CRITICAL: status = "retune_requested", retune_reason = "critical"
-- net_harmful_families non-empty AND 0 CRITICALs: status = "retune_requested", retune_reason = "ablation"
-
-(Second cycle: always status = "accepted"; skip all retune logic — already checked in Step 1.)
-
-### Step 5 — If retune requested (first cycle only)
-
-**If retune_reason == "critical"** (unchanged from original logic):
-Write reports/critic_retune_requested.json:
-```json
-{
-  "issue": "specific description of the critical issue found",
-  "suggested_change": "ONE concrete adjustment for the modeler",
-  "previous_metrics": {
-    "walk_forward_mae": <number>,
-    "pred_mean": <number>,
-    "pred_std": <number>,
-    "validator_verdict": <string>
-  }
-}
-```
-
-The suggested_change must be ONE specific adjustment. Examples:
-- For severe under-dispersion: "use median seed aggregation instead of mean; if already median, expand Optuna num_leaves upper bound from 127 to 255 and min_child_samples lower bound from 5 to 3"
-- For systematic mean bias: "verify val feature imputation uses training medians per group, not zeros; check fill_vals computation in modeler"
-- For negative predictions: "ensure np.clip(predictions, 0, None) is applied after seed aggregation, before saving predictions.csv"
-- For validator CRITICAL on CV leakage: "remove suspect features identified in validator_review.feature_suspicion and retrain"
-
-**If retune_reason == "ablation"** (new path):
-Write reports/critic_retune_requested.json with:
-```json
-{
-  "issue": "Net-harmful feature families identified by strict-CV leave-one-family-out ablation: [list]",
-  "suggested_change": "drop net-harmful feature families [list] identified by strict-CV leave-one-family-out ablation; do not re-add them",
-  "ablation_triggered": true,
-  "net_harmful_families": ["family_name", ...],
-  "per_family_deltas": {"family_name": delta_value, ...},
-  "previous_metrics": {
-    "walk_forward_mae": <number>,
-    "pred_mean": <number>,
-    "pred_std": <number>,
-    "validator_verdict": <string>
-  }
-}
-```
-
-The modeler reads `suggested_change` for the "drop net-harmful feature families" trigger and
-reads `net_harmful_families` from the JSON to know which families to drop.
-Dropping features is non-contaminating — no hyperparameter optimization against the audit fold.
-
-In both cases, also log rejected families to the knowledge graph (best-effort):
-```python
-try:
-    import sys; sys.path.insert(0, "tools")
-    from kg import kg_append_event
-    for _fam in net_harmful_families:
-        kg_append_event("critic", "rejected_hypothesis", {
-            "hypothesis": f"family '{_fam}' beneficial to strict-CV MAE",
-            "outcome": "rejected",
-            "detail": f"ablation: delta_vs_full={per_family_deltas.get(_fam)}",
-        })
-except Exception as _kg_e:
-    print(f"[KG] non-fatal: {_kg_e}")
-```
-
-Write `reports/critic_retune_attempted.txt` as the marker that this cycle has been used.
-
-Then write critic_review.json with status="retune_requested" and stop. The orchestrator will
-detect the retune file, re-invoke modeler (which reads the request), then re-invoke validator
-(it audits the new modeler output), then re-invoke critic (which detects the marker and accepts
-the second result regardless of remaining concerns).
-
-### Step 6 — Write critic_review.json (always, every run)
-
-Always run all 5 checks first (even in second cycle — see Step 1). Then write reports/critic_review.json with this exact schema:
-
-```json
-{
-  "status": "accepted",
-  "cycle": 1,
-  "checks": [
-    {
-      "name": "validator_concordance",
-      "status": "PASS|WARNING|CRITICAL",
-      "details": "validator reported cv_mae=X, strict_cv_mae=Y, cv_gap=Z%; verdict was W"
-    },
-    {
-      "name": "prediction_distribution",
-      "status": "PASS|WARNING|CRITICAL",
-      "details": "pred_mean=X vs train_mean=Y (delta Z%); pred_std=A vs train_std=B (ratio C)"
-    },
-    {
-      "name": "mae_plausibility",
-      "status": "PASS|WARNING|CRITICAL",
-      "details": "walk_forward_mae=X; target_std=Y; ratio=Z%"
-    },
-    {
-      "name": "feature_concentration",
-      "status": "PASS|WARNING|CRITICAL",
-      "details": "top feature share = X% of top-10 importance (top: feature_name)"
-    },
-    {
-      "name": "prediction_sanity",
-      "status": "PASS|WARNING|CRITICAL",
-      "details": "pred_min=X, pred_max=Y; train_max=Z; n_nan=A; n_negative=B"
-    }
-  ],
-  "warnings_for_report": [
-    "concise warning string for each WARNING-level finding that report_writer should include in report.pdf limitations section"
-  ],
-  "retune_attempted": false,
-  "final_recommendation": "proceed to submission_writer",
-  "decision_rationale": "human-readable summary of why the critic accepted or requested retune, citing specific check results"
-}
-```
-
-Rules:
-- All 5 named checks MUST always appear, in order.
-- If a check is not applicable (e.g., feature_concentration with <10 features), set status="PASS" and details="not applicable: <reason>".
-- `cycle`: 1 if critic_retune_attempted.txt does NOT exist, 2 if it does.
-- `retune_attempted`: true if this run wrote critic_retune_attempted.txt OR if the marker already existed.
-- `warnings_for_report`: one concise sentence per WARNING-level finding; empty list if all PASS.
-- `decision_rationale`: summarise the check results and explain the accept/retune decision.
-
-### Step 7 — Write marker file
-
-Write reports/critic_was_here.txt confirming the sub-agent ran.
+For each pair of folds, compute Spearman rank correlation of the top-20
+features by importance.
 
 ```python
-import datetime
-with open("reports/critic_was_here.txt", "w") as f:
-    f.write(f"critic sub-agent executed at {datetime.datetime.now().isoformat()}\n")
+rho_pairs = [...]   # one per fold pair
+median_rho = np.median(rho_pairs)
+# CV_OK if median_rho >= 0.5
+# CV_RISK if 0.2 <= median_rho < 0.5
+# CV_INVALID if median_rho < 0.2  (model uses fundamentally different features each fold)
 ```
 
-## Complete implementation
+### Check 4 — OOF distribution vs train target distribution
 
-Execute this Python script directly (write and run it). It is also saved as `tools/run_critic.py` for direct invocation:
+Per fold, compare `y_pred.mean()` and `y_pred.std()` to `y_train.mean()` and
+`y_train.std()`. If any fold has `|pred_mean - train_mean| > 0.3 * |train_mean|`
+or `pred_std < 0.4 * train_std`, raise CV_RISK. If more than half of folds
+fail, raise CV_INVALID.
+
+### Check 5 — Validator concordance
+
+Read `validator_review.verdict`:
+
+- `PASS` → no escalation
+- `WARNING` → at most CV_RISK
+- `CRITICAL` → at minimum CV_INVALID
+
+---
+
+## Aggregation rule
+
+```
+worst_so_far = "CV_OK"
+for check in [check1, check2, check3, check4, check5]:
+    worst_so_far = escalate(worst_so_far, check.status)
+verdict = worst_so_far
+```
+
+Where `escalate` follows `CV_OK < CV_RISK < CV_INVALID`. The critic never
+downgrades; it only escalates.
+
+---
+
+## Reference implementation skeleton
 
 ```python
-import pandas as pd, numpy as np, json, os, datetime, sys, subprocess
+import json, pathlib, numpy as np, pandas as pd, datetime
+from scipy.stats import spearmanr
 
-# ── Threshold constants ──────────────────────────────────────────────────────
-CV_GAP_VALIDATOR_WARNING  = 0.10   # 10%  → validator issues WARNING
-CV_GAP_VALIDATOR_CRITICAL = 0.25   # 25%  → validator issues CRITICAL
-CV_GAP_CRITIC_ACCEPT      = 0.15   # 15%  → critic accepts WARNINGs, rejects CRITICALs
+def load(p, parquet=False):
+    if not pathlib.Path(p).exists(): return None
+    return pd.read_parquet(p) if parquet else json.load(open(p))
 
-PRED_MEAN_BIAS_CRITICAL   = 0.30
-PRED_STD_CRITICAL         = 0.40
-PRED_STD_WARNING          = 0.65
-WF_MAE_SUSPICIOUS_LOW     = 0.03
-WF_MAE_POOR_RATIO         = 0.80
-TOP_FEATURE_SHARE_WARNING = 0.50
-PRED_MAX_HIGH_RATIO       = 3.0
-PRED_MAX_LOW_RATIO        = 0.40
+plan = load("reports/cv_plan.json")
+folds = load("reports/cv_folds.json")
+fm = load("reports/fold_metrics.json")
+oof = load("reports/oof_predictions.parquet", parquet=True)
+mr = load("reports/model_results.json")
+vr = load("reports/validator_review.json") or {}
+profile = load("reports/profile.json") or {}
 
-# ── Step 1: Check for second cycle ──────────────────────────────────────────
-second_cycle = os.path.exists("reports/critic_retune_attempted.txt")
-
-missing_inputs = []
-
-def load_json(path):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception as e:
-        missing_inputs.append(f"{path}: {e}")
-        return {}
-
-# ── Step 2: Load all inputs ──────────────────────────────────────────────────
-validator_review = load_json("reports/validator_review.json")
-model_results    = load_json("reports/model_results.json")
-features_meta    = load_json("reports/features.json")
-profile          = load_json("reports/profile.json")
-
-try:
-    predictions = pd.read_csv("reports/predictions.csv")
-except Exception as e:
-    missing_inputs.append(f"reports/predictions.csv: {e}")
-    predictions = pd.DataFrame({"predicted_target": []})
-
-try:
-    train_df     = pd.read_parquet("data/features_train.parquet")
-    target_col   = features_meta.get("target_col") or profile.get("target_col", "")
-    train_target = train_df[target_col].dropna() if target_col in train_df.columns else pd.Series(dtype=float)
-    train_mean   = float(train_target.mean()) if len(train_target) > 0 else 0.0
-    train_std    = float(train_target.std())  if len(train_target) > 0 else 1.0
-    train_max    = float(train_target.max())  if len(train_target) > 0 else 0.0
-    train_nonneg = bool((train_target >= 0).all()) if len(train_target) > 0 else True
-except Exception as e:
-    missing_inputs.append(f"data/features_train.parquet: {e}")
-    train_mean, train_std, train_max, train_nonneg = 0.0, 1.0, 0.0, True
-
-# ── Step 3: Run quality checks (always, even in second cycle) ────────────────
 checks = []
-warnings_for_report = []
+verdict = "CV_OK"
 
-# CHECK 1: Validator concordance (with gap attribution downgrade)
-verdict         = validator_review.get("verdict", "UNKNOWN")
-reported_cv_mae = float(validator_review.get("reported_cv_mae") or validator_review.get("honest_cv_mae") or 0.0)
-strict_cv_mae   = float(validator_review.get("strict_cv_mae") or reported_cv_mae)
-cv_gap_frac     = float(validator_review.get("cv_gap_pct", 0.0))
-cv_gap_display  = cv_gap_frac * 100
+def escalate(a, b):
+    order = {"CV_OK": 0, "CV_RISK": 1, "CV_INVALID": 2}
+    return a if order[a] >= order[b] else b
 
-gap_attribution     = validator_review.get("gap_attribution", {})
-attr_classification = gap_attribution.get("classification", "UNKNOWN")
+# ── Check 1: fold stability ────────────────────────────────────────────────
+maes = (fm or {}).get("fold_maes", [])
+if maes:
+    mu, sd = float(np.mean(maes)), float(np.std(maes))
+    cv = sd / max(mu, 1e-9)
+    status = "CV_OK"
+    if cv > 0.80 or (len(maes) >= 2 and max(maes) > 3 * np.median(maes)):
+        status = "CV_INVALID"
+    elif cv > 0.40:
+        status = "CV_RISK"
+    checks.append({"name": "fold_stability", "status": status,
+                   "details": f"cv={cv:.2f} fold_maes={maes}"})
+    verdict = escalate(verdict, status)
 
-# Base status from validator verdict
-c1_raw_status = "CRITICAL" if verdict == "CRITICAL" else ("WARNING" if verdict == "WARNING" else "PASS")
-
-# Gap attribution downgrade: CV_SCHEME suppresses one severity level.
-# HARD: this can only SUPPRESS a retune, never CREATE or escalate one.
-attr_note = ""
-if attr_classification == "CV_SCHEME" and c1_raw_status in ("CRITICAL", "WARNING"):
-    c1_status = "WARNING" if c1_raw_status == "CRITICAL" else "PASS"
-    attr_note = (
-        f" [DOWNGRADED from {c1_raw_status}: "
-        "CV gap attributed to expanding-window scheme pessimism "
-        "(latest-fold MAE ≈ reported); not overfit — retune suppressed by gap attribution]"
-    )
-    print(f"  CHECK 1: gap_attribution=CV_SCHEME → downgraded {c1_raw_status} → {c1_status}")
-else:
-    c1_status = c1_raw_status
-    if attr_classification in ("REAL_DIVERGENCE", "UNKNOWN"):
-        attr_note = f" [gap_attribution={attr_classification}; no downgrade]"
-
-c1_details = (
-    f"validator reported cv_mae={reported_cv_mae:.4f}, strict_cv_mae={strict_cv_mae:.4f}, "
-    f"cv_gap={cv_gap_display:.1f}%; verdict was {verdict}."
-    f" gap_attribution={attr_classification}.{attr_note}"
-)
-checks.append({"name": "validator_concordance", "status": c1_status, "details": c1_details})
-
-# CHECK 2: Prediction distribution match
-pred_stats = model_results.get("val_prediction_stats", {})
-pred_mean  = float(pred_stats.get("mean", predictions["predicted_target"].mean() if len(predictions) > 0 else 0.0))
-pred_std   = float(pred_stats.get("std",  predictions["predicted_target"].std()  if len(predictions) > 0 else 0.0))
-mean_bias  = abs(pred_mean - train_mean) if train_mean != 0.0 else 0.0
-bias_pct   = (pred_mean - train_mean) / abs(train_mean) * 100 if train_mean != 0.0 else 0.0
-std_ratio  = pred_std / train_std if train_std > 0.0 else 1.0
-c2_status  = "PASS"
-c2_details = (f"pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (delta {bias_pct:+.1f}%); "
-              f"pred_std={pred_std:.3f} vs train_std={train_std:.3f} (ratio {std_ratio:.3f})")
-if train_mean != 0.0 and mean_bias > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
-    c2_status = "CRITICAL"
-elif train_std > 0.0 and pred_std < PRED_STD_CRITICAL * train_std:
-    c2_status = "CRITICAL"
-elif train_std > 0.0 and pred_std < PRED_STD_WARNING * train_std:
-    c2_status = "WARNING"
-checks.append({"name": "prediction_distribution", "status": c2_status, "details": c2_details})
-
-# CHECK 3: Walk-forward MAE plausibility
-wf_mae     = float(model_results.get("walk_forward_mae") or model_results.get("oof_mae", 0.0) or 0.0)
-ratio_pct  = (wf_mae / train_std * 100) if train_std > 0.0 else 0.0
-c3_status  = "PASS"
-c3_details = f"walk_forward_mae={wf_mae:.4f}; target_std={train_std:.4f}; ratio={ratio_pct:.1f}%"
-if train_std > 0.0 and wf_mae < WF_MAE_SUSPICIOUS_LOW * train_std and verdict != "PASS":
-    c3_status = "WARNING"
-elif train_std > 0.0 and wf_mae > WF_MAE_POOR_RATIO * train_std:
-    c3_status = "WARNING"
-checks.append({"name": "mae_plausibility", "status": c3_status, "details": c3_details})
-
-# CHECK 4: Feature importance concentration
-top10     = model_results.get("feature_importance_top10", [])
-c4_status = "PASS"
-if not top10:
-    c4_details = "not applicable: no feature importance data available"
-elif len(top10) < 10:
-    c4_details = f"not applicable: only {len(top10)} features available (need ≥ 10)"
-else:
-    top_imp = top10[0]["importance"]; total_imp = sum(x["importance"] for x in top10)
-    if total_imp <= 0:
-        c4_details = "not applicable: all importance values are zero"
+# ── Check 2: leakage symptom (CV too good) ─────────────────────────────────
+target = plan["target_column"]
+train_std = (profile.get("schema", {}).get(target, {}) or {}).get("std")
+if train_std and fm and fm.get("oof_mae") is not None:
+    ratio = fm["oof_mae"] / train_std
+    if ratio < 0.01:
+        s = "CV_INVALID"
+    elif ratio < 0.05:
+        s = "CV_RISK"
     else:
-        top_share  = top_imp / total_imp
-        c4_details = f"top feature share = {top_share*100:.1f}% of top-10 importance (top: {top10[0]['feature']})"
-        if top_share > TOP_FEATURE_SHARE_WARNING:
-            c4_status = "WARNING"
-checks.append({"name": "feature_concentration", "status": c4_status, "details": c4_details})
+        s = "CV_OK"
+    checks.append({"name": "cv_too_good", "status": s,
+                   "details": f"oof_mae/train_std={ratio:.4f}"})
+    verdict = escalate(verdict, s)
 
-# CHECK 5: Prediction sanity
-pred_col  = predictions["predicted_target"] if "predicted_target" in predictions.columns else pd.Series(dtype=float)
-pred_min  = float(pred_col.min())  if len(pred_col) > 0 else 0.0
-pred_max  = float(pred_col.max())  if len(pred_col) > 0 else 0.0
-nan_count = int(pred_col.isna().sum())
-neg_count = int((pred_col < 0).sum()) if len(pred_col) > 0 else 0
-c5_status  = "PASS"
-c5_details = (f"pred_min={pred_min:.3f}, pred_max={pred_max:.3f}; "
-              f"train_max={train_max:.3f}; n_nan={nan_count}; n_negative={neg_count}")
-if nan_count > 0:
-    c5_status = "CRITICAL"
-elif neg_count > 0 and train_nonneg:
-    c5_status = "CRITICAL"
-elif train_max > 0.0 and pred_max > PRED_MAX_HIGH_RATIO * train_max:
-    c5_status = "WARNING"
-elif train_max > 0.0 and pred_max < PRED_MAX_LOW_RATIO * train_max:
-    c5_status = "WARNING"
-checks.append({"name": "prediction_sanity", "status": c5_status, "details": c5_details})
+# ── Check 3: feature importance stability ──────────────────────────────────
+imps = []
+for k in [f["fold_id"] for f in (folds or {}).get("folds", [])]:
+    p = pathlib.Path(f"reports/importance_fold_{k}.json")
+    if p.exists():
+        d = json.load(open(p))
+        cb_imp = {x["name"]: x["importance"] for x in d.get("catboost_top", [])}
+        imps.append(cb_imp)
+if len(imps) >= 2:
+    common = set.intersection(*[set(d.keys()) for d in imps])
+    if common:
+        rhos = []
+        for i in range(len(imps)):
+            for j in range(i+1, len(imps)):
+                a = [imps[i][f] for f in common]
+                b = [imps[j][f] for f in common]
+                if len(a) >= 2:
+                    rho, _ = spearmanr(a, b)
+                    if not np.isnan(rho):
+                        rhos.append(rho)
+        if rhos:
+            med = float(np.median(rhos))
+            s = ("CV_INVALID" if med < 0.2 else
+                 "CV_RISK"    if med < 0.5 else "CV_OK")
+            checks.append({"name": "importance_stability", "status": s,
+                           "details": f"median_spearman={med:.2f}"})
+            verdict = escalate(verdict, s)
 
-# ── Step 3.5: Family ablation (best-effort, first cycle only) ────────────────
-family_ablation    = None
-net_harmful_families: list[str] = []
-ablation_attempted = False
+# ── Check 4: pred distribution per fold ─────────────────────────────────────
+if oof is not None and not oof.empty and train_std:
+    fold_bad = 0
+    for k, sub in oof.groupby("fold"):
+        if abs(sub["y_pred"].mean() - sub["y_true"].mean()) > 0.3 * abs(sub["y_true"].mean() or 1.0):
+            fold_bad += 1
+        elif sub["y_pred"].std() < 0.4 * sub["y_true"].std():
+            fold_bad += 1
+    n_folds = oof["fold"].nunique()
+    if n_folds:
+        s = ("CV_INVALID" if fold_bad > n_folds / 2 else
+             "CV_RISK"    if fold_bad else "CV_OK")
+        checks.append({"name": "pred_distribution", "status": s,
+                       "details": f"{fold_bad}/{n_folds} folds with distribution drift"})
+        verdict = escalate(verdict, s)
 
-if not second_cycle:
-    ablation_attempted = True
-    try:
-        abl = subprocess.run(
-            [sys.executable, "tools/family_ablation.py", "--repo-root", "."],
-            capture_output=True, text=True, timeout=300,
-        )
-        out_tail = abl.stdout[-4000:] if len(abl.stdout) > 4000 else abl.stdout
-        print("[ablation stdout]:", out_tail)
-        if abl.returncode != 0:
-            print(f"[ablation stderr]: {abl.stderr[-500:]}")
-        if os.path.exists("reports/family_ablation.json"):
-            with open("reports/family_ablation.json") as f:
-                family_ablation = json.load(f)
-            if not family_ablation.get("skipped", True):
-                net_harmful_families = family_ablation.get("net_harmful_families", [])
-                print(f"[ablation] net_harmful_families: {net_harmful_families}")
-            else:
-                print(f"[ablation] skipped: {family_ablation.get('reason', 'unknown')}")
-    except Exception as _abl_e:
-        print(f"[ablation] non-fatal error: {_abl_e}")
-        warnings_for_report.append(f"Family ablation error: {_abl_e}")
+# ── Check 5: validator concordance ──────────────────────────────────────────
+vv = vr.get("verdict", "PASS")
+s = ("CV_INVALID" if vv == "CRITICAL" else
+     "CV_RISK"    if vv == "WARNING"  else "CV_OK")
+checks.append({"name": "validator_concordance", "status": s,
+               "details": f"validator verdict={vv}"})
+verdict = escalate(verdict, s)
 
-# ── Step 4: Decide on action ─────────────────────────────────────────────────
-critical_checks = [c for c in checks if c["status"] == "CRITICAL"]
-warning_checks  = [c for c in checks if c["status"] == "WARNING"]
-for c in warning_checks:
-    warnings_for_report.append(f"Check '{c['name']}' raised WARNING: {c['details']}")
-if missing_inputs:
-    warnings_for_report.append("Some critic inputs were missing: " + "; ".join(missing_inputs))
-
-# Single retune slot: CRITICAL path has priority over ablation path
-retune_reason = None  # "critical" | "ablation" | None
-if not second_cycle:
-    if critical_checks:
-        retune_reason = "critical"
-    elif net_harmful_families:
-        retune_reason = "ablation"
-
-status = "accepted" if (second_cycle or retune_reason is None) else "retune_requested"
-
-# Build decision_rationale
-warn_names    = [c["name"] for c in checks if c["status"] == "WARNING"]
-crit_names    = [c["name"] for c in checks if c["status"] == "CRITICAL"]
-check_summary = "; ".join(f"{c['name']}={c['status']}" for c in checks)
-
-if second_cycle:
-    decision_rationale = f"Second retune cycle: accepted regardless of remaining check results. Check summary: {check_summary}."
-elif status == "accepted":
-    if not warn_names and not crit_names:
-        decision_rationale = f"All {len(checks)} checks PASS. Model accepted without concerns."
-    else:
-        decision_rationale = (
-            f"Model accepted: {len(warn_names)} WARNING(s) ({', '.join(warn_names)}), 0 CRITICALs. "
-            f"WARNINGs documented in warnings_for_report. Check summary: {check_summary}."
-        )
-    if attr_classification == "CV_SCHEME" and c1_raw_status in ("CRITICAL", "WARNING"):
-        decision_rationale += (
-            f" Gap attribution CV_SCHEME: validator {c1_raw_status} downgraded to {c1_status} — not overfit."
-        )
-    if net_harmful_families:
-        decision_rationale += (
-            f" Ablation found net-harmful families {net_harmful_families} but CRITICAL path already claimed retune slot — "
-            f"families NOT dropped this cycle."
-        )
-elif retune_reason == "ablation":
-    decision_rationale = (
-        f"Retune requested (ablation): {len(net_harmful_families)} net-harmful feature "
-        f"families ({net_harmful_families}). 0 CRITICAL checks. Check summary: {check_summary}."
-    )
-else:
-    decision_rationale = (
-        f"Retune requested (critical): {len(crit_names)} CRITICAL check(s) ({', '.join(crit_names)}). "
-        f"Check summary: {check_summary}."
-    )
-
-print(f"Critic decision: {status} (second_cycle={second_cycle}, retune_reason={retune_reason})")
-for c in checks:
-    print(f"  {c['name']}: {c['status']} — {c['details']}")
-
-# ── Step 5: If retune requested (first cycle only) ───────────────────────────
-issue = suggested = None
-retune_json: dict = {}
-per_family_deltas: dict = {}
-
-if status == "retune_requested" and not second_cycle:
-    if retune_reason == "ablation":
-        fam_list = net_harmful_families
-        per_family_deltas = {
-            fam: family_ablation["families"][fam]["delta_vs_full"]
-            for fam in fam_list
-            if fam in (family_ablation or {}).get("families", {})
-            and "delta_vs_full" in (family_ablation or {}).get("families", {}).get(fam, {})
-        }
-        issue     = (
-            f"Net-harmful feature families identified by strict-CV "
-            f"leave-one-family-out ablation: {fam_list}"
-        )
-        suggested = (
-            f"drop net-harmful feature families {fam_list} identified by "
-            f"strict-CV leave-one-family-out ablation; do not re-add them"
-        )
-        retune_json = {
-            "issue":                issue,
-            "suggested_change":     suggested,
-            "ablation_triggered":   True,
-            "net_harmful_families": fam_list,
-            "per_family_deltas":    per_family_deltas,
-            "previous_metrics": {
-                "walk_forward_mae":   float(wf_mae),
-                "pred_mean":          float(pred_mean),
-                "pred_std":           float(pred_std),
-                "validator_verdict":  verdict,
-            },
-        }
-        # Log rejected families to knowledge graph (best-effort)
-        try:
-            sys.path.insert(0, "tools")
-            from kg import kg_append_event
-            for _fam in fam_list:
-                kg_append_event("critic", "rejected_hypothesis", {
-                    "hypothesis": f"family '{_fam}' beneficial to strict-CV MAE",
-                    "outcome":    "rejected",
-                    "detail":     f"ablation: delta_vs_full={per_family_deltas.get(_fam)}",
-                })
-        except Exception as _kg_e:
-            print(f"[KG] non-fatal: {_kg_e}")
-
-    else:  # retune_reason == "critical"
-        first_critical = critical_checks[0]["name"]
-        if first_critical == "validator_concordance":
-            issue = f"Validator returned CRITICAL verdict: {validator_review.get('notes', 'see validator_review.json')}"
-            fs    = validator_review.get("feature_suspicion", [])
-            suggested = (
-                f"remove suspect features ({', '.join(str(f) for f in fs[:3])}) and retrain"
-                if fs else
-                "review validator_review.json notes and address CV methodology issue before retraining"
-            )
-        elif first_critical == "prediction_distribution":
-            if train_mean != 0.0 and abs(pred_mean - train_mean) > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
-                issue     = f"Systematic mean bias: pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (>30% offset)"
-                suggested = "verify val feature imputation uses training medians per group, not zeros"
-            else:
-                issue     = f"Severe under-dispersion: pred_std={pred_std:.3f} < {PRED_STD_CRITICAL:.2f}*train_std={train_std:.3f}"
-                suggested = "use median seed aggregation; expand Optuna num_leaves upper bound from 127 to 255"
-        elif first_critical == "prediction_sanity":
-            if nan_count > 0:
-                issue     = f"NaN predictions: {nan_count} NaN in predicted_target"
-                suggested = "apply fill_vals to all val columns; add np.nan_to_num fallback after ensemble_preds"
-            else:
-                issue     = f"Negative predictions: {neg_count} negative values in non-negative target"
-                suggested = "apply np.clip(predictions, 0, None) after seed aggregation, before saving predictions.csv"
-        else:
-            issue     = f"Critical check failed: {first_critical} — {critical_checks[0]['details']}"
-            suggested = "retrain with default hyperparameters to rule out numerical instability"
-
-        retune_json = {
-            "issue":            issue,
-            "suggested_change": suggested,
-            "previous_metrics": {
-                "walk_forward_mae":  float(wf_mae),
-                "pred_mean":         float(pred_mean),
-                "pred_std":          float(pred_std),
-                "validator_verdict": verdict,
-            },
-        }
-
-    with open("reports/critic_retune_requested.json", "w") as f:
-        json.dump(retune_json, f, indent=2)
-    with open("reports/critic_retune_attempted.txt", "w") as f:
-        f.write(
-            f"critic retune marker written at {datetime.datetime.now().isoformat()}\n"
-            f"retune_reason: {retune_reason}\n"
-        )
-    print(f"Written reports/critic_retune_requested.json (reason={retune_reason})")
-    print("Written reports/critic_retune_attempted.txt")
-
-# ── Step 6: Write critic_review.json ─────────────────────────────────────────
-ablation_summary = None
-if family_ablation is not None:
-    ablation_summary = {
-        "skipped":              family_ablation.get("skipped", True),
-        "net_harmful_families": family_ablation.get("net_harmful_families", []),
-        "triggered_retune":     retune_reason == "ablation",
-        "reason":               family_ablation.get("reason", ""),
-    }
-elif ablation_attempted:
-    ablation_summary = {
-        "skipped": True, "reason": "run failed or json not written",
-        "net_harmful_families": [], "triggered_retune": False,
-    }
-
+# ── Emit verdict ────────────────────────────────────────────────────────────
+# `status` is required by CLAUDE.md's retune gate; `verdict` is the
+# fine-grained CV_OK / CV_RISK / CV_INVALID label kept for the report writer.
+status = "retune_requested" if verdict == "CV_INVALID" else "accepted"
 review = {
-    "status":               status,
-    "cycle":                2 if second_cycle else 1,
-    "checks":               checks,
-    "gap_attribution_used": {
-        "classification":    attr_classification,
-        "downgraded_check1": (attr_classification == "CV_SCHEME" and c1_raw_status != "PASS"),
-        "original_verdict":  c1_raw_status,
-        "final_status":      c1_status,
-    },
-    "family_ablation":      ablation_summary,
-    "warnings_for_report":  warnings_for_report,
-    "retune_attempted":     second_cycle or (status == "retune_requested"),
-    "final_recommendation": (
-        "proceed to submission_writer" if status == "accepted"
-        else f"retune requested ({retune_reason}) — orchestrator: re-invoke modeler, validator, critic"
+    "plan_id": (plan or {}).get("plan_id"),
+    "status": status,
+    "verdict": verdict,
+    "checks": checks,
+    "recommendation": (
+        "proceed to submission_writer" if verdict in ("CV_OK", "CV_RISK")
+        else "retune requested — orchestrator may re-invoke modeler / validator / critic at most once per run"
     ),
-    "decision_rationale":   decision_rationale,
 }
-if issue is not None:
-    review["retune_issue"]            = issue
-    review["retune_suggested_change"] = suggested
-
 with open("reports/critic_review.json", "w") as f:
     json.dump(review, f, indent=2)
+
+if status == "retune_requested":
+    # The critic does NOT modify any contract — it signals the orchestrator
+    # via the exact filename CLAUDE.md's retune gate watches for.
+    with open("reports/critic_retune_requested.json", "w") as f:
+        json.dump({
+            "plan_id": (plan or {}).get("plan_id"),
+            "status": status,
+            "reason": "CV_INVALID — see critic_review.json",
+            "failing_checks": [c for c in checks if c["status"] == "CV_INVALID"],
+        }, f, indent=2)
+
 with open("reports/critic_was_here.txt", "w") as f:
-    f.write(f"critic sub-agent executed at {datetime.datetime.now().isoformat()}\n")
-print(f"Written reports/critic_review.json with status={status}")
-print("Written reports/critic_was_here.txt")
+    f.write(f"critic executed at {datetime.datetime.utcnow().isoformat()}Z verdict={verdict}\n")
 ```
 
-## Output
-- `reports/critic_review.json` (always; now includes `gap_attribution_used` and `family_ablation` keys)
-- `reports/critic_was_here.txt` (always)
-- `reports/family_ablation.json` (written by tools/family_ablation.py; best-effort, first cycle only)
-- `reports/critic_retune_requested.json` (only if retune triggered, cycle 1)
-- `reports/critic_retune_attempted.txt` (only if retune triggered, cycle 1)
+---
 
 ## What you do NOT do
-- You do NOT block the pipeline. Always allow submission_writer to run.
-- You do NOT request more than one retune cycle (controlled by the critic_retune_attempted.txt marker).
-  The CRITICAL path and the ablation path share this single slot; ablation does not get its own.
-- You do NOT feed strict CV results back into any hyperparameter tuning objective.
-  The ablation measures on the strict scheme, but the retune only instructs feature dropping —
-  the model's hyperparameters are re-used unchanged from the first run.
-- You do NOT let gap_attribution ESCALATE or CREATE a retune signal. It can only suppress
-  (downgrade CRITICAL→WARNING or WARNING→PASS-with-note).
-- You do NOT modify predictions, features, or model results directly.
-- You do NOT use external knowledge — only what's in reports/ and data/.
-- You do NOT duplicate the validator's work. The validator audits CV methodology and leakage;
-  you audit prediction quality, distribution match, and feature family usefulness. Different jobs.
+
+- ❌ Do NOT modify CV_PLAN, fold indices, features, predictions, or any model
+  artefact.
+- ❌ Do NOT call the modeler again. Replans go back to schema_analyst.
+- ❌ Do NOT block submission. Submission_writer always runs after the critic.
+- ❌ Do NOT downgrade a check status. Only escalation is permitted.
 
 ## Failure handling
-If any input is missing, log it in critic_review.json under warnings_for_report and proceed with accept status. Never block by crashing. The pipeline must always reach submission_writer.
+
+- If any input is missing → record the missing input in `critic_review.notes`
+  and continue with the checks that can run. A missing input never escalates
+  to CV_INVALID by itself.
