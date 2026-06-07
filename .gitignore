@@ -47,3 +47,7 @@ tools/run_modeler_full.py
 tools/run_modeler_retune.py
 tools/run_modeler_v2.py
 tools/run_modeler_v3.py
+
+_sweep_runner.py
+_sweep_results.json
+_data_backup_sweep/
