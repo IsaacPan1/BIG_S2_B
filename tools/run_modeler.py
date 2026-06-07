@@ -55,11 +55,14 @@ print("=" * 60)
 profile_path  = os.path.join(REPO_ROOT, "reports", "profile.json")
 features_path = os.path.join(REPO_ROOT, "reports", "features.json")
 config_path   = os.path.join(REPO_ROOT, "pipeline_config.json")
+cv_plan_path  = os.path.join(REPO_ROOT, "reports", "cv_plan.json")
 
 with open(profile_path, encoding="utf-8") as f:
     profile = json.load(f)
 with open(features_path, encoding="utf-8") as f:
     feat_meta = json.load(f)
+with open(cv_plan_path, encoding="utf-8") as f:
+    cv_plan = json.load(f)
 config = load_config(config_path)
 
 problem_type    = profile.get("problem_type", "panel_forecasting")
@@ -362,7 +365,13 @@ def _cb_objective_factory(X_outer_tr_df, y_outer_tr, sw_outer_tr,
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 7 — Outer CV with nested Optuna
 # ─────────────────────────────────────────────────────────────────────────────
-outer_splits, outer_scheme = build_outer_splits(train_df)
+from cv_engine import CVEngine
+assert train_df.index.equals(pd.RangeIndex(len(train_df))), \
+    "CVEngine returns positional indices; train_df must be RangeIndex"
+engine = CVEngine(cv_plan, train_df, profile=profile)
+outer_splits   = engine.split()
+outer_scheme   = cv_plan["cv"]["cv_type"]
+N_OUTER_FOLDS  = len(outer_splits)
 print(f"Outer CV: {len(outer_splits)} folds ({outer_scheme})")
 
 oof_preds = np.full(len(train_df), np.nan)
