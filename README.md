@@ -7,7 +7,7 @@ This is an autonomous data analysis pipeline built on Claude Code that handles t
 1. Place the dataset in `data/` along with `DATA_DESCRIPTION.md`
 2. Open Claude Code: `claude --dangerously-skip-permissions`
 3. Prompt: `Do the data analysis.`
-4. Wait for the pipeline to complete (typically 5–15 minutes depending on dataset size)
+4. Wait for the pipeline to complete. Full modeler runs (5-fold nested CV with Optuna and 5-seed final ensemble) typically take ~25–45 minutes; schema, feature engineering, validator, critic, and reporting add roughly another 10–20 minutes on top.
 5. Find `submission.csv` and `report.pdf` at the repo root
 
 ## Expected Inputs
@@ -40,7 +40,7 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 |-----------|------|
 | `schema_analyst` | Runs `tools/profile_data.py` to discover dataset structure, problem type, KS-tested shifts, and optional time codebook; writes `reports/profile.json` and `reports/schema_analysis.md` |
 | `feature_engineer` | Runs `tools/feature_engineering.py` to generate features adapted to schema, detected time granularity, distribution shift (KS-based features), and adversarial validation (train-vs-val shift detection with sample weighting) |
-| `modeler` | Executes inline Python: adaptive ensemble selection based on problem type and dataset size; adversarial sample weights from feature_engineer applied to all model families; each family tuned with Optuna (15 trials) with intra-run boundary recentering; 5-seed aggregation; final prediction is dynamically reweighted across surviving families based on OOF performance; ordinal targets receive post-processing rounding |
+| `modeler` | Runs `tools/run_modeler.py`. CatBoost is the sole predictor; a Ridge baseline runs alongside as a linear diagnostic only. Nested CV is driven by the frozen `reports/cv_plan.json`: each outer fold builds a fresh per-fold `adaptive_pipeline` (impute → scale → per-fold `TargetEncoderCV`) that is fit on training rows only, then runs Optuna inside the fold. Trials are bounded by a per-fold time deadline derived from a tuning budget (default 25 min total); folds whose budget is exhausted fit CatBoost with default hyperparameters and still contribute their MAE. Final predictions aggregate a 5-seed CatBoost ensemble. The recursive-vs-static-imputation method is selected empirically on a walk-forward holdout. Ordinal targets receive post-processing rounding. A `--debug` flag caps iterations, trials, and seeds for fast iteration — debug OOF is not a valid score. |
 | `validator` | Runs `tools/validate.py` for an independent strict CV audit using purged walk-forward; diagnostic only — never blocks submission |
 | `critic` | Runs `tools/run_critic.py`: 5-check quality review with optional retune feedback to the modeler |
 | `submission_writer` | Runs `tools/build_submission.py` to validate format and write `submission.csv` |
@@ -51,6 +51,18 @@ The pipeline runs seven sub-agents in sequence, each in its own context window. 
 The pipeline writes an observability-only knowledge graph to `reports/knowledge_graph.json` via `tools/kg.py`. It is a **derived, append-only, observability-only log** — written by sub-agents at key points using `kg_set_stage`, `kg_append_event`, and `kg_record_rejected`. No agent reads it to make decisions, and it has no effect on the analysis or the submission.
 
 The graph records stage transitions (which agent ran and when), per-stage events (inferred problem type, resource counts, Optuna trial outcomes, hypothesis events), and rejected hypotheses from each stage. Its purpose is a run audit trail for transparency and post-hoc debugging — diagnostic tooling only, not a controller.
+
+## Cross-Validation Strategy
+
+CV is treated as a frozen contract authored exactly once per run. `schema_analyst` invokes `tools/scheme_analysis.py`, the **only** module permitted to write `reports/cv_plan.json`. The plan selects a CV scheme from the inferred problem type — grouped or ungrouped time series default to `TimeSeriesExpanding`, tabular IID falls into `GroupKFold` / `StratifiedKFold` / `KFold` depending on whether group columns are present and whether the target is discrete — and is marked `frozen: true`. No downstream agent may modify it; the critic can request at most one replan by emitting `CV_INVALID`, in which case the orchestrator deletes `cv_plan.json` and re-invokes `schema_analyst` once.
+
+`tools/cv_engine.CVEngine` materialises the plan into deterministic `(train_idx, valid_idx)` folds and enforces leakage invariants (no train/valid index overlap; for time-series schemes, `max(train_time) + gap ≤ min(valid_time)`; for `GroupKFold`, disjoint groups). The same `CVEngine` is consumed by the modeler — its outer evaluation folds come directly from this plan, not from any modeler-internal split.
+
+**End-anchored expanding window.** For `TimeSeriesExpanding` (the default time-series scheme), the **last** fold's validation block ends at the final time index `T` — mirroring the train → test boundary the held-out submission will face. Earlier folds step backward by `valid_size`; training is always `[0:train_end]`, so the train window expands as fold index advances. `TimeSeriesSliding` follows the same end-anchored pattern with a fixed-width training window.
+
+**Rank-resolved time axis.** When the time column is an opaque identifier resolved by a codebook, `cv_engine.attach_period_rank` materialises a dense integer `__period_rank__` column from `profile['period_rank_info']['id_to_rank']` and uses it as the ordering axis for all CV math; the raw hash column remains as the join / submission key. This is the only place `id_to_rank` lookups happen. A missing or NaN rank during this step raises rather than silently flowing into the fold math.
+
+**Drift gate (expanding-vs-sliding).** `scheme_analysis.py` defaults to expanding and switches to sliding **only** when a recent-vs-full drift diagnostic shows the train→val shift is **recency-reducible**. For each shared numeric, non-window covariate (seasonality and time-index columns are excluded by name), it computes the standardised mean shift `|μ_train − μ_val| / pooled_std` twice — using the full training window and using only the last `RECENT_PERIODS = 14` periods — and aggregates `mean_improvement`, `rel = mean_improvement / mean_dist_full`, and `frac_improved` (share of features whose per-feature improvement exceeds 0.05). The sliding branch is taken **only** when all three affirmative gates hold simultaneously: `frac_improved ≥ 0.60` (primary), `rel ≥ 0.25` (secondary), and `n_features_scanned ≥ 12` (evidence-breadth floor). Every fallback path — no val frame, no time axis, fewer than `RECENT_PERIODS` of history, no rank, no shared numeric covariates — returns expanding. The diagnostic uses validation **covariates** (provided by the competition); the validation target is never read.
 
 ## Problem Subtype Detection
 
@@ -76,13 +88,15 @@ When subtype is unclear between ordinal_regression and multiclass_classification
 
 Each problem subtype maps to an ensemble training path:
 
-| Problem Subtype | Ensemble Path | Families | Loss |
+LightGBM and XGBoost appear in the CV-plan's `modeler_contract.interface_only_backends` slot but are **interface-only stubs that raise `NotImplementedError`** — they are not trained or scored. Active families are CatBoost (predictor) and Ridge (diagnostic only).
+
+| Problem Subtype | Path | Active families (predictor / diagnostic) | Loss |
 |---|---|---|---|
-| continuous_regression | full_regression_ensemble | LGB + XGB + CatBoost + Ridge | MAE |
-| ordinal_regression | full_regression_ensemble | LGB + XGB + CatBoost + Ridge | MAE |
-| panel_forecasting | panel_forecasting_path | LGB + XGB + CatBoost + Ridge | MAE |
-| binary_classification | classification_fallback | LGB only | LogLoss |
-| multiclass_classification | classification_fallback | LGB only | LogLoss |
+| continuous_regression | regression | CatBoost / Ridge | MAE |
+| ordinal_regression | regression | CatBoost / Ridge | MAE |
+| panel_forecasting | panel forecasting (with recursive lag option) | CatBoost / Ridge | MAE |
+| binary_classification | classification | CatBoost classifier / Ridge | LogLoss |
+| multiclass_classification | classification | CatBoost classifier / Ridge | LogLoss |
 
 Ordinal regression uses the regression path (not classification) because:
 - The target has natural ordering, so distance between values matters
@@ -101,9 +115,21 @@ The modeler uses a single predictor family: **CatBoost**. **Ridge** is trained a
 | CatBoost | Sole predictor             | Yes            |
 | Ridge    | Linear diagnostic baseline | No             |
 
-**Hyperparameter tuning with boundary recentering.** CatBoost is tuned with 15 Optuna trials and final predictions are aggregated across 5 random seeds. When Optuna's search hits a parameter boundary — for example, the best trial lands at the maximum `depth` or minimum `learning_rate` — the search space is recentered around the boundary value and a second Optuna pass runs within the same agent invocation. This exhausts the search space locally before declaring the best configuration, without consuming the critic-triggered retune cycle. Recentering is logged in `model_results.json` under `optuna_reflection`.
+**Hyperparameter tuning.** CatBoost is tuned with Optuna inside each outer fold of the nested CV; final predictions are aggregated across 5 random seeds (3 seeds inside the outer-fold scoring step). Trial count is not fixed — each outer fold gets up to `OPTUNA_N_TRIALS` (8 in full mode) bounded by a per-fold time deadline derived from a global tuning budget (default 25 minutes total). The per-fold timeout is the remaining budget divided by the number of folds left, so later folds adapt to time already spent. If the budget is exhausted before an outer fold begins tuning, that fold **skips Optuna**, fits CatBoost with default hyperparameters, and still contributes its MAE to the OOF estimate — no fold is silently dropped for being late. `--debug` drops this to 1 trial per fold, a 60-second budget, and a 1-seed ensemble; debug OOF is not a valid score.
 
 **Ridge diagnostic.** Ridge is fit on the walk-forward holdout with alpha selected via probe split from `{0.01, 0.1, 1.0, 10.0, 100.0}`, then used for two diagnostic outputs in `model_results.json`: a linear-baseline OOF MAE to compare against CatBoost, and the top-10 absolute coefficients as a linear-importance signal. Ridge does not participate in `predictions.csv`.
+
+## Scored-Category Optimization
+
+The submission contract can restrict scoring to a subset of the categories present in training — for example, an aggregate / hierarchical target where only certain level-codes appear in `sample_submission.csv`. The modeler detects this generically: for every candidate column shared between `sample_submission.csv` and the training frame (group columns probed first, then any remaining submission column, with target / id / time columns excluded), the distinct submission values are compared to the distinct training values. A column qualifies as **scored-restricting** only when the submission values form a **strict proper subset** of the training values. Nothing about the column name or category labels is hardcoded — if no candidate column passes the strict-subset check, the pipeline defaults to treating all training rows as scored (no restriction).
+
+When a scored subset is detected, the pipeline **trains on every training row** (the unscored categories carry signal for hierarchical aggregates and shared seasonal structure) but **optimizes and reports MAE only on the scored subset**. The scored-only mask flows through:
+
+- The Optuna objective inside each outer fold, so hyperparameter selection targets the metric the leaderboard actually uses.
+- The recursive-vs-static-imputation comparison, so the chosen lag-handling method wins on the scored slice rather than on the global average.
+- The honest OOF MAE and per-fold MAE reports that propagate into `model_results.json` and the report.
+
+`model_results.json` carries both views: `oof_mae` and `per_fold_maes` report the scored-only metric (the decision metric), while `oof_mae_all_categories` and `per_fold_maes_all_categories` are sibling diagnostics over every training row. `scored_categories`, `scored_category_column`, and `per_scored_category_oof_mae` are also written so downstream tools can break down performance by category.
 
 ## Distribution-Shift-Aware Features
 
@@ -215,7 +241,7 @@ Granularity (hourly / daily / weekly / monthly) is detected from the median inte
 
 - Image feature extraction uses hand-crafted spatial statistics rather than deep learning embeddings. For domains where semantic content matters (object recognition, complex scenes), pre-trained CNN embeddings would extract richer features but require GPU and significant model weight downloads. The current approach trades some signal richness for CPU compatibility and zero external dependencies beyond PIL.
 - Pipeline assumes one of three documented file conventions; unusual layouts may not be auto-detected and will fall back to heuristics that could misclassify train/val files.
-- Stacking and target encoding are not used, to avoid leakage risks that arise when hierarchical outcome categories overlap across folds.
+- Stacking is not used. Target encoding **is** used and made leak-safe by per-fold fitting: a `TargetEncoderCV` (smoothed empirical-Bayes encoder with an inner KFold) is rebuilt inside every outer fold's adaptive Pipeline and `fit` only on that fold's training rows. The Ridge diagnostic consumes the encoded columns directly; CatBoost consumes the raw categoricals as `cat_features` and handles them via ordered boosting, so it sees no target-derived numerics. Unseen categories at transform time fall back to the global training mean.
 - For panel forecasting, the modeler selects empirically between static cycle-aware imputation and recursive (iterated) forecasting for unknown future lags (see [Recursive (Iterated) Forecasting](#recursive-iterated-forecasting)). Even with recursive forecasting, compounding prediction error accumulates over long horizons; the holdout comparison measures — but cannot fully eliminate — this degradation.
 - The holdout-selected lag method improves alignment between internal metrics and real test MAE, but a residual gap remains: OOF and strict-CV metrics are computed on training periods where lags are already known, so neither method's advantage is visible there. The gap manifests only on genuinely unknown future lags.
 - On datasets with severe distribution shift, internal CV estimates may still underestimate true generalization error even after shift-aware features are applied, because the KS-weighted ensemble adjustments are bounded and cannot fully correct for extreme covariate drift.

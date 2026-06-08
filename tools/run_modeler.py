@@ -55,8 +55,18 @@ if __name__ == "__main__":
         help="Fast dev iteration: cap iterations at 200, 2 Optuna trials, "
              "1-seed ensemble, 60s tuning cap. OOF is NOT a valid score.",
     )
+    parser.add_argument(
+        "--transform",
+        choices=["auto", "none", "log1p", "sqrt"],
+        default="auto",
+        help="Target transform. 'auto' (default) runs a data-driven A/B over "
+             "{none, sqrt, log1p}, picking the one with the lowest held-out "
+             "raw scored MAE on the WF probe split. 'none'/'log1p'/'sqrt' "
+             "force the named transform and skip the A/B (manual override).",
+    )
     _cli_args = parser.parse_args()
     DEBUG = _cli_args.debug
+    TRANSFORM_REQUEST = _cli_args.transform
 
     if DEBUG:
         print("*** DEBUG MODE — reduced compute; OOF is NOT a valid score ***")
@@ -188,27 +198,255 @@ if __name__ == "__main__":
         print("No adversarial weights — uniform sample weights")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Step 3 — Log1p target transform (skewed target heuristic)
+    # Step 2.5 — Detect SCORED categories from the submission contract
+    # ─────────────────────────────────────────────────────────────────────────
+    # Generic, domain-agnostic: any column that appears in sample_submission.csv
+    # AND in train_df, whose distinct submission values form a STRICT subset of
+    # the distinct training values, is a scored-restricting column. If no such
+    # column exists, the scored set = ALL training rows (no restriction).
+    # Training still uses every row — only the EVALUATION/DECISION metric is
+    # filtered to scored rows.
+    def _detect_scored_filters(sample_sub_path, train_df_, target_col_,
+                                time_col_, group_cols_):
+        if not os.path.exists(sample_sub_path):
+            return {}, None, None, (
+                f"No sample_submission.csv at {sample_sub_path} — "
+                "scored set = ALL training rows (no restriction)"
+            )
+        try:
+            sample_sub = pd.read_csv(sample_sub_path)
+        except Exception as e:
+            return {}, None, None, (
+                f"Failed to read sample_submission.csv ({e}) — "
+                "scored set = ALL training rows"
+            )
+        exclude = {target_col_, "row_id", "id", "Id", "ID"}
+        if time_col_:
+            exclude.add(time_col_)
+        # Probe group_cols first, then any remaining submission column.
+        candidates = []
+        for c in (group_cols_ or []):
+            if (c in sample_sub.columns and c in train_df_.columns
+                    and c not in exclude):
+                candidates.append(c)
+        for c in sample_sub.columns:
+            if (c not in exclude and c in train_df_.columns
+                    and c not in candidates):
+                candidates.append(c)
+
+        filters = {}
+        for c in candidates:
+            sub_vals = set(sample_sub[c].dropna().unique().tolist())
+            tr_vals  = set(train_df_[c].dropna().unique().tolist())
+            if sub_vals and sub_vals < tr_vals:   # proper subset
+                filters[c] = sub_vals
+
+        if not filters:
+            return {}, None, None, (
+                f"No submission column restricts categories vs training "
+                f"(probed {candidates}) — scored set = ALL training rows"
+            )
+        # Choose one column for per-category breakdown (prefer the simple case).
+        cat_col = next(iter(filters))
+        cats    = sorted(filters[cat_col])
+        if len(filters) == 1:
+            msg = (f"Detected scored category column '{cat_col}' "
+                   f"with {len(cats)} scored values: {cats}")
+        else:
+            msg = (f"Detected multiple scored-restricting columns: "
+                   f"{ {k: sorted(v) for k, v in filters.items()} }; "
+                   f"per-category breakdown uses '{cat_col}'")
+        return filters, cats, cat_col, msg
+
+    def _scored_mask(df, filters):
+        n = len(df)
+        if not filters:
+            return np.ones(n, dtype=bool)
+        mask = np.ones(n, dtype=bool)
+        for col, vals in filters.items():
+            mask &= df[col].isin(vals).values
+        return mask
+
+    def _mae_scored(y_true, y_pred, mask):
+        """MAE on rows where mask is True; falls back to full MAE if mask empty."""
+        if mask is None or not mask.any():
+            return float(mean_absolute_error(y_true, y_pred))
+        return float(mean_absolute_error(y_true[mask], y_pred[mask]))
+
+    _sample_sub_path = os.path.join(REPO_ROOT, "data", "sample_submission.csv")
+    scored_filters, scored_categories, scored_cat_col, _scored_log = \
+        _detect_scored_filters(_sample_sub_path, train_df,
+                               target_col, time_col, group_cols)
+    print(_scored_log)
+    train_scored_mask = _scored_mask(train_df, scored_filters)
+    val_scored_mask   = _scored_mask(val_df,   scored_filters)
+    print(f"  scored train rows: {int(train_scored_mask.sum())}/{len(train_df)}"
+          f"  ({100*train_scored_mask.mean():.1f}%)")
+    print(f"  scored val rows:   {int(val_scored_mask.sum())}/{len(val_df)}"
+          f"  ({100*val_scored_mask.mean():.1f}%)")
+    print(f"  Training still uses ALL {len(train_df)} rows — only "
+          f"the evaluation/decision metric is filtered to scored rows.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 3 — Target transform selection
+    #
+    # 'auto' (default) runs a data-driven A/B over {none, sqrt, log1p} and
+    # picks the winner by raw-space SCORED WF MAE: one CatBoost probe per
+    # candidate on the existing WF probe split, predictions inverse-mapped
+    # back to raw rate before scoring. Anything else is treated as a manual
+    # override and the A/B is skipped. The skew is logged but no longer drives
+    # the choice — optimising de-skewing is not the same as optimising the
+    # scored metric.
     # ─────────────────────────────────────────────────────────────────────────
     try:
         from scipy.stats import skew as _skew
         _target_skew = float(_skew(train_df[target_col].dropna()))
     except Exception:
         _target_skew = 0.0
-    _use_log1p = _target_skew > 1.5
 
-    print(f"Target skewness: {_target_skew:.3f} → log1p transform: {_use_log1p}")
+    _TRANSFORM_CANDIDATES = ("none", "sqrt", "log1p")
 
+    def _fwd_for_mode(mode, y):
+        y = np.asarray(y, dtype=float)
+        if mode == "log1p":
+            return np.log1p(y)
+        if mode == "sqrt":
+            return np.sqrt(np.clip(y, 0, None))
+        return y  # 'none' (identity)
 
-    def inv(preds):
-        """Inverse-transform predictions from log1p space to original space."""
-        if _use_log1p:
-            return np.expm1(np.clip(preds, 0, None))
-        return np.array(preds)
+    def _inv_for_mode(mode, p):
+        p = np.asarray(p, dtype=float)
+        if mode == "log1p":
+            return np.expm1(np.clip(p, 0, None))
+        if mode == "sqrt":
+            return np.square(np.clip(p, 0, None))
+        return np.clip(p, 0, None)
 
+    # WF probe split — same convention as Step 8 (deterministic; both calls
+    # produce identical masks).
+    def _build_wf_split_for_ab():
+        n_tr = len(train_df)
+        if time_col and problem_type == "panel_forecasting":
+            _aw = sorted(train_df[time_col].unique())
+            _ci = int(len(_aw) * 0.8)
+            _cw = _aw[_ci]
+            tr_mask = (train_df[time_col] < _cw).values
+            va_mask = (train_df[time_col] >= _cw).values
+        else:
+            _perm = np.random.RandomState(42).permutation(n_tr)
+            _sp = int(n_tr * 0.8)
+            tr_mask = np.zeros(n_tr, dtype=bool)
+            va_mask = np.zeros(n_tr, dtype=bool)
+            tr_mask[_perm[:_sp]] = True
+            va_mask[_perm[_sp:]] = True
+        return tr_mask, va_mask
 
-    y_raw  = train_df[target_col].values.astype(float)
-    y_full = np.log1p(y_raw) if _use_log1p else y_raw
+    candidates_mae: dict = {}
+
+    if TRANSFORM_REQUEST != "auto":
+        _transform_mode = TRANSFORM_REQUEST
+        print(f"Transform: manual override --transform={TRANSFORM_REQUEST}; "
+              f"A/B skipped.")
+    else:
+        # One CatBoost probe per candidate on the WF probe split. Pipeline fit
+        # is reused across candidates: only the target transform changes.
+        import catboost as _cb_module_ab
+        from sklearn.metrics import mean_absolute_error as _mae_ab
+
+        _tr_mask_ab, _va_mask_ab = _build_wf_split_for_ab()
+        _wf_tr_df_ab = train_df[_tr_mask_ab]
+        _wf_va_df_ab = train_df[_va_mask_ab]
+        X_tr_ab = _wf_tr_df_ab[all_feature_cols]
+        X_va_ab = _wf_va_df_ab[all_feature_cols]
+        y_tr_raw_ab = _wf_tr_df_ab[target_col].values.astype(float)
+        y_va_raw_ab = _wf_va_df_ab[target_col].values.astype(float)
+        _sw_ab = (_adv_weights[_wf_tr_df_ab.index.values]
+                  if _adv_weights is not None else None)
+        _va_scored_mask_ab = _scored_mask(_wf_va_df_ab, scored_filters)
+
+        _ab_bp = build_pipeline(adaptive_steps, for_model="catboost")
+        _ab_bp.pipeline.fit(X_tr_ab, y_tr_raw_ab)
+        _X_tr_ab_t = _ab_bp.pipeline.transform(X_tr_ab)
+        _X_va_ab_t = _ab_bp.pipeline.transform(X_va_ab)
+        _cf_ab_idx = [_X_tr_ab_t.columns.get_loc(c) for c in cat_feature_cols
+                      if c in _X_tr_ab_t.columns]
+
+        _AB_PROBE_ITERS = 200 if DEBUG else min(PROBE_ITERS, 1000)
+        _ab_probe_params = {
+            "iterations":          _AB_PROBE_ITERS,
+            "loss_function":       _cb_loss,
+            "eval_metric":         _cb_eval_metric,
+            "verbose":             False,
+            "allow_writing_files": False,
+            "random_seed":         42,
+            "od_type":             "Iter",
+            "od_wait":             100,
+            "learning_rate":       0.05,
+            "depth":               6,
+            "l2_leaf_reg":         3.0,
+            "cat_features":        _cf_ab_idx,
+        }
+
+        print(f"Target skewness: {_target_skew:.3f}   "
+              f"--transform=auto   running A/B over {list(_TRANSFORM_CANDIDATES)}")
+        for _cand in _TRANSFORM_CANDIDATES:
+            _y_tr_ab = _fwd_for_mode(_cand, y_tr_raw_ab)
+            _y_va_ab = _fwd_for_mode(_cand, y_va_raw_ab)
+            try:
+                _m = _cb_module_ab.CatBoostRegressor(**_ab_probe_params)
+                _m.fit(_X_tr_ab_t, _y_tr_ab, sample_weight=_sw_ab,
+                       eval_set=(_X_va_ab_t, _y_va_ab), verbose=False)
+                _preds_raw = _inv_for_mode(_cand, _m.predict(_X_va_ab_t))
+                if _va_scored_mask_ab.any():
+                    _mae_raw = float(_mae_ab(
+                        y_va_raw_ab[_va_scored_mask_ab],
+                        _preds_raw[_va_scored_mask_ab],
+                    ))
+                else:
+                    _mae_raw = float(_mae_ab(y_va_raw_ab, _preds_raw))
+            except Exception as _e:
+                print(f"  A/B candidate '{_cand}' failed: {_e}")
+                _mae_raw = float("inf")
+            candidates_mae[_cand] = _mae_raw
+            print(f"  A/B '{_cand}': raw scored WF MAE = {_mae_raw:.4f}")
+
+        _transform_mode = min(_TRANSFORM_CANDIDATES,
+                              key=lambda c: candidates_mae[c])
+        print(f"Transform A/B winner: '{_transform_mode}' "
+              f"(candidates: {candidates_mae})")
+
+    _use_log1p = (_transform_mode == "log1p")  # legacy alias for reporting
+
+    def forward_transform(y):
+        """Forward target transform — applied to training labels only."""
+        return _fwd_for_mode(_transform_mode, y)
+
+    def inverse_transform(p):
+        """Inverse target transform — applied to model predictions to return
+        them to the original target space. Always non-negative."""
+        return _inv_for_mode(_transform_mode, p)
+
+    # Legacy alias: many helpers reference `inv(...)` for prediction inversion.
+    inv = inverse_transform
+
+    print(f"Target skewness: {_target_skew:.3f}   "
+          f"--transform={TRANSFORM_REQUEST}   resolved={_transform_mode}")
+
+    # Selection log — surfaced via model_results.json so the report can
+    # justify the choice ("we ran an A/B and sqrt won at 2.14 vs log1p 2.26").
+    _transform_selection = {
+        "candidates_mae":   {k: (None if (v is None or not np.isfinite(v))
+                                 else float(v))
+                             for k, v in candidates_mae.items()},
+        "chosen":           _transform_mode,
+        "selection_metric": "raw_scored_wf_mae",
+        "skew":             float(_target_skew),
+        "manual_override":  TRANSFORM_REQUEST != "auto",
+        "requested":        TRANSFORM_REQUEST,
+    }
+
+    y_raw   = train_df[target_col].values.astype(float)
+    y_full  = forward_transform(y_raw)
     n_train = len(train_df)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -330,7 +568,8 @@ if __name__ == "__main__":
     def _train_catboost_fold(X_tr_df, y_tr, X_va_df, y_va_orig, hparams,
                               sample_weight, seeds=(42,)):
         """Train CatBoost (multi-seed) on a fold-fit Pipeline; return val preds
-        in original target space and the trained models."""
+        in original target space, the per-seed prediction list (inverse/clipped
+        target space, aligned to `seeds` slot order), and the trained models."""
         X_tr_t, X_va_t, bp = _fit_transform_fold(X_tr_df, y_tr, X_va_df,
                                                   for_model="catboost")
         # cat_features for CatBoost are the target_encode targets that survived
@@ -354,13 +593,15 @@ if __name__ == "__main__":
             seed_preds.append(np.clip(inv(m.predict(X_va_t)), 0, None))
             models.append(m)
         preds = _seed_agg(seed_preds, axis=0)
-        return preds, models, bp
+        return preds, seed_preds, models, bp
 
 
     def _cb_objective_factory(X_outer_tr_df, y_outer_tr, sw_outer_tr,
-                              inner_splits_local):
+                              inner_splits_local, outer_scored_mask):
         """Return an Optuna objective closure that runs inner-CV on the
-        outer-training rows."""
+        outer-training rows. Minimizes MAE restricted to SCORED rows
+        (decision metric); falls back to all-row MAE if a fold has zero
+        scored rows."""
         def objective(trial):
             params = {
                 "learning_rate": trial.suggest_float("learning_rate", _lr_lo, _lr_hi, log=True),
@@ -375,13 +616,14 @@ if __name__ == "__main__":
                 X_in_va = X_outer_tr_df.iloc[inner_va_idx]
                 y_in_tr = y_outer_tr[inner_tr_idx]
                 y_in_va_raw = y_outer_tr[inner_va_idx]
-                y_in_va_orig = np.expm1(y_in_va_raw) if _use_log1p else y_in_va_raw
+                y_in_va_orig = inverse_transform(y_in_va_raw)
                 sw_in = sw_outer_tr[inner_tr_idx] if sw_outer_tr is not None else None
                 try:
-                    preds, _, _ = _train_catboost_fold(
+                    preds, _, _, _ = _train_catboost_fold(
                         X_in_tr, y_in_tr, X_in_va, y_in_va_orig, params,
                         sample_weight=sw_in, seeds=(42,))
-                    inner_maes.append(mean_absolute_error(y_in_va_orig, preds))
+                    fold_scored = outer_scored_mask[inner_va_idx]
+                    inner_maes.append(_mae_scored(y_in_va_orig, preds, fold_scored))
                 except Exception as _e:
                     # Failed trial returns inf; Optuna skips it
                     return float("inf")
@@ -402,10 +644,23 @@ if __name__ == "__main__":
     print(f"Outer CV: {len(outer_splits)} folds ({outer_scheme})")
 
     oof_preds = np.full(len(train_df), np.nan)
-    outer_fold_maes  = []
+    outer_fold_maes         = []   # SCORED (decision metric)
+    outer_fold_maes_all     = []   # all-category (diagnostic)
+    outer_fold_per_cat_maes = []   # list[dict[cat -> mae|None]] per fold
     outer_fold_best_params  = []
     outer_fold_sizes        = []
     total_optuna_trials     = 0
+
+    # OBSERVABILITY ONLY — per-seed OOF prediction accumulators. No model is
+    # added, reordered, reseeded, or refit; we persist the per-seed arrays the
+    # outer-fold scoring step ALREADY computes inside _train_catboost_fold.
+    # No agent reads reports/oof/oof_per_seed.csv; aggregated OOF and every
+    # downstream decision (ordinal offset, scored MAE, recursive-vs-imputation)
+    # are unchanged.
+    S_OUTER = len(OUTER_FOLD_FINAL_SEEDS)
+    per_seed_oof        = np.full((S_OUTER, len(train_df)), np.nan)
+    oof_fold_id         = np.full(len(train_df), -1, dtype=int)
+    per_fold_seeds_used = []   # list[list[int]] aligned to outer_splits order
 
     TUNING_DEADLINE = start_time + TUNING_BUDGET_SECONDS  # cap on the nested-CV phase
 
@@ -445,9 +700,11 @@ if __name__ == "__main__":
                 for tr, va in inner_splits
             ]
 
+            outer_tr_scored = train_scored_mask[outer_tr_idx]
             objective = _cb_objective_factory(
                 X_outer_tr_df.reset_index(drop=True),
                 y_outer_tr, sw_outer_tr, inner_splits_pos,
+                outer_tr_scored,
             )
             study = optuna.create_study(direction="minimize")
             if DEBUG:
@@ -464,26 +721,81 @@ if __name__ == "__main__":
 
         # Train final outer-fold model with best params (or defaults); predict on outer-val
         try:
-            preds, _, _ = _train_catboost_fold(
+            preds, seed_preds, _, _ = _train_catboost_fold(
                 X_outer_tr_df, y_outer_tr, X_outer_va_df, y_outer_va_orig,
                 best_params, sample_weight=sw_outer_tr, seeds=OUTER_FOLD_FINAL_SEEDS)
         except Exception as _e:
             print(f"  Outer fold {of_i}: final fit failed ({_e}); skipping fold")
             continue
         oof_preds[outer_va_idx] = preds
-        fmae = float(mean_absolute_error(y_outer_va_orig, preds))
-        outer_fold_maes.append(fmae)
+        # Persist per-seed predictions by slot. Slot k corresponds to
+        # OUTER_FOLD_FINAL_SEEDS[k]; unfilled slots stay NaN (never fabricated).
+        for _k in range(S_OUTER):
+            if _k < len(seed_preds):
+                per_seed_oof[_k, outer_va_idx] = seed_preds[_k]
+        oof_fold_id[outer_va_idx] = of_i
+        per_fold_seeds_used.append(
+            [int(s) for s in OUTER_FOLD_FINAL_SEEDS[:len(seed_preds)]]
+        )
+        # All-category MAE (diagnostic) AND scored MAE (decision metric).
+        fmae_all = float(mean_absolute_error(y_outer_va_orig, preds))
+        va_scored_m = train_scored_mask[outer_va_idx]
+        fmae_scored = _mae_scored(y_outer_va_orig, preds, va_scored_m)
+        outer_fold_maes.append(fmae_scored)
+        outer_fold_maes_all.append(fmae_all)
         outer_fold_best_params.append(best_params)
-        print(f"  Outer fold {of_i}: MAE = {fmae:.4f}")
+        # Per-scored-category fold MAE breakdown
+        fold_per_cat = {}
+        if scored_categories and scored_cat_col:
+            cat_arr_va = train_df[scored_cat_col].values[outer_va_idx]
+            for _cat in scored_categories:
+                _cm = (cat_arr_va == _cat)
+                fold_per_cat[_cat] = (
+                    float(mean_absolute_error(y_outer_va_orig[_cm], preds[_cm]))
+                    if _cm.any() else None
+                )
+        outer_fold_per_cat_maes.append(fold_per_cat)
+        _cat_str = (
+            "  per-cat={" + ", ".join(
+                f"{k}={v:.4f}" if v is not None else f"{k}=NA"
+                for k, v in fold_per_cat.items()) + "}"
+        ) if fold_per_cat else ""
+        print(f"  Outer fold {of_i}: MAE all={fmae_all:.4f}  "
+              f"scored={fmae_scored:.4f}{_cat_str}")
 
-    # Honest OOF MAE on rows covered by at least one outer fold
+    # Honest OOF MAE on rows covered by at least one outer fold.
+    # `oof_mae` (the reported metric used by validator/critic/Optuna pinning) is
+    # the SCORED-only MAE — the decision metric. `oof_mae_all_categories` is the
+    # diagnostic across every training category.
     _covered = ~np.isnan(oof_preds)
     if _covered.any():
-        oof_mae = float(mean_absolute_error(y_raw[_covered], oof_preds[_covered]))
+        oof_mae_all = float(mean_absolute_error(y_raw[_covered], oof_preds[_covered]))
+        _scored_cov = _covered & train_scored_mask
+        oof_mae_scored = _mae_scored(y_raw, oof_preds, _scored_cov)
     else:
-        oof_mae = float("inf")
-    print(f"Nested-CV OOF MAE: {oof_mae:.4f}  (covered {_covered.sum()}/{len(train_df)} rows)")
-    print(f"Per-fold MAEs: {[round(m, 4) for m in outer_fold_maes]}")
+        oof_mae_all    = float("inf")
+        oof_mae_scored = float("inf")
+    oof_mae = oof_mae_scored   # decision-metric alias (downstream contract)
+    print(f"Nested-CV OOF MAE: all={oof_mae_all:.4f}  scored={oof_mae_scored:.4f}  "
+          f"(covered {_covered.sum()}/{len(train_df)} rows)")
+    print(f"Per-fold scored MAEs: {[round(m, 4) for m in outer_fold_maes]}")
+    print(f"Per-fold all-cat MAEs: {[round(m, 4) for m in outer_fold_maes_all]}")
+
+    # Per-scored-category OOF MAE breakdown (one entry per scored category)
+    per_scored_cat_oof_mae = {}
+    if scored_categories and scored_cat_col:
+        _cat_arr = train_df[scored_cat_col].values
+        for _cat in scored_categories:
+            _cm = _covered & (_cat_arr == _cat)
+            per_scored_cat_oof_mae[_cat] = (
+                float(mean_absolute_error(y_raw[_cm], oof_preds[_cm]))
+                if _cm.any() else None
+            )
+        _pc_str = ", ".join(
+            f"{k}={v:.4f}" if v is not None else f"{k}=NA"
+            for k, v in per_scored_cat_oof_mae.items()
+        )
+        print(f"Per-scored-category OOF MAE: {{{_pc_str}}}")
 
     # Aggregate best hyperparameters across outer folds (median per param)
     def _aggregate_params(list_of_dicts):
@@ -524,7 +836,7 @@ if __name__ == "__main__":
     X_wf_train_df = wf_train[all_feature_cols]
     X_wf_val_df   = wf_val[all_feature_cols]
     y_wf_train_raw = wf_train[target_col].values.astype(float)
-    y_wf_train     = np.log1p(y_wf_train_raw) if _use_log1p else y_wf_train_raw
+    y_wf_train     = forward_transform(y_wf_train_raw)
     y_wf_val_raw   = wf_val[target_col].values.astype(float)
     y_wf_val       = y_wf_val_raw  # original space for MAE eval
     _wf_sw = _adv_weights[wf_train.index.values] if _adv_weights is not None else None
@@ -551,16 +863,19 @@ if __name__ == "__main__":
     probe = _cb_module.CatBoostRegressor(**{**probe_params, "cat_features": _cf_probe_idx})
     probe.fit(
         _X_wf_tr_t, y_wf_train, sample_weight=_wf_sw,
-        eval_set=(_X_wf_va_t, np.log1p(y_wf_val_raw) if _use_log1p else y_wf_val_raw),
+        eval_set=(_X_wf_va_t, forward_transform(y_wf_val_raw)),
         verbose=False,
     )
     _best_iter        = probe.get_best_iteration() or 500
     best_n_estimators = int(_best_iter * 1.1)
     if DEBUG:
         best_n_estimators = min(best_n_estimators, 200)
-    wf_mae            = float(mean_absolute_error(
-        y_wf_val, np.clip(inv(probe.predict(_X_wf_va_t)), 0, None)))
-    print(f"WF MAE (probe): {wf_mae:.4f}  best_iter: {_best_iter}  n_estimators: {best_n_estimators}")
+    _wf_probe_preds = np.clip(inv(probe.predict(_X_wf_va_t)), 0, None)
+    wf_mae          = float(mean_absolute_error(y_wf_val, _wf_probe_preds))
+    _wf_val_scored_m = _scored_mask(wf_val, scored_filters)
+    wf_mae_scored = _mae_scored(y_wf_val, _wf_probe_preds, _wf_val_scored_m)
+    print(f"WF MAE (probe): all={wf_mae:.4f}  scored={wf_mae_scored:.4f}  "
+          f"best_iter: {_best_iter}  n_estimators: {best_n_estimators}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Step 9 — Final 5-seed CatBoost retrain on full train data + production Pipeline
@@ -605,6 +920,52 @@ if __name__ == "__main__":
     _oof_path = os.path.join(REPO_ROOT, "reports", "oof_predictions.csv")
     _oof_ids.to_csv(_oof_path, index=False, encoding="utf-8")
     print(f"Written OOF predictions: {_oof_path}  shape={_oof_ids.shape}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OBSERVABILITY ONLY — reports/oof/oof_per_seed.csv
+    #
+    # One row per OOF observation; columns expose the per-seed prediction
+    # arrays already computed inside the outer-fold scoring step. The
+    # row-wise aggregate of pred_seed_* (same callable as `_seed_agg`)
+    # reproduces this run's aggregated OOF predictions to machine precision —
+    # asserted below. No agent reads this file to make decisions.
+    # ─────────────────────────────────────────────────────────────────────────
+    _oof_dir = os.path.join(REPO_ROOT, "reports", "oof")
+    os.makedirs(_oof_dir, exist_ok=True)
+    _covered_pos = np.where(_covered)[0]
+    _join_cols   = list(group_cols) + ([time_col] if time_col else [])
+    _ops_df = train_df.loc[_covered, _join_cols].copy().reset_index(drop=True)
+    _ops_df.insert(0, "row_index", _covered_pos)
+    _ops_df["fold_id"] = oof_fold_id[_covered_pos]
+    _ops_df["y_true"]  = y_raw[_covered_pos]
+    for _k in range(S_OUTER):
+        _ops_df[f"pred_seed_{_k}"] = per_seed_oof[_k, _covered_pos]
+    _oof_seed_path = os.path.join(_oof_dir, "oof_per_seed.csv")
+    _ops_df.to_csv(_oof_seed_path, index=False, encoding="utf-8")
+    print(f"Written per-seed OOF: {_oof_seed_path}  shape={_ops_df.shape}  "
+          f"seeds={list(OUTER_FOLD_FINAL_SEEDS)}  agg={_seed_agg.__name__}")
+
+    # Verify: row-wise _seed_agg of per-seed arrays reproduces oof_preds.
+    # Uses np.nanmean / np.nanmedian when only some seed slots are populated
+    # (e.g. --debug → single seed), mirroring _seed_agg semantics on the
+    # actual per-fold arrays.
+    _pred_cols = [f"pred_seed_{_k}" for _k in range(S_OUTER)]
+    _per_seed_arr = _ops_df[_pred_cols].values
+    if _seed_agg is np.median:
+        _rowwise = np.nanmedian(_per_seed_arr, axis=1)
+    else:
+        _rowwise = np.nanmean(_per_seed_arr, axis=1)
+    _target = oof_preds[_covered_pos]
+    _max_abs_diff = float(np.max(np.abs(_rowwise - _target)))
+    print(f"oof_per_seed verify: n_rows={len(_ops_df)} (OOF rows={int(_covered.sum())})  "
+          f"max |rowwise_{_seed_agg.__name__} - oof_preds| = {_max_abs_diff:.3e}")
+    assert len(_ops_df) == int(_covered.sum()), (
+        f"oof_per_seed row count {len(_ops_df)} != OOF row count {int(_covered.sum())}"
+    )
+    assert _max_abs_diff < 1e-9, (
+        f"oof_per_seed verify failed: max |rowwise_{_seed_agg.__name__} - oof_preds| "
+        f"= {_max_abs_diff:.3e} exceeds 1e-9 tolerance"
+    )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Step 10 — Ridge diagnostic (Pipeline-encoded, not in submission)
@@ -771,6 +1132,8 @@ if __name__ == "__main__":
             _n_h_steps        = len(_wf_val_periods)
             _wf_step_nums     = (_wf_v_sorted[_rf_ord_col].values - _wf_train_max_ord).astype(int)
             _y_wf_truth       = _wf_v_sorted[target_col].values
+            # Boolean mask of scored holdout rows (aligned to _wf_v_sorted)
+            _wf_scored_m      = _scored_mask(_wf_v_sorted, scored_filters)
 
             _hist_seed = {}
             for _gk, _gdf in _wf_t_sorted.groupby(_gb_cols):
@@ -791,14 +1154,23 @@ if __name__ == "__main__":
                 if col in _imp_df.columns:
                     _imp_df[col] = 0.0
             _imp_preds_h = _rf_predict(_imp_df)
-            _imp_hold_mae = float(mean_absolute_error(_y_wf_truth, _imp_preds_h))
-            _per_step_imp = [
+            _imp_hold_mae_all    = float(mean_absolute_error(_y_wf_truth, _imp_preds_h))
+            _imp_hold_mae_scored = _mae_scored(_y_wf_truth, _imp_preds_h, _wf_scored_m)
+            _imp_hold_mae        = _imp_hold_mae_scored   # decision metric
+            _per_step_imp_all = [
                 float(mean_absolute_error(_y_wf_truth[_wf_step_nums == s],
                                            _imp_preds_h[_wf_step_nums == s]))
                 for s in range(1, _n_h_steps + 1)
                 if (_wf_step_nums == s).any()
             ]
-            print(f"  Imputation holdout MAE: {_imp_hold_mae:.4f}")
+            _per_step_imp = [
+                _mae_scored(_y_wf_truth, _imp_preds_h,
+                            _wf_scored_m & (_wf_step_nums == s))
+                for s in range(1, _n_h_steps + 1)
+                if (_wf_step_nums == s).any()
+            ]
+            print(f"  Imputation holdout MAE: all={_imp_hold_mae_all:.4f}  "
+                  f"scored={_imp_hold_mae_scored:.4f}")
 
             # (B) recursive holdout — predict step-by-step, feeding preds forward
             print("Recursive forecasting: recursive holdout…")
@@ -826,17 +1198,28 @@ if __name__ == "__main__":
                 for _li, _ri in enumerate(_pidxs):
                     _rec_hist.setdefault(_wf_gkeys[_ri], []).append(float(_sp[_li]))
 
-            _rec_hold_mae = float(mean_absolute_error(_y_wf_truth, _rec_preds_h))
-            _per_step_rec = [
+            _rec_hold_mae_all    = float(mean_absolute_error(_y_wf_truth, _rec_preds_h))
+            _rec_hold_mae_scored = _mae_scored(_y_wf_truth, _rec_preds_h, _wf_scored_m)
+            _rec_hold_mae        = _rec_hold_mae_scored   # decision metric
+            _per_step_rec_all = [
                 float(mean_absolute_error(_y_wf_truth[_wf_step_nums == s],
                                            _rec_preds_h[_wf_step_nums == s]))
                 for s in range(1, _n_h_steps + 1)
                 if (_wf_step_nums == s).any()
             ]
-            print(f"  Recursive holdout MAE: {_rec_hold_mae:.4f}")
+            _per_step_rec = [
+                _mae_scored(_y_wf_truth, _rec_preds_h,
+                            _wf_scored_m & (_wf_step_nums == s))
+                for s in range(1, _n_h_steps + 1)
+                if (_wf_step_nums == s).any()
+            ]
+            print(f"  Recursive holdout MAE: all={_rec_hold_mae_all:.4f}  "
+                  f"scored={_rec_hold_mae_scored:.4f}")
 
-            _rec_wins = _rec_hold_mae <= _imp_hold_mae
-            print(f"  Winner: {'RECURSIVE' if _rec_wins else 'IMPUTATION'}")
+            # Decision uses SCORED-only MAE (the evaluation metric).
+            _rec_wins = _rec_hold_mae_scored <= _imp_hold_mae_scored
+            print(f"  Winner (by scored MAE): "
+                  f"{'RECURSIVE' if _rec_wins else 'IMPUTATION'}")
 
             _method_used  = "imputation"
             _n_val_steps  = int(val_df[_rf_ord_col].nunique())
@@ -893,19 +1276,26 @@ if __name__ == "__main__":
 
             _lag_forecasting = {
                 "method_used":             _method_used,
-                "imputation_holdout_mae":  _imp_hold_mae,
-                "recursive_holdout_mae":   _rec_hold_mae,
-                "per_step_mae_imputation": _per_step_imp,
-                "per_step_mae_recursive":  _per_step_rec,
+                "decision_metric":         "scored_only_mae",
+                "imputation_holdout_mae":              _imp_hold_mae_scored,
+                "imputation_holdout_mae_all_categories": _imp_hold_mae_all,
+                "recursive_holdout_mae":               _rec_hold_mae_scored,
+                "recursive_holdout_mae_all_categories":  _rec_hold_mae_all,
+                "per_step_mae_imputation":               _per_step_imp,
+                "per_step_mae_imputation_all_categories": _per_step_imp_all,
+                "per_step_mae_recursive":                _per_step_rec,
+                "per_step_mae_recursive_all_categories":  _per_step_rec_all,
                 "n_holdout_steps":         _n_h_steps,
                 "n_val_steps":             _n_val_steps,
                 "ceiling_hits_holdout":    _rf_ceiling_hits,
                 "ceiling_hits_val":        _val_ceil_hits,
                 "ceiling_value":           _rf_ceiling,
                 "notes": (
-                    f"recursive won by {_imp_hold_mae - _rec_hold_mae:.4f}"
+                    f"recursive won by {_imp_hold_mae_scored - _rec_hold_mae_scored:.4f} "
+                    f"(scored MAE)"
                     if _rec_wins
-                    else f"imputation won by {_rec_hold_mae - _imp_hold_mae:.4f}"
+                    else f"imputation won by {_rec_hold_mae_scored - _imp_hold_mae_scored:.4f} "
+                         f"(scored MAE)"
                 ),
             }
 
@@ -949,16 +1339,22 @@ if __name__ == "__main__":
         "problem_subtype":    problem_subtype,
         "ensemble_path_used": "catboost_only",
         "log1p_transform":    _use_log1p,
+        "target_transform":   _transform_mode,
+        "target_transform_requested": TRANSFORM_REQUEST,
         "target_skewness":    float(_target_skew),
+        "transform_selection": _transform_selection,
         "pipeline_config_used": True,
         "nested_cv": {
             "outer_folds":          len(outer_splits),
             "outer_scheme":         outer_scheme,
             "inner_folds":          N_INNER_FOLDS,
             "outer_fold_maes":      [float(m) for m in outer_fold_maes],
+            "outer_fold_maes_all_categories": [float(m) for m in outer_fold_maes_all],
+            "outer_fold_per_scored_category_maes": outer_fold_per_cat_maes,
             "outer_fold_train_sizes": [int(s) for s in outer_fold_sizes],
             "outer_fold_best_params": outer_fold_best_params,
             "honest_oof_mae":       float(oof_mae),
+            "honest_oof_mae_all_categories": float(oof_mae_all),
         },
         "adaptive_choice": {
             "branch":                        1,
@@ -1000,10 +1396,22 @@ if __name__ == "__main__":
         "n_seeds":                  len(FINAL_RETRAIN_SEEDS),
         "cv_scheme":                outer_scheme,
         "oof_mae":                  float(oof_mae),
+        "oof_mae_all_categories":   float(oof_mae_all),
         "oof_cv_scheme":            outer_scheme,
         "per_fold_maes":            [float(m) for m in outer_fold_maes],
+        "per_fold_maes_all_categories": [float(m) for m in outer_fold_maes_all],
+        "per_scored_category_oof_mae":  per_scored_cat_oof_mae,
+        "per_fold_per_scored_category_maes": outer_fold_per_cat_maes,
+        "scored_categories":        scored_categories,
+        "scored_category_column":   scored_cat_col,
+        "scored_filters":           {k: sorted(v) for k, v in scored_filters.items()},
+        "n_scored_train_rows":      int(train_scored_mask.sum()),
+        "n_scored_val_rows":        int(val_scored_mask.sum()),
+        "decision_metric":          "scored_only_mae" if scored_filters else "all_category_mae",
         "walk_forward_mae":         float(wf_mae),
+        "walk_forward_mae_scored":  float(wf_mae_scored),
         "probe_mae_80_20":          float(wf_mae),
+        "probe_mae_80_20_scored":   float(wf_mae_scored),
         "training_time_seconds":    training_time,
         "optuna_trials_completed":  total_optuna_trials,
         "optuna_succeeded":         total_optuna_trials > 0,
@@ -1025,6 +1433,17 @@ if __name__ == "__main__":
         },
         "postprocessing":    _postprocessing,
         "lag_forecasting":   _lag_forecasting,
+        # OBSERVABILITY ONLY — pointer to per-seed OOF prediction arrays.
+        # Not consumed by validator/critic/submission/report — diagnostic only.
+        "oof_per_seed": {
+            "seeds":           [int(s) for s in OUTER_FOLD_FINAL_SEEDS],
+            "n_seeds":         int(S_OUTER),
+            "n_rows":          int(_covered.sum()),
+            "per_fold_seeds":  per_fold_seeds_used,
+            "agg":             _seed_agg.__name__,
+            "path":            "reports/oof/oof_per_seed.csv",
+            "debug":           bool(DEBUG),
+        },
     }
 
     _mr_path = os.path.join(REPO_ROOT, "reports", "model_results.json")
