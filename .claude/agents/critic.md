@@ -28,8 +28,9 @@ the loop (modeler → validator → critic) — bounded.
 - Detects a second-cycle invocation by checking
   `reports/critic_retune_attempted.txt`; on the second cycle the script
   forces `status = "accepted"` regardless of check outcomes, so the loop
-  cannot regress further. (See the **Loop bound and tool gap** section below
-  — the contract specs MAX 2 retunes; today's tool sentinel enforces 1.)
+  cannot regress further. (See the **Loop bound** section below — the
+  contract aligns with the tool at MAX 1 retune; raising the cap requires
+  coordinated changes elsewhere, not a doc edit alone.)
 - Runs five quality checks: CV gap (with the gap-attribution
   CV_SCHEME-vs-REAL_DIVERGENCE downgrade), prediction bias/variance,
   feature concentration, walk-forward plausibility, prediction sanity. The
@@ -118,7 +119,7 @@ the **only** divergences from the base schema; everything else matches.
   "notes": "",
 
   // critic-specific extension:
-  "cycle":          0,                                  // 0 = initial pass; 1 = after first retune; 2 = after second retune
+  "cycle":          0,                                  // 0 = initial pass; 1 = after the one allowed retune (the cap); see "Loop bound"
   "modeler_run_id": "20260608T180000Z_a1b2c3d4",        // copied from upstream modeler_completion.json
   "retune_reason":  "critical"                          // ONLY when status == "retune_requested"; ∈ {"critical", "ablation"}
 }
@@ -135,25 +136,54 @@ not `"retune_requested"`. `retune_reason` MUST be omitted when status is not
 | `"ok"` | Critic ran, accepted the model (either clean first pass, OR forced-accept on bound-hit / budget guard / 2nd-cycle script rule). | Proceed to submission_writer. | Precondition satisfied (gate on `status == "ok"`). |
 | `"failed"` | Script crashed, exited nonzero, or a post-exit check failed (missing/empty/invalid artifact, stale marker). | Continue to submission_writer per CLAUDE.md ("a missing critic review never blocks submission"). | Will see no `critic_completion.json` with `status == "ok"`; CLAUDE.md owns the no-block-on-critic-failure rule. |
 | `"blocked"` | Upstream precondition not satisfied (no good `modeler_completion.json`, no `modeler_run_id`, etc.). Script was never invoked. | Same as "failed" — do not run the loop. | Same as "failed". |
-| `"retune_requested"` | Critic ran successfully and decided to loop. | Re-dispatch modeler → validator → critic, after confirming `cycle < 2` and the pipeline budget allows it. | NOT "ok"; both stages refuse to proceed until a subsequent critic pass returns `status == "ok"`. |
+| `"retune_requested"` | Critic ran successfully and decided to loop. | Re-dispatch modeler → validator → critic, after confirming `cycle < 1` and the pipeline budget allows it. | NOT "ok"; both stages refuse to proceed until a subsequent critic pass returns `status == "ok"`. |
 
-### Loop bound and tool gap
+### Loop bound
 
-The contract specs **MAX 2 retune cycles** (3 critic passes total: cycle 0,
-cycle 1, cycle 2). Bound-hit forces `status = "ok"` with a recorded reason; the
-pipeline always reaches submission_writer.
+The contract specs **MAX 1 retune** (`cycle ∈ {0, 1}`; 2 critic passes total:
+cycle 0 = initial pass, cycle 1 = post-retune pass which always force-accepts).
+This matches what `tools/run_critic.py` actually enforces today via the
+`critic_retune_attempted.txt` sentinel — on cycle 1 the script forces
+`status = "accepted"` regardless of check outcomes. The contract, the tool,
+and the orchestrator agree on the same cap.
 
-The contract additionally guards on **pipeline wall-clock budget**: if the
-remaining budget cannot cover a retune cycle (modeler + validator + critic, ≈
-25 min slack), the critic forces `status = "ok"` with a recorded reason instead
-of emitting `"retune_requested"`.
+Two independent triggers can force `status = "ok"` on a pass that the analytic
+checks would otherwise have marked `"retune_requested"` — whichever trips
+first:
 
-**Known tool gap.** `tools/run_critic.py` today enforces a strict 1-retune cap
-internally via the `critic_retune_attempted.txt` sentinel — on the second pass
-it forces `status = "accepted"` regardless of check outcomes. The contract
-specs 2 retunes; the tool implements 1. Effective behaviour today is
-`min(contract, tool) = 1 retune`. Closing this is a future `tools/run_critic.py`
-change (out of scope for the agent contract).
+1. **Cycle cap.** `resolved cycle >= 1` (i.e. this is the post-retune pass).
+2. **Wall-clock budget guard.** Remaining pipeline budget cannot cover another
+   retune cycle (modeler + validator + critic, ≈ 25 min slack).
+
+In either case, record the reason in `notes` and remove
+`reports/critic_retune_requested.json` if the script wrote it. The pipeline
+always reaches submission_writer.
+
+#### Future option: raising the cap to 2 retunes
+
+Documented for future readers so that nobody assumes a doc-only edit can raise
+the cap. The 2-retune mode is reachable ONLY when BOTH of the following land
+together:
+
+1. **`tools/run_critic.py` cycle-counter upgrade.** Replace the boolean
+   `critic_retune_attempted.txt` sentinel with a persisted cycle counter (the
+   same counter this contract documents in
+   `critic_completion.json["cycle"]`). The tool would then accept `cycle ∈
+   {0, 1, 2}` and only force-accept at `cycle >= 2`. Without this change the
+   tool will continue to force-accept at cycle 1 regardless of what this
+   contract says.
+2. **`reports/pipeline_run.json` plus orchestrator-level cycle enforcement.**
+   The cap value (and `current_modeler_run_id`, `session_start_epoch`) must
+   live in `pipeline_run.json` as the cross-stage source of truth, and the
+   orchestrator must enforce `cycle < cap` before re-dispatching the
+   modeler. Without this the cap value lives only in `critic_completion.json`
+   and the orchestrator has no authoritative reference to consult.
+
+**Raising the contract number from 1 to 2 without both of those changes does
+not deliver 2 retunes.** It only desynchronises the doc from the tool, which
+is the failure mode we just removed in this commit. Any future change to lift
+the cap must edit (1) and (2) above before — or in the same change as —
+editing this contract.
 
 ### Cycle counter
 
@@ -233,7 +263,7 @@ any non-UTC machine.
 ### Step 3 — early bound check (informational; do NOT skip the tool)
 
 Compute two booleans:
-- `cycle_cap_will_block = (resolved cycle >= 2)`.
+- `cycle_cap_will_block = (resolved cycle >= 1)`.
 - `budget_will_block = (remaining_pipeline_budget_seconds < 25 * 60)`, where
   remaining is `(pipeline_run.session_start_epoch + 2*3600) − now` if the
   strict source is present, else a logged heuristic (use
@@ -325,7 +355,7 @@ pass. Do NOT return before step 7 has written the record to disk.
 - Do NOT block submission. The orchestrator's no-block-on-critic-failure
   rule (CLAUDE.md Step 3.6 fallback path) still applies — a `failed` or
   `blocked` critic does not stop the pipeline.
-- Do NOT emit `retune_requested` past `cycle == 2` or with insufficient
+- Do NOT emit `retune_requested` past `cycle == 1` or with insufficient
   pipeline budget. Step 6 enforces both.
 - Do NOT write `critic_retune_requested.json` yourself; `tools/run_critic.py`
   writes it. On a bound-hit forced accept, REMOVE the file the script wrote
@@ -347,10 +377,13 @@ pass. Do NOT return before step 7 has written the record to disk.
 
 These are tracked separately and not addressed in this agent file:
 
-- **`tools/run_critic.py` cycle-cap upgrade.** Replace the boolean
-  `critic_retune_attempted.txt` sentinel with the persisted `cycle` counter
-  so the tool can support up to 2 retunes per the contract. Until this lands
-  the effective cap is 1 retune.
+- **(Optional, future) 2-retune mode.** Only reachable when BOTH
+  `tools/run_critic.py` is upgraded (sentinel → persisted cycle counter) AND
+  the orchestrator-level cap/enforcement lands in `reports/pipeline_run.json`
+  (see "Loop bound → Future option" above). The current contract is MAX 1
+  retune by design, matching the tool. Do NOT raise the cap in this file
+  alone — it will desynchronise the doc from what the tool actually
+  enforces.
 - **CLAUDE.md Step 3.6 reconciliation.** Add an independent artifact gate
   for `critic_completion.json`; document the loop-vs-proceed branch on
   `status == "retune_requested"` (orchestrator side); document the bound
