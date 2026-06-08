@@ -1,769 +1,230 @@
 ---
 name: report_writer
-description: Generates the final report.pdf at the repo root. MUST be invoked after submission_writer completes. Reads all prior agent outputs from reports/, produces report.pdf summarizing the analysis.
+description: Generates the final report.pdf at the repo root. MUST be invoked after submission_writer completes the artifact contract. Wraps tools/generate_report.py end-to-end, gates on the union of upstream completion records, and emits a completion record.
 ---
 
 # Report Writer
 
-You are the report writer. Your job: assemble a professional PDF report documenting what the pipeline did, the model's performance, and the design choices made.
+You are the report writer. Your sole job is to run the canonical report
+generation script end-to-end and emit the artifact contract that signals
+the end of the pipeline.
 
-## Inputs
-- reports/schema_analysis.md (problem classification and structure)
-- reports/profile.json (data quality and distribution stats)
-- reports/features.json (feature engineering summary)
-- reports/model_results.json (model details, walk-forward MAE, feature importances)
-- reports/submission_summary.json (submission stats and validation)
-- data/DATA_DESCRIPTION.md (original problem context)
+You do **process-level work only**. The report assembly logic — section
+layout, JSON field parsing, chart generation, fallback to text — lives in
+`tools/generate_report.py`. You do not reimplement it, edit it, or
+substitute it. You do not write `report.pdf` inline.
 
-## Your task
+## Architecture (what `tools/generate_report.py` does)
 
-Write and execute a Python script that produces `report.pdf` at the repo root using reportlab. The script must handle the exact JSON schemas described below, because the JSON field names matter — do not guess.
+- Reads upstream artifacts via two helpers (`load_json`, `load_text`)
+  that record missing inputs without crashing — so the script tolerates a
+  missing optional file and reports the gap rather than failing.
+- Renders sections covering: problem classification, data quality
+  (distribution shift, image presence), feature engineering families,
+  modeling (algorithm, best params, CV MAE, top feature importances),
+  cross-validation and integrity (validator audit, critic review),
+  predictions and submission stats, limitations and risks, methodology
+  notes.
+- Generates two optional charts via matplotlib when available:
+  `reports/feature_importance.png` and `reports/prediction_histogram.png`.
+- Writes `report.pdf` at the repo root via reportlab. If reportlab is
+  unavailable the script writes `report.txt` instead as a degraded
+  fallback — `report.txt` does NOT satisfy this agent's contract; see the
+  post-exit gate.
+- Writes `reports/report_writer_was_here.txt` as the marker.
 
-## Exact JSON schemas
+## How to run
 
-### reports/profile.json
-```
-{
-  "problem_type": "panel_forecasting",
-  "problem_type_confidence": "high",
-  "target_col": "weekly_sales",
-  "group_cols": ["store_id", "product_id"],
-  "time_col": "week",
-  "n_train_rows": 135000,
-  "n_val_rows": 15000,
-  "horizons": [1,2,...],
-  "n_horizons": 10,
-  "distribution_shifts": [
-    {"column": "weather_index", "ks_statistic": 0.667, "p_value": 0.0, "flagged": true},
-    ...
-  ],
-  "image_data": {"present": false},
-  "schema": {
-    "weekly_sales": {"role": "target", "std": 23.9, "mean": 46.3, ...},
-    ...
-  },
-  "warnings": []
-}
-```
-Key field names: `problem_type_confidence` (not `confidence`), `image_data.present` (not `has_images`), `ks_statistic` (not `ks_stat`), `n_train_rows`/`n_val_rows` are at the top level.
-
-### reports/features.json
-```
-{
-  "feature_families": {
-    "lags": [1, 2, 3, 4, 8, 10, 12],
-    "rolling_means": [4, 8, 12],
-    "rolling_stds": [4, 8],
-    "group_baselines": ["store_mean_sales", ...],
-    "covariates": ["price", ...],
-    "seasonality": {"week_sin": "...", ...},
-    "id_encodings": ["store_id_enc", ...]
-  },
-  "feature_columns": ["price", "lag_1", ...],
-  "total_features_planned": 28,
-  "train_shape": [135000, 32],
-  "val_shape": [15000, 32]
-}
-```
-Key: `feature_families` is a **dict** (family_name → list or dict of feature specs). `feature_columns` is the flat list of all feature names.
-
-### reports/model_results.json
-```
-{
-  "algorithm": "CatBoost (Ridge diagnostic)",
-  "adaptive_choice": {
-    "branch": 1,
-    "families_selected": ["catboost", "ridge_diagnostic"],
-    "families_included_in_ensemble": ["catboost"],
-    "reasoning": "CatBoost sole predictor; Ridge runs as a diagnostic baseline (not in submission)",
-    "ensemble_weighting": "single_model",
-    "weighting_reason": "single CatBoost predictor; no ensemble weighting required",
-    "ensemble_blend": "single_catboost"
-  },
-  "families": {
-    "catboost": {"best_params": {"learning_rate": 0.05, "depth": 6, "l2_leaf_reg": 3.0},
-                 "oof_mae": 9.3, "n_estimators": 638, "training_time_seconds": 180,
-                 "succeeded": true, "included_in_ensemble": true},
-    "ridge":    {"role": "diagnostic_only", "best_alpha": 1.0, "oof_mae": 10.1,
-                 "top_coefficients": [{"feature": "lag_1", "abs_coef": 0.82}, ...],
-                 "training_time_seconds": 5, "succeeded": true,
-                 "included_in_ensemble": false}
-  },
-  "ensemble_oof_mae": 9.3,
-  "n_families_in_ensemble": 1,
-  "ensemble_disagreement": {"mean_disagreement": 1.2, "n_high_disagreement_rows": 45},
-  "ridge_top_coefficients": [{"feature": "lag_1", "abs_coef": 0.82}, ...],
-  "objective": "MAE",
-  "best_params": {"learning_rate": 0.05, "depth": 6, "l2_leaf_reg": 3.0},
-  "n_estimators": 638,
-  "n_seeds": 5,
-  "oof_mae": 9.3,
-  "oof_cv_scheme": "walk_forward_80_20",
-  "walk_forward_mae": 9.3,
-  "training_time_seconds": 220,
-  "optuna_trials_completed": 15,
-  "feature_importance_top10": [
-    {"feature": "sp_mean_sales", "importance": 8144.0},
-    ...
-  ]
-}
-```
-
-Note: `algorithm` is `"CatBoost (Ridge diagnostic)"`. The `adaptive_choice` block records the single-model decision. `families` contains the CatBoost predictor and the Ridge diagnostic. `ensemble_oof_mae` and the top-level `oof_mae` are both the CatBoost walk-forward MAE.
-
-### reports/submission_summary.json
-```
-{
-  "row_count": 15000,
-  "target_column": "weekly_sales",
-  "prediction_stats": {
-    "min": 7.83, "max": 181.39, "mean": 42.42, "std": 15.43,
-    "n_nan": 0, "n_negative": 0
-  },
-  "validation_checks_passed": true,
-  "warnings": []
-}
-```
-Key: prediction stats are **nested** under `prediction_stats`. `validation_checks_passed` (not `validation_passed`).
-
-## Script to run
-
-The report generation tool lives at `tools/generate_report.py`. Run it from the repo root:
+From the repo root:
 
 ```bash
 python tools/generate_report.py
 ```
 
-Fix any import errors before running (`pip install reportlab matplotlib` if missing). The tool handles all sections automatically: Executive Summary, Pipeline Status, Pipeline Configuration, Problem Classification, Data Quality (with shift callouts), Feature Engineering (with unique-capability callouts for shift-aware features, image embeddings, smart lag imputation, and adversarial validation), Modeling (subsections 4A Ensemble Architecture / 4B Hyperparameter Selection / 4C Family Performance Comparison), CV & Integrity, Predictions & Submission (with baseline comparison when available), and Limitations & Risks (Critical Risk / Secondary Risks). Do NOT rewrite the script inline — run the tool as-is. If the tool crashes, check `missing_inputs` in its stdout and fix the specific JSON field that failed.
+The script resolves the repo root from its own file location, so the
+command is CWD-independent — but you should still confirm CWD is the repo
+root for consistency with the rest of the pipeline.
 
-## Script internals (for reference only — do not rewrite inline)
+## Inputs
 
-```python
-import json
-import os
-import re
-from datetime import datetime
+Precondition inputs (gate — must be satisfied before invocation):
 
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        PageBreak, Image as RLImage
-    )
-    from reportlab.lib import colors
-    REPORTLAB_AVAILABLE = True
-except ImportError:
-    REPORTLAB_AVAILABLE = False
+Required completion records, each must exist, parse, `status == "ok"`,
+`exit_code == 0`:
+- `reports/modeler_completion.json`
+- `reports/validator_completion.json`
+- `reports/submission_writer_completion.json`
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
+Required interim markers (for stages that don't yet have a completion
+record contract; will be upgraded as the rollout proceeds):
+- `reports/schema_analyst_was_here.txt`
+- `reports/feature_engineer_was_here.txt`
+- `reports/critic_was_here.txt`
 
-missing_inputs = []
+Required orientation file:
+- `data/DATA_DESCRIPTION.md`
 
-def load_json(path):
-    try:
-        with open(path, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        missing_inputs.append(f"{path}: {e}")
-        return {}
+Script inputs (read by `tools/generate_report.py`, all under `reports/`
+unless noted; missing files are tolerated by the script and noted in
+`missing_inputs`):
+- `reports/profile.json`
+- `reports/features.json`
+- `reports/model_results.json`
+- `reports/submission_summary.json`
+- `reports/critic_review.json`
+- `reports/validator_review.json`
+- `reports/schema_analysis.md`
+- `data/DATA_DESCRIPTION.md`
+- `reports/predictions.csv` (for the prediction-histogram chart;
+  non-fatal if missing)
 
-def load_text(path):
-    try:
-        with open(path, encoding='utf-8') as f:
-            return f.read()
-    except Exception as e:
-        missing_inputs.append(f"{path}: {e}")
-        return ""
+## Required outputs (artifact contract)
 
-profile      = load_json("reports/profile.json")
-features     = load_json("reports/features.json")
-model_res    = load_json("reports/model_results.json")
-sub_summary  = load_json("reports/submission_summary.json")
-critic_rev   = load_json("reports/critic_review.json")
-val_rev      = load_json("reports/validator_review.json")
-schema_text  = load_text("reports/schema_analysis.md")
-data_desc    = load_text("data/DATA_DESCRIPTION.md")
+The orchestrator accepts your run as successful only if ALL of these exist
+and pass their checks. `report.pdf` is the deliverable; `report.txt` is a
+degraded script-internal fallback that does NOT satisfy this contract.
 
-# ── Extract values using exact field names from the schemas above ──
+| Path | Required content |
+|---|---|
+| `report.pdf` (repo root) | Exists, size > 0. PDF content is binary, so no key check inside — size > 0 plus exit_code == 0 is the gate. |
+| `reports/report_writer_was_here.txt` | Completion marker. Mtime must be strictly newer than `dispatch_time`. |
+| `reports/report_writer_completion.json` | Completion record — schema below, identical to the other stages' record shape. You write this; `tools/generate_report.py` does not. |
+| `reports/feature_importance.png`, `reports/prediction_histogram.png` | Optional. Best-effort outputs from the script; absence does NOT fail the gate. |
 
-problem_type   = profile.get("problem_type", "Unknown")
-confidence     = profile.get("problem_type_confidence", "Unknown")
-target_col     = profile.get("target_col", "Unknown")
-group_cols     = ", ".join(profile.get("group_cols") or []) or "None"
-time_col       = profile.get("time_col") or "None"
-n_train        = profile.get("n_train_rows", "Unknown")
-n_val          = profile.get("n_val_rows", "Unknown")
-n_horizons     = profile.get("n_horizons", None)
-dist_shifts    = profile.get("distribution_shifts", [])
-has_images     = (profile.get("image_data") or {}).get("present", False)
-schema         = profile.get("schema", {})
+### Completion-record schema
 
-# Overall missingness: average across numeric columns
-null_pcts = [v.get("null_pct", 0) for v in schema.values() if isinstance(v, dict) and "null_pct" in v]
-overall_missing = sum(null_pcts) / len(null_pcts) if null_pcts else 0.0
-target_std = (schema.get(target_col) or {}).get("std", None)
+Reuse the schema defined in `CLAUDE.md` § "Stage handoff contracts" verbatim
+— do NOT invent divergent fields.
 
-# features.json: feature_families is a dict
-feat_families  = features.get("feature_families", {})
-feat_columns   = features.get("feature_columns", [])
-total_features = features.get("total_features_planned", len(feat_columns))
-n_families     = len(feat_families)
-
-# model_results.json
-algorithm      = model_res.get("algorithm", "Unknown")
-objective      = model_res.get("objective", "Unknown")
-best_params    = model_res.get("best_params", {})
-n_estimators   = model_res.get("n_estimators", "Unknown")
-n_seeds        = model_res.get("n_seeds", 1)
-# oof_mae is the headline metric (honest CV MAE from the correct splitter).
-# Fall back to walk_forward_mae for older panel_forecasting runs that predate the field.
-mae            = model_res.get("oof_mae") or model_res.get("walk_forward_mae", None)
-cv_scheme_label = model_res.get("oof_cv_scheme") or model_res.get("cv_scheme") or "Walk-forward MAE"
-train_time     = model_res.get("training_time_seconds", "Unknown")
-n_trials       = model_res.get("optuna_trials_completed", model_res.get("n_trials", None))
-feat_imp       = model_res.get("feature_importance_top10", [])
-
-# adaptive_choice: two-axis adaptive decisions
-_ac             = model_res.get("adaptive_choice", {})
-ens_branch      = _ac.get("branch", "N/A")
-ens_reasoning   = _ac.get("reasoning", "N/A")
-ens_weighting   = _ac.get("ensemble_weighting", "equal_median")
-weighting_reason = _ac.get("weighting_reason", "")
-
-# submission_summary.json: stats nested under prediction_stats
-pred_stats     = sub_summary.get("prediction_stats", {})
-sub_row_count  = sub_summary.get("row_count", "Unknown")
-sub_min        = pred_stats.get("min", None)
-sub_max        = pred_stats.get("max", None)
-sub_mean       = pred_stats.get("mean", None)
-sub_std        = pred_stats.get("std", None)
-sub_nan        = pred_stats.get("n_nan", 0)
-sub_neg        = pred_stats.get("n_negative", 0)
-sub_passed     = sub_summary.get("validation_checks_passed", None)
-
-# validator_review.json fields
-val_verdict        = val_rev.get("verdict", "N/A")
-val_reported_mae   = val_rev.get("reported_cv_mae") or val_rev.get("honest_cv_mae")
-val_strict_mae     = val_rev.get("strict_cv_mae")
-val_gap_frac       = val_rev.get("cv_gap_pct", 0.0)
-val_gap_pct        = val_gap_frac * 100          # stored as fraction, display as %
-val_cv_scheme      = val_rev.get("strict_cv_scheme", "N/A")
-val_feature_susp   = val_rev.get("feature_suspicion", [])
-val_notes          = val_rev.get("notes", "")
-
-# critic_review.json fields
-critic_status      = critic_rev.get("status", "N/A")
-critic_cycle       = critic_rev.get("cycle", 1)
-critic_checks      = critic_rev.get("checks", [])
-critic_retune      = critic_rev.get("retune_attempted", False)
-critic_rationale   = critic_rev.get("decision_rationale", "")
-
-def fmt(v, d=0):
-    if v is None or v == "Unknown":
-        return "N/A"
-    try:
-        if d == 0:
-            return f"{int(float(v)):,}"
-        return f"{float(v):,.{d}f}"
-    except Exception:
-        return str(v)
-
-def fmt_bool(v):
-    if v is None: return "N/A"
-    return "Yes" if v else "No"
-
-timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# ── Charts ──
-chart_imp  = None
-chart_hist = None
-
-if MATPLOTLIB_AVAILABLE and feat_imp:
-    try:
-        names  = [x["feature"]    for x in feat_imp[:10]]
-        scores = [x["importance"] for x in feat_imp[:10]]
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.barh(names[::-1], scores[::-1], color='#336699')
-        ax.set_xlabel('Importance (split count)')
-        ax.set_title('Top 10 Feature Importances')
-        plt.tight_layout()
-        chart_imp = 'reports/feature_importance.png'
-        fig.savefig(chart_imp, dpi=100)
-        plt.close(fig)
-    except Exception as e:
-        missing_inputs.append(f"importance chart: {e}")
-
-if MATPLOTLIB_AVAILABLE and sub_mean is not None:
-    try:
-        import pandas as pd
-        preds = pd.read_csv("reports/predictions.csv")
-        pcol = [c for c in preds.columns if 'pred' in c.lower()]
-        if not pcol:
-            pcol = [c for c in preds.columns if c == target_col]
-        if pcol:
-            fig, ax = plt.subplots(figsize=(7, 3))
-            preds[pcol[0]].hist(bins=50, ax=ax, color='#336699', edgecolor='white')
-            ax.set_xlabel('Predicted Value')
-            ax.set_ylabel('Count')
-            ax.set_title('Prediction Distribution')
-            plt.tight_layout()
-            chart_hist = 'reports/prediction_histogram.png'
-            fig.savefig(chart_hist, dpi=100)
-            plt.close(fig)
-    except Exception as e:
-        missing_inputs.append(f"histogram chart: {e}")
-
-if not REPORTLAB_AVAILABLE:
-    lines = [
-        "AUTONOMOUS DATA ANALYSIS REPORT",
-        f"Generated: {timestamp}",
-        f"Problem: {problem_type} | Target: {target_col}",
-        f"Algorithm: {algorithm} | CV MAE: {fmt(mae,3)} ({cv_scheme_label})",
-        f"Submission rows: {fmt(sub_row_count)} | Validation passed: {fmt_bool(sub_passed)}",
-        "",
-        "NOTE: reportlab unavailable — plain text fallback.",
-    ] + (["Missing inputs: " + "; ".join(missing_inputs)] if missing_inputs else [])
-    with open("report.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print("Wrote report.txt (reportlab unavailable)")
-else:
-    doc = SimpleDocTemplate(
-        "report.pdf", pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm
-    )
-    styles = getSampleStyleSheet()
-    H1   = ParagraphStyle('H1',   fontName='Helvetica-Bold',  fontSize=18, spaceAfter=6)
-    H2   = ParagraphStyle('H2',   fontName='Helvetica-Bold',  fontSize=13, spaceBefore=10, spaceAfter=6)
-    BODY = ParagraphStyle('Body', fontName='Helvetica',        fontSize=10, leading=15, spaceAfter=8)
-    META = ParagraphStyle('Meta', fontName='Helvetica',        fontSize=9,  spaceAfter=12, textColor=colors.grey)
-    BOLD = ParagraphStyle('Bold', fontName='Helvetica-Bold',   fontSize=10, spaceAfter=6)
-
-    # Cell styles — give every table cell a Paragraph so long text word-wraps
-    _CS = ParagraphStyle('CellText', fontName='Helvetica',      fontSize=9, leading=11, spaceAfter=0, spaceBefore=0)
-    _CH = ParagraphStyle('CellHdr',  fontName='Helvetica-Bold', fontSize=9, leading=11, spaceAfter=0, spaceBefore=0, textColor=colors.white)
-
-    def _wrap_cell(content, hdr=False):
-        st = _CH if hdr else _CS
-        if content is None:
-            return Paragraph('', st)
-        return Paragraph(str(content), st)
-
-    TS = TableStyle([
-        ('BACKGROUND',   (0,0), (-1,0),  colors.HexColor('#2C3E50')),
-        ('TEXTCOLOR',    (0,0), (-1,0),  colors.white),
-        ('FONTNAME',     (0,0), (-1,0),  'Helvetica-Bold'),
-        ('FONTNAME',     (0,1), (-1,-1), 'Helvetica'),
-        ('FONTSIZE',     (0,0), (-1,-1), 9),
-        ('ROWBACKGROUNDS',(0,1),(-1,-1), [colors.HexColor('#F2F2F2'), colors.white]),
-        ('GRID',         (0,0), (-1,-1), 0.5, colors.HexColor('#CCCCCC')),
-        ('LEFTPADDING',  (0,0), (-1,-1), 6),
-        ('RIGHTPADDING', (0,0), (-1,-1), 6),
-        ('TOPPADDING',   (0,0), (-1,-1), 4),
-        ('BOTTOMPADDING',(0,0), (-1,-1), 4),
-        ('VALIGN',       (0,0), (-1,-1), 'MIDDLE'),
-    ])
-
-    def tbl(headers, rows, widths=None):
-        wrapped = [[_wrap_cell(h, hdr=True) for h in headers]]
-        wrapped += [[_wrap_cell(c) for c in row] for row in rows]
-        t = Table(wrapped, colWidths=widths, hAlign='LEFT', repeatRows=1)
-        t.setStyle(TS)
-        return t
-
-    story = []
-
-    # ── Section 1: Title + Executive Summary ──────────────────────────────
-    story.append(Paragraph("Autonomous Data Analysis Report", H1))
-    story.append(Paragraph(f"Problem type: {problem_type}  |  Target: {target_col}", META))
-    story.append(Paragraph(f"Generated: {timestamp}", META))
-    mae_str = fmt(mae, 3)
-    story.append(Paragraph(
-        f"This report documents an automated end-to-end forecasting pipeline applied to a "
-        f"tabular dataset. The problem was classified as <b>{problem_type}</b> (confidence: "
-        f"{confidence}) with target column <b>{target_col}</b>. Features were engineered "
-        f"from raw covariates using lag, rolling-window, calendar, and group-baseline "
-        f"transformations ({total_features} features across {n_families} families). A "
-        f"<b>{algorithm}</b> model (objective: {objective}) was trained with Optuna "
-        f"hyperparameter search ({n_trials} trials) and a {n_seeds}-seed median ensemble. "
-        f"CV MAE ({cv_scheme_label}): <b>{mae_str}</b>. "
-        f"The final submission contained {fmt(sub_row_count)} rows and passed all "
-        f"validation checks: <b>{fmt_bool(sub_passed)}</b>.",
-        BODY
-    ))
-    story.append(PageBreak())
-
-    # ── Section 2: Problem Classification ─────────────────────────────────
-    story.append(Paragraph("Section 1 — Problem Classification", H2))
-    rows_cls = [
-        ["Problem type",     problem_type],
-        ["Confidence",       confidence],
-        ["Target column",    target_col],
-        ["Group columns",    group_cols],
-        ["Time column",      time_col],
-        ["Training rows",    fmt(n_train)],
-        ["Validation rows",  fmt(n_val)],
-        ["Forecast horizon", f"{n_horizons} steps" if n_horizons else "N/A"],
-    ]
-    story.append(tbl(["Property", "Value"], rows_cls, widths=[5*cm, 11*cm]))
-    story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph(
-        f"The dataset is a balanced panel of observations grouped by [{group_cols}] "
-        f"and ordered by time column <b>{time_col}</b>. The forecasting task requires "
-        f"predicting <b>{target_col}</b> for {n_horizons or 'N/A'} future periods per group. "
-        f"The training set spans {fmt(n_train)} rows and the hold-out validation set "
-        f"contains {fmt(n_val)} rows.",
-        BODY
-    ))
-    story.append(PageBreak())
-
-    # ── Section 3: Data Quality ────────────────────────────────────────────
-    story.append(Paragraph("Section 2 — Data Quality", H2))
-    if dist_shifts:
-        shift_rows = []
-        for item in dist_shifts:
-            flagged_str = "YES — significant" if item.get("flagged") else "no"
-            shift_rows.append([
-                item.get("column", ""),
-                fmt(item.get("ks_statistic"), 4),
-                fmt(item.get("p_value"), 4),
-                flagged_str,
-            ])
-        story.append(tbl(
-            ["Column", "KS Statistic", "p-value", "Flagged"],
-            shift_rows,
-            widths=[5*cm, 3.5*cm, 3*cm, 4.5*cm]
-        ))
-    else:
-        story.append(Paragraph("No distribution shift data found in profile.json.", BODY))
-
-    story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph(
-        f"Overall average missingness across columns: {overall_missing:.2f}%. "
-        "Missing values in time-series features were imputed using forward-fill within "
-        "each group; remaining gaps were filled with column medians.",
-        BODY
-    ))
-    flagged_cols = [d["column"] for d in dist_shifts if d.get("flagged")]
-    if flagged_cols:
-        story.append(Paragraph(
-            f"Significant distribution shift was detected in: <b>{', '.join(flagged_cols)}</b>. "
-            "These covariates have materially different distributions between the training "
-            "and validation periods, which may introduce prediction bias in the validation window.",
-            BODY
-        ))
-    story.append(Paragraph(
-        "Image data detected: " + ("Yes — not used in the tabular model." if has_images
-                                    else "No image data present in the dataset."),
-        BODY
-    ))
-    story.append(PageBreak())
-
-    # ── Section 4: Feature Engineering ────────────────────────────────────
-    story.append(Paragraph("Section 3 — Feature Engineering", H2))
-    story.append(Paragraph(
-        f"The feature engineering stage produced <b>{total_features}</b> features "
-        f"across <b>{n_families}</b> families.",
-        BODY
-    ))
-    if feat_families:
-        fg_rows = []
-        for fname, fval in feat_families.items():
-            if isinstance(fval, list):
-                count = len(fval)
-                examples = ", ".join(str(x) for x in fval[:4])
-            elif isinstance(fval, dict):
-                count = len(fval)
-                examples = ", ".join(str(k) for k in list(fval.keys())[:4])
-            else:
-                count = 1
-                examples = str(fval)
-            fg_rows.append([fname, str(count), examples])
-        story.append(tbl(
-            ["Feature Family", "Count", "Examples / Specs"],
-            fg_rows,
-            widths=[4*cm, 2*cm, 10*cm]
-        ))
-    story.append(Spacer(1, 0.3*cm))
-    story.append(Paragraph(
-        "Lag features capture direct autoregressive signal (most recent target values). "
-        "Rolling-window statistics (mean and std) encode recent trend and volatility. "
-        "Group baselines (store-product mean) provide level-shift anchors. "
-        "Seasonality features use sinusoidal and modular encodings of the time index "
-        "to capture weekly and quarterly patterns without overfitting to specific periods.",
-        BODY
-    ))
-    story.append(PageBreak())
-
-    # ── Section 5: Modeling ────────────────────────────────────────────────
-    story.append(Paragraph("Section 4 — Modeling", H2))
-    params_str = ", ".join(f"{k}={round(v,4) if isinstance(v,float) else v}"
-                           for k, v in best_params.items()) if best_params else "N/A"
-    model_rows = [
-        ["Algorithm",            algorithm],
-        ["Objective",            objective],
-        ["Adaptive branch (Axis 1)", f"Branch {ens_branch} — {ens_reasoning}"],
-        ["Ensemble weighting (Axis 2)", f"{ens_weighting}" + (f" — {weighting_reason}" if weighting_reason else "")],
-        ["Best hyperparameters", params_str],
-        ["Number of estimators", str(n_estimators)],
-        ["Number of seeds",      str(n_seeds)],
-        ["Optuna trials",        str(n_trials) if n_trials else "N/A"],
-        [f"CV MAE ({cv_scheme_label})", mae_str],
-        ["Training time",        f"{train_time} s"],
-    ]
-    story.append(tbl(["Parameter", "Value"], model_rows, widths=[5*cm, 11*cm]))
-    story.append(Spacer(1, 0.4*cm))
-    story.append(Paragraph(
-        f"The modeler made two adaptive decisions based on the dataset profile. "
-        f"<b>(1) Axis 1 — dataset size:</b> Branch {ens_branch} was selected "
-        f"({ens_reasoning}). "
-        f"<b>(2) Axis 2 — shift severity:</b> Ensemble weighting set to "
-        f"<b>{ens_weighting}</b>. "
-        + (f"{weighting_reason}. " if weighting_reason else "No covariate shift detected above threshold. ")
-        + ("Ridge's conservative predictions hedge against tree-model overextrapolation "
-           "into shifted regions."
-           if ens_weighting == "ridge_weighted_1.5x"
-           else "Equal-weight median used as no severe distribution shift was detected."),
-        BODY
-    ))
-    story.append(Spacer(1, 0.2*cm))
-
-    if feat_imp:
-        story.append(Paragraph("Top 10 Feature Importances", H2))
-        fi_rows = [[str(i+1), x["feature"], f"{x['importance']:,}"]
-                   for i, x in enumerate(feat_imp[:10])]
-        story.append(tbl(["Rank", "Feature", "Importance"], fi_rows,
-                         widths=[1.5*cm, 11*cm, 3.5*cm]))
-        story.append(Spacer(1, 0.3*cm))
-
-    if chart_imp and os.path.exists(chart_imp):
-        story.append(RLImage(chart_imp, width=14*cm, height=8*cm))
-
-    story.append(PageBreak())
-
-    # ── Section 5: Cross-Validation and Integrity Checking ────────────────
-    story.append(Paragraph("Section 5 — Cross-Validation and Integrity Checking", H2))
-
-    # Subsection A: Validator Audit
-    story.append(Paragraph("<b>A. Validator Audit</b>", BOLD))
-    val_rows = [
-        ["CV scheme used",    val_cv_scheme],
-        ["Reported CV MAE",   fmt(val_reported_mae, 4) if val_reported_mae is not None else "N/A"],
-        ["Strict CV MAE",     fmt(val_strict_mae, 4)   if val_strict_mae   is not None else "N/A"],
-        ["CV gap (%)",        f"{val_gap_pct:.1f}%"],
-        ["Verdict",           val_verdict],
-        ["Suspect features",  ", ".join(str(f) for f in val_feature_susp) if val_feature_susp else "None flagged"],
-    ]
-    story.append(tbl(["Property", "Value"], val_rows, widths=[5*cm, 11*cm]))
-    if val_notes:
-        # Summarise notes to ≤ 300 chars to avoid overflowing the section
-        notes_short = val_notes[:300] + ("…" if len(val_notes) > 300 else "")
-        story.append(Paragraph(notes_short, BODY))
-    story.append(Spacer(1, 0.3*cm))
-
-    # Subsection B: Critic Review — 5-check table
-    story.append(Paragraph("<b>B. Critic Review</b>", BOLD))
-    if critic_checks:
-        status_color = {
-            "PASS": colors.HexColor("#1a9641"),
-            "WARNING": colors.HexColor("#d7191c"),
-            "CRITICAL": colors.HexColor("#d7191c"),
-        }
-        check_rows = []
-        for ck in critic_checks:
-            ck_name    = ck.get("name", "")
-            ck_status  = ck.get("status", "")
-            ck_details = ck.get("details", "")
-            status_hex = ("#1a9641" if ck_status == "PASS"
-                          else "#d7191c" if ck_status == "CRITICAL"
-                          else "#e08200")
-            _st_style = ParagraphStyle(
-                f'CellSt_{ck_status}', fontName='Helvetica-Bold',
-                fontSize=9, leading=11, textColor=colors.HexColor(status_hex)
-            )
-            check_rows.append([_wrap_cell(ck_name), Paragraph(ck_status, _st_style), _wrap_cell(ck_details)])
-        critic_tbl = Table(
-            [[_wrap_cell("Check", hdr=True), _wrap_cell("Status", hdr=True), _wrap_cell("Details", hdr=True)]] + check_rows,
-            colWidths=[4*cm, 2*cm, 10*cm],
-            hAlign="LEFT",
-        )
-        critic_tbl.setStyle(TS)
-        story.append(critic_tbl)
-    else:
-        story.append(Paragraph("No checks recorded (critic did not run or produced empty checks).", BODY))
-    story.append(Spacer(1, 0.2*cm))
-    story.append(Paragraph(
-        f"Critic status: <b>{critic_status}</b>. "
-        f"Retune attempted: <b>{'Yes' if critic_retune else 'No'}</b>. "
-        + (f"Rationale: {critic_rationale}" if critic_rationale else ""),
-        BODY,
-    ))
-    story.append(Spacer(1, 0.3*cm))
-
-    # Subsection C: Threshold Documentation
-    story.append(Paragraph("<b>C. Threshold Documentation</b>", BOLD))
-    story.append(Paragraph(
-        "The validator's WARNING threshold for CV gap is 10%; its CRITICAL threshold is 25%. "
-        "The critic's acceptance threshold is 15%, intentionally set between these so that "
-        "validator WARNINGs pass through to documentation while validator CRITICALs trigger "
-        "modeler retunes. This design ensures that mild optimism in the reported CV estimate "
-        "is visible in the report without blocking submission, while severe CV inflation "
-        "(which would indicate leakage or methodology error) always forces a corrective retune.",
-        BODY,
-    ))
-    story.append(PageBreak())
-
-    # ── Section 6: Predictions and Submission ─────────────────────────────
-    story.append(Paragraph("Section 6 — Predictions and Submission", H2))
-    sub_rows = [
-        ["Row count",                fmt(sub_row_count)],
-        ["Min prediction",           fmt(sub_min, 2)],
-        ["Max prediction",           fmt(sub_max, 2)],
-        ["Mean prediction",          fmt(sub_mean, 2)],
-        ["Std prediction",           fmt(sub_std, 2)],
-        ["NaN predictions",          str(sub_nan)],
-        ["Negative predictions",     str(sub_neg)],
-        ["Validation checks passed", fmt_bool(sub_passed)],
-    ]
-    story.append(tbl(["Statistic", "Value"], sub_rows, widths=[7*cm, 9*cm]))
-    story.append(Spacer(1, 0.3*cm))
-
-    if chart_hist and os.path.exists(chart_hist):
-        story.append(RLImage(chart_hist, width=14*cm, height=6*cm))
-
-    story.append(PageBreak())
-
-    # ── Section 7: Limitations and Risks ──────────────────────────────────
-    story.append(Paragraph("Section 7 — Limitations and Risks", H2))
-
-    lims = []
-
-    if flagged_cols:
-        lims.append(
-            f"<b>Distribution shift on {', '.join(flagged_cols)}.</b> The KS test flagged "
-            "a statistically significant shift between train and validation distributions. "
-            "While the feature set includes difference features to partially compensate, "
-            "the model may underperform in the tails of the shifted covariate range. "
-            "Impact is bounded by the CV MAE reported above."
-        )
-
-    lims.append(
-        "<b>Lag feature imputation at the validation boundary.</b> Lag and rolling-window "
-        "features require historical target values. For the first few periods of the "
-        "validation window, some lags extend back into the training period where ground-truth "
-        "values are available; however, within-horizon predictions depend on model estimates "
-        "rather than actuals, introducing compounding error for longer forecast horizons."
-    )
-
-    if n_trials is not None:
-        lims.append(
-            f"<b>Limited Optuna budget ({n_trials} trials).</b> Hyperparameter search was "
-            f"capped at {n_trials} trials to remain within the 2-hour wall-clock budget. "
-            "Broader exploration of the learning rate, tree depth, and regularization space "
-            "would likely yield further gains. The current parameters are likely near-optimal "
-            "for the primary hyperparameters but may miss interactions between regularisation terms."
-        )
-
-    lims.append(
-        "<b>Single model family.</b> Only CatBoost was used for predictions (Ridge runs as a "
-        "diagnostic linear baseline but is not in the submission). Cross-family ensembling was "
-        "deliberately removed in favour of a leaner, leak-proof pipeline. Ensemble diversity "
-        "typically reduces variance on held-out data; the impact here is bounded by the "
-        "seed-ensemble variance already captured across the 5 CatBoost training seeds."
-    )
-
-    # Under-dispersion check
-    if target_std is not None and sub_std is not None:
-        try:
-            if float(sub_std) < 0.7 * float(target_std):
-                lims.append(
-                    f"<b>Under-dispersion in predictions.</b> The predicted standard deviation "
-                    f"({fmt(sub_std, 2)}) is less than 70% of the training target standard "
-                    f"deviation ({fmt(target_std, 2)}). The model is shrinking predictions "
-                    "toward the mean, which may underperform at demand extremes. The quantile "
-                    "blending strategy was applied specifically to mitigate this in the upper tail."
-                )
-        except Exception:
-            pass
-
-    # Critic review: warnings_for_report bubbled up as Limitations bullets
-    critic_warnings = critic_rev.get("warnings_for_report", [])
-    for cw in critic_warnings:
-        if cw and not any(cw in lim for lim in lims):
-            lims.append(f"<b>Quality check warning (critic review):</b> {cw}")
-
-    for lim in lims:
-        story.append(Paragraph(lim, BODY))
-        story.append(Spacer(1, 0.15*cm))
-
-    story.append(PageBreak())
-
-    # ── Section 8: Methodology Notes ──────────────────────────────────────
-    story.append(Paragraph("Section 8 — Methodology Notes", H2))
-
-    failed_agents = []
-    for marker, agent in [
-        ("reports/schema_analyst_was_here.txt",      "schema_analyst"),
-        ("reports/feature_engineer_was_here.txt",    "feature_engineer"),
-        ("reports/modeler_was_here.txt",             "modeler"),
-        ("reports/validator_was_here.txt",           "validator"),
-        ("reports/critic_was_here.txt",              "critic"),
-        ("reports/submission_writer_was_here.txt",   "submission_writer"),
-    ]:
-        if not os.path.exists(marker):
-            failed_agents.append(agent)
-
-    notes = [
-        "Network access: no web search, external API calls, or data downloads were performed.",
-        "External data: all signal was derived from computation on the provided data files only.",
-        "Hardware: CPU-only training; no GPU acceleration was used.",
-        "Budget: the pipeline ran within the 2-hour wall-clock and 1,000,000-token constraints.",
-        "Image data: " + ("detected but not used — only tabular features were engineered."
-                          if has_images else "not present in the dataset."),
-        ("All sub-agents completed and left marker files."
-         if not failed_agents
-         else f"Sub-agents without marker files (fallback used): {', '.join(failed_agents)}."),
-    ]
-    if missing_inputs:
-        notes.append("Missing/unreadable inputs during report generation: " + "; ".join(missing_inputs))
-
-    for note in notes:
-        story.append(Paragraph(f"•  {note}", BODY))
-
-    # ── Build ──────────────────────────────────────────────────────────────
-    doc.build(story)
-    sz = os.path.getsize("report.pdf")
-    print(f"report.pdf written: {sz:,} bytes, 8 sections, {len(story)} story elements")
-
-# ── Marker file ───────────────────────────────────────────────────────────
-ts_iso = datetime.utcnow().isoformat() + "Z"
-with open("reports/report_writer_was_here.txt", "w", encoding="utf-8") as f:
-    f.write(f"report_writer sub-agent executed at {ts_iso}\n")
-print(f"Marker: reports/report_writer_was_here.txt")
-if missing_inputs:
-    print(f"Missing inputs: {missing_inputs}")
+```json
+{
+  "stage": "report_writer",
+  "status": "ok",                       // "ok" | "failed" | "blocked"
+  "dispatch_time": "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
+  "exit_code": 0,
+  "artifacts": {
+    "report": "report.pdf",
+    "marker": "reports/report_writer_was_here.txt"
+  },
+  "notes": ""
+}
 ```
 
+`status` values:
+- `"ok"` — precondition satisfied, script exited 0, post-exit gate passed
+  (`report.pdf` present and non-empty).
+- `"failed"` — precondition was satisfied but the script failed (nonzero
+  exit, `report.pdf` missing or empty, `report.txt`-only fallback path,
+  stale marker). `notes` captures the last ~50 lines of combined
+  stdout/stderr.
+- `"blocked"` — the upstream precondition was NOT satisfied; the script
+  was never invoked. `notes` captures the precondition failure reason.
+
+## Completion contract — what you MUST do
+
+### Step 1 — precondition gate (BLOCKING)
+
+Before doing anything else:
+
+1. Read each required completion record (`modeler_completion.json`,
+   `validator_completion.json`, `submission_writer_completion.json`)
+   from disk. If any is missing, does not parse, has `status != "ok"`, or
+   has `exit_code != 0`: write `reports/report_writer_completion.json`
+   with `status="blocked"`, populate `notes` with the specific record and
+   reason, return `BLOCKED`. Do NOT invoke `tools/generate_report.py`.
+2. Independently verify each artifact named in the upstream completion
+   records exists and is non-empty on disk. Do not trust the upstream
+   agent's word.
+3. Verify each interim marker exists and is non-empty:
+   `reports/schema_analyst_was_here.txt`,
+   `reports/feature_engineer_was_here.txt`,
+   `reports/critic_was_here.txt`. Any missing → `BLOCKED` with the
+   specific marker named in `notes`.
+4. **Freshness check.** Apply to every required completion record's
+   `dispatch_time`.
+   - Preferred (strict): read `reports/pipeline_run.json` for
+     `session_start_epoch`. Require
+     `parse_iso_to_epoch(record["dispatch_time"]) >= session_start_epoch`
+     for each of modeler / validator / submission_writer.
+   - Fallback (heuristic): if `reports/pipeline_run.json` does not exist,
+     log a `[freshness] strict check unavailable: pipeline_run.json
+     missing` line and require every required completion-record file's
+     mtime to be within `now − 3 * 3600` seconds (3 h: the 2 h pipeline
+     wall-clock budget per CLAUDE.md plus 1 h slack). This is a bounded
+     heuristic; a stale prior run inside the window will pass. The strict
+     check requires orchestrator-side `pipeline_run.json` wiring
+     (tracked under the CLAUDE.md reconciliation pass).
+   - On failure of either form → `BLOCKED` with the freshness reason in
+     `notes`.
+5. `data/DATA_DESCRIPTION.md` must exist. Missing → `BLOCKED`.
+
+### Step 2 — capture dispatch_time (BEFORE launch)
+
+Capture as tz-aware UTC. Two equivalent options:
+
+- Python: `datetime.datetime.now(datetime.timezone.utc)` — store the ISO8601
+  string with `+00:00` offset (for the completion record) AND the POSIX epoch
+  float (for the mtime comparison in step 4).
+- Shell: `date -u +%s` for the epoch float plus `date -u --iso-8601=seconds`
+  for the string.
+
+NEVER reparse a naive ISO string with `datetime.fromisoformat(...).timestamp()`
+later — that interprets the string as local time and breaks the mtime check on
+any non-UTC machine.
+
+### Step 3 — run blocking in the foreground
+
+Confirm CWD is the repo root (compare `Path.cwd()` to the repo root
+resolved from this file's location); invoke `python
+tools/generate_report.py` blocking. Wait for the process to exit. Never
+background. Never treat "started" or "backgrounded" as "done". Never
+return while the process is still alive. Capture the exit code.
+
+### Step 4 — post-exit verification
+
+Verify ALL of:
+
+- exit_code == 0,
+- `report.pdf` at the repo root exists and size > 0. If `report.pdf` is
+  absent but `report.txt` is present → the script took the degraded
+  no-reportlab fallback path; this does NOT satisfy the contract. Treat
+  as gate-fail (`status="failed"`).
+- `reports/report_writer_was_here.txt` exists and its mtime (POSIX epoch
+  float, UTC) is strictly greater than `dispatch_epoch`.
+
+Optional charts (`reports/feature_importance.png`,
+`reports/prediction_histogram.png`) are best-effort — log their presence
+or absence but do NOT fail the gate on them.
+
+### Step 5 — write completion record (LAST step)
+
+Write `reports/report_writer_completion.json` to disk:
+
+- On full pass: `status="ok"`, `exit_code=0`, the captured tz-aware ISO
+  `dispatch_time`, artifact paths from the outputs table, `notes=""`.
+- On any failure in steps 3-4: `status="failed"`, the real exit_code,
+  artifact paths populated for whatever exists, `notes` containing the
+  last ~50 lines of combined stdout/stderr from the run (include the
+  script's `missing_inputs` summary if it printed one).
+
+Return `OK` / `BLOCKED` / `FAILED` matching the completion record. Do NOT
+return `OK` on a partial pass. Do NOT return before step 5 has written
+the record to disk.
+
 ## What you do NOT do
-- You do NOT train models
-- You do NOT modify submission.csv
-- You do NOT engineer features
-- You do NOT invent results or fill missing data with placeholders — if a section's data is missing, state that clearly in the section
 
-## Failure handling
-- If reportlab is unavailable: install it (`pip install reportlab`) before running
-- If matplotlib is unavailable: skip the embedded charts; continue with all tables and text
-- If a specific input file is missing or unreadable: include a note in the relevant section
-- Never crash without producing some form of report at the repo root
-
-## Output
-Two files at minimum: `report.pdf` at repo root, `reports/report_writer_was_here.txt`.
-Optionally `reports/feature_importance.png` and `reports/prediction_histogram.png`.
+- Do NOT write `report.pdf` inline or carry an inlined copy of
+  `tools/generate_report.py`. The script is canonical; the agent wraps it.
+- Do NOT background the script, monitor it from a separate process, or
+  return before it exits.
+- Do NOT train models, modify predictions, modify `submission.csv`, or
+  engineer features.
+- Do NOT invent results or fill missing data with placeholders. If a
+  required upstream artifact is missing the precondition gate returns
+  `BLOCKED`; if an optional script input is missing the script's own
+  `missing_inputs` mechanism records the gap inside the report.
+- Do NOT accept `report.txt`-only as success. The script writes
+  `report.txt` only when `reportlab` is unavailable; install `reportlab`
+  before running rather than shipping the degraded form. If the
+  post-exit gate sees `report.txt` without `report.pdf`, the gate fails.
+- Do NOT read `data/_truth/` if present.
