@@ -89,14 +89,15 @@ Reuse the schema defined in `CLAUDE.md` § "Stage handoff contracts" verbatim
 {
   "stage": "submission_writer",
   "status": "ok",                       // "ok" | "failed" | "blocked"
-  "dispatch_time": "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
+  "dispatch_time":   "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
   "exit_code": 0,
   "artifacts": {
     "submission":         "submission.csv",
     "submission_summary": "reports/submission_summary.json",
     "marker":             "reports/submission_writer_was_here.txt"
   },
-  "notes": ""
+  "notes": "",
+  "modeler_run_id": "20260608T180000Z_a1b2c3d4"   // REQUIRED — copied verbatim from upstream modeler_completion.json that satisfied the precondition
 }
 ```
 
@@ -117,28 +118,42 @@ Before doing anything else:
 1. Read `reports/modeler_completion.json` from disk. If the file is missing,
    does not parse, has `status != "ok"`, or has `exit_code != 0`: write
    `reports/submission_writer_completion.json` with `status="blocked"`,
-   populate `notes` with the specific reason, return `BLOCKED`. Do NOT
-   invoke `tools/build_submission.py`. Do NOT write `submission.csv`.
+   `modeler_run_id` set to whatever value was observable in the upstream
+   record (or `null` if the file did not parse), populate `notes` with the
+   specific reason, return `BLOCKED`. Do NOT invoke
+   `tools/build_submission.py`. Do NOT write `submission.csv`.
 2. Independently verify each modeler artifact named in
    `modeler_completion.json["artifacts"]` exists and is non-empty on disk:
    `reports/model_results.json`, `reports/predictions.csv`,
    `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`. Any failure
    → same `BLOCKED` path as above.
-3. **Freshness check.** A stale `"ok"` modeler_completion.json from a prior
-   pipeline run must NOT satisfy the precondition.
-   - Preferred (strict): read `reports/pipeline_run.json` for
-     `session_start_epoch`. Require
-     `parse_iso_to_epoch(modeler_completion.json["dispatch_time"]) >= session_start_epoch`.
-   - Fallback (heuristic): if `reports/pipeline_run.json` does not exist, log
-     a `[freshness] strict check unavailable: pipeline_run.json missing` line
-     and require `modeler_completion.json` file mtime to be within
-     `now − 3 * 3600` seconds (3 h: the 2 h pipeline wall-clock budget per
-     CLAUDE.md plus 1 h slack). This is a bounded heuristic; a stale prior
-     run inside the window will pass. The strict check requires
-     orchestrator-side `pipeline_run.json` wiring (tracked under the
-     CLAUDE.md reconciliation pass).
-   - On failure of either form → `BLOCKED` with the freshness reason in
-     `notes`.
+3. **Freshness check — strict per-pass nonce match.** A stale `"ok"`
+   `modeler_completion.json` from a prior pipeline run, or from an earlier
+   pass within the current run that has since been superseded by a retune,
+   must NOT satisfy the precondition. The check has one strict form and one
+   defensive branch for the orchestrator-side failure where Step 0 did not
+   run:
+   - **Strict (the normal path).** Read
+     `reports/pipeline_run.json["current_modeler_run_id"]`. Require
+     `modeler_completion.json["modeler_run_id"] == current_modeler_run_id`.
+     If they differ, the modeler artifacts are stale or from a prior pass
+     — `BLOCKED` with `notes` recording both ids and which record was
+     consulted.
+   - **Defensive (orchestrator failure to initialize Step 0).**
+     `reports/pipeline_run.json` should always exist by the time
+     submission_writer runs — Step 0 of CLAUDE.md creates it. If it does
+     NOT exist, the orchestrator failed to run Step 0; log a
+     `[freshness] pipeline_run.json missing — Step 0 not initialized`
+     line and `BLOCKED` with that exact reason in `notes`. There is no 3 h
+     mtime heuristic anymore — the prior fallback was for the era when
+     `pipeline_run.json` was not guaranteed to exist; with Step 0 wired,
+     that era is over.
+   - The strict path is REQUIRED — never fall back to time-window
+     heuristics. If the strict check cannot run (no `current_modeler_run_id`
+     in `pipeline_run.json`, or the field is `null` indicating Step 3
+     verify never propagated the latest modeler's nonce), that is an
+     orchestrator-side bug — `BLOCKED` with the specific cause in `notes`,
+     do not improvise.
 4. `data/sample_submission.csv` must exist. Missing → `BLOCKED`.
 
 ### Step 2 — capture dispatch_time (BEFORE launch)
@@ -185,10 +200,16 @@ Verify ALL of:
 Write `reports/submission_writer_completion.json` to disk:
 
 - On full pass: `status="ok"`, `exit_code=0`, the captured tz-aware ISO
-  `dispatch_time`, artifact paths from the outputs table, `notes=""`.
+  `dispatch_time`, `modeler_run_id` copied from the upstream
+  `modeler_completion.json` that satisfied the precondition (this is the
+  same value the strict freshness check just confirmed equals
+  `pipeline_run.json["current_modeler_run_id"]`), artifact paths from the
+  outputs table, `notes=""`.
 - On any failure in steps 3-4: `status="failed"`, the real exit_code,
-  artifact paths populated for whatever exists, `notes` containing the last
-  ~50 lines of combined stdout/stderr from the run.
+  `modeler_run_id` copied from the same upstream record (the precondition
+  passed, so the value is available), artifact paths populated for whatever
+  exists, `notes` containing the last ~50 lines of combined stdout/stderr
+  from the run.
 
 Return `OK` / `BLOCKED` / `FAILED` matching the completion record. Do NOT
 return `OK` on a partial pass. Do NOT return before step 5 has written the
