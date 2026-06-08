@@ -193,9 +193,14 @@ file. Rules:
 
 1. Resolve the current `modeler_run_id` from `reports/modeler_completion.json`.
 2. Read prior `reports/critic_completion.json` if present.
-   - If prior is older than the pipeline session (use
-     `pipeline_run.json["session_start_epoch"]` if present; else heuristic 3 h
-     window): treat as stale → ignore → `cycle = 0`.
+   - If prior is older than the pipeline session — parse
+     `prior["dispatch_time"]` as a tz-aware ISO, convert to POSIX epoch
+     float, and require it to be `>= pipeline_run.json["session_start_epoch"]`.
+     If older: treat as stale → ignore → `cycle = 0`. If
+     `pipeline_run.json` does not exist, the orchestrator failed to run
+     Step 0 — refuse with `status = "blocked"` and
+     `notes = "pipeline_run.json missing — Step 0 not initialized"`; do
+     not fall back to a time-window heuristic.
    - Else if prior `status == "retune_requested"` AND prior `modeler_run_id`
      differs from the current `modeler_run_id` (the modeler just re-ran):
      `cycle = prior.cycle + 1`.
@@ -213,9 +218,11 @@ modeler-pass-1 inside a retune cycle. Format: `<UTC_compact>_<hex8>`, e.g.
 `20260608T180000Z_a1b2c3d4`. Source-of-truth:
 `reports/modeler_completion.json["modeler_run_id"]`. The critic copies it
 verbatim into `critic_completion.json["modeler_run_id"]`. Downstream stages
-(submission_writer, report_writer) use this id as the strict freshness check —
-replacing the 3 h mtime heuristic those files currently document — once their
-contracts are updated to consume it.
+(submission_writer, report_writer) use this id as their strict freshness check
+against `pipeline_run.json["current_modeler_run_id"]`; the critic uses the same
+check in Step 1 below. There is no 3 h mtime heuristic anymore — that was the
+fallback for the era when `pipeline_run.json` was not guaranteed to exist;
+with Step 0 wired by the orchestrator, that era is over.
 
 mtime is NOT a substitute. This repository lives under
 `OneDrive/Desktop/BIG_S2_B`; OneDrive sync touches change mtimes, and retune
@@ -236,14 +243,21 @@ Before doing anything else:
 2. Independently verify each modeler artifact named in
    `modeler_completion.json["artifacts"]` exists and is non-empty on disk.
    Any failure → `BLOCKED` path above.
-3. Read `current_modeler_run_id = modeler_completion.json["modeler_run_id"]`.
-   If absent → `BLOCKED` with `notes = "modeler_completion.json missing
-   modeler_run_id — orchestrator-side wiring not yet in place"`. Until
-   `reports/pipeline_run.json` is wired by the orchestrator, the modeler
-   agent's contract is to fall back to generating its own; if neither
-   produces an id, the strict freshness check cannot be performed and the
-   critic refuses.
-4. Resolve `cycle` per the rules in "Cycle counter" above. If the
+3. Read `modeler_run_id` from `modeler_completion.json`. If absent →
+   `BLOCKED` with `notes = "modeler_completion.json missing modeler_run_id"`.
+   The modeler's contract (modeler.md) requires the field; absence is an
+   upstream contract violation.
+4. **Strict freshness check.** Read
+   `reports/pipeline_run.json["current_modeler_run_id"]`. Require
+   `modeler_completion.json["modeler_run_id"] == current_modeler_run_id`.
+   If they differ, the modeler artifacts are stale or from a prior pass
+   (e.g. pass-1 left in place after a retune that should have superseded
+   them) → `BLOCKED` with `notes` recording both ids and which record was
+   consulted. If `pipeline_run.json` does not exist, the orchestrator
+   failed to run Step 0 → `BLOCKED` with
+   `notes = "pipeline_run.json missing — Step 0 not initialized"`. There
+   is no 3 h mtime fallback; the strict path is the only path.
+5. Resolve `cycle` per the rules in "Cycle counter" above. If the
    double-invocation case fires (prior `status == "retune_requested"` and
    matching `modeler_run_id`): `BLOCKED` with `notes = "double-invocation
    on same modeler_run_id"`.
@@ -265,9 +279,11 @@ any non-UTC machine.
 Compute two booleans:
 - `cycle_cap_will_block = (resolved cycle >= 1)`.
 - `budget_will_block = (remaining_pipeline_budget_seconds < 25 * 60)`, where
-  remaining is `(pipeline_run.session_start_epoch + 2*3600) − now` if the
-  strict source is present, else a logged heuristic (use
-  `now - dispatch_epoch + 90 * 60` as a conservative upper-bound surrogate).
+  remaining is computed strictly from `pipeline_run.json`:
+  `(session_start_epoch + total_budget_seconds) − now`. The total_budget_seconds
+  field is set at Step 0 (default 7200 = 2 h, per CLAUDE.md hard constraints).
+  `pipeline_run.json` is guaranteed to exist by this point — Step 1 already
+  BLOCKED if it didn't. There is no time-window heuristic fallback.
 
 These are recorded — they do NOT short-circuit running the tool. The tool
 still runs (the analytic output goes into the report) but in Step 6 either
@@ -379,24 +395,9 @@ These are tracked separately and not addressed in this agent file:
 
 - **(Optional, future) 2-retune mode.** Only reachable when BOTH
   `tools/run_critic.py` is upgraded (sentinel → persisted cycle counter) AND
-  the orchestrator-level cap/enforcement lands in `reports/pipeline_run.json`
-  (see "Loop bound → Future option" above). The current contract is MAX 1
+  the orchestrator-level cap value is raised in `reports/pipeline_run.json`
+  (`retune_cap`) together with the Step 3.6 narrative in CLAUDE.md (see
+  "Loop bound → Future option" above). The current contract is MAX 1
   retune by design, matching the tool. Do NOT raise the cap in this file
   alone — it will desynchronise the doc from what the tool actually
   enforces.
-- **CLAUDE.md Step 3.6 reconciliation.** Add an independent artifact gate
-  for `critic_completion.json`; document the loop-vs-proceed branch on
-  `status == "retune_requested"` (orchestrator side); document the bound
-  cap and budget guard at the orchestrator level; add the critic-specific
-  extension fields (`cycle`, `modeler_run_id`, `retune_reason`) to the
-  "Stage handoff contracts" base schema as documented divergences.
-- **Orchestrator wiring of `reports/pipeline_run.json`.** Generate
-  `session_start_epoch` and `current_modeler_run_id` at pipeline start;
-  update `current_modeler_run_id` on every modeler dispatch (including
-  retune passes); maintain `critic_cycle` as a cross-stage mirror.
-- **`modeler.md`, `validator.md`, `submission_writer.md`, `report_writer.md`
-  one-line updates.** Each stage's completion record must carry
-  `modeler_run_id` through (copied from the upstream record it consumes).
-  Submission_writer and report_writer should additionally adopt
-  `modeler_run_id` match as the strict freshness check, replacing the 3 h
-  mtime heuristic each currently documents.
