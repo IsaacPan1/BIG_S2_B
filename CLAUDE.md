@@ -336,10 +336,9 @@ record:** read `modeler_completion.json["modeler_run_id"]` and write it into
 `reports/pipeline_run.json["current_modeler_run_id"]`. This is the orchestrator's
 job; it applies to BOTH the initial Step 3 dispatch and any Step 3.6 retune
 re-dispatch — the field always tracks the latest modeler pass. After this
-update, downstream stages can use the strict `modeler_run_id`-match freshness
-check instead of the 3 h mtime heuristic their agent files currently document
-(once those agents are updated to consume it — see "Remaining contract work"
-at the bottom).
+update, the downstream validator / submission_writer / report_writer
+freshness checks fire against `current_modeler_run_id` (their agent
+contracts now consume the field).
 
 ```python
 import json
@@ -361,164 +360,299 @@ to `submission_writer`. Do NOT dispatch the validator on partial state.
 ### Step 3.5 — validator
 
 Invoke the validator sub-agent via the Task tool after modeler completes.
-Wait for it to write `reports/validator_review.json` AND
-`reports/validator_was_here.txt`. Do not proceed until the marker file exists.
 Do NOT perform validation inline — always delegate to the validator sub-agent.
 The validator is **diagnostic only** — it does NOT modify predictions and does NOT
 block submission regardless of verdict. This stage typically takes 3–8 minutes;
 see the Sub-agent completion contract above — do NOT re-invoke if the marker
 has not yet appeared.
 
+**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** — same
+convention as Step 3: Python `datetime.datetime.now(datetime.timezone.utc)` →
+ISO + epoch-float pair; record both. NEVER reparse a naive ISO string with
+`datetime.fromisoformat(...).timestamp()` later.
+
 ```
 Use the validator sub-agent to audit the modeler's CV integrity.
 ```
 
-- Reads: `reports/profile.json`, `reports/model_results.json`, `reports/features.json`,
+- Reads: `reports/modeler_completion.json` (precondition: `status == "ok"`),
+         `reports/pipeline_run.json` (freshness),
+         `reports/profile.json`, `reports/model_results.json`, `reports/features.json`,
          `data/features_train.parquet`, `reports/oof_predictions.csv` (if present),
          `reports/schema_analysis.md` (optional)
-- Writes: `reports/validator_review.json`, `reports/validator_was_here.txt`
+- Writes: `reports/validator_review.json`, `reports/validator_was_here.txt`,
+          `reports/validator_completion.json`
 - Budget: **10 minutes**
 
-Verify after completion:
-- Before verifying, confirm the sub-agent process has exited. If the marker is absent
-  but the process is still alive, continue waiting — this is NOT a failure state.
-- `reports/validator_was_here.txt` exists (proves sub-agent ran, not inline work)
-- `reports/validator_review.json` exists and has all required keys:
-  `verdict`, `reported_cv_mae`, `strict_cv_mae`, `honest_cv_mae`,
-  `cv_gap_abs`, `cv_gap_pct`, `strict_cv_scheme`, `feature_suspicion`,
-  `checks`, `notes`
-- `verdict` ∈ {PASS, WARNING, CRITICAL}
+Verify after completion — this is an **INDEPENDENT artifact gate**; do NOT
+trust the sub-agent's verbal "done" report. Re-run every check from this side:
 
-If the process has exited AND `reports/validator_was_here.txt` is still absent (genuine
-failure): write a minimal `reports/validator_review.json` with `verdict="WARNING"` and
-`notes` explaining the failure. Always continue to `submission_writer` — a missing
-validator review never blocks submission.
+1. The sub-agent process has exited. If the marker is absent but the process
+   is still alive, continue waiting — this is NOT a failure state.
+2. `reports/validator_completion.json` exists, parses as JSON, has
+   `status ∈ {"ok", "failed", "blocked"}` and an integer `exit_code` field.
+3. `reports/validator_was_here.txt` exists AND its mtime is strictly newer
+   than `dispatch_time` (epoch-float comparison; rejects leftover markers
+   from prior runs).
+4. `reports/validator_review.json` exists, size > 0, parses as JSON, and has
+   a top-level `verdict ∈ {"PASS", "WARNING", "CRITICAL"}` (HARD). Other
+   analytic keys (`reported_cv_mae`, `strict_cv_mae`, `fold_maes`,
+   `gap_attribution`, etc.) are SOFT — log if missing, do NOT fail the gate
+   on them.
+5. **Freshness:** `validator_completion.json["modeler_run_id"] ==
+   pipeline_run.json["current_modeler_run_id"]`. Mismatch → gate fails
+   (the validator ran against a pre-retune modeler pass).
+
+Status branch (on full gate pass):
+- `status == "ok"` → dispatch Step 3.6 (critic).
+- `status == "failed"` / `"blocked"` → record the situation; continue to
+  Step 3.6. The validator is diagnostic and never blocks submission; a
+  failed/blocked validator is not a pipeline-blocking outcome — the report
+  surfaces it.
+
+**Distinguish two failure modes that must NOT be conflated:**
+- **Gate fail** (record missing/stale/unparseable, marker absent or stale,
+  freshness mismatch) is an orchestrator-detected breakage. Synthesize a
+  minimal `reports/validator_completion.json` with `status="failed"` AND a
+  minimal `reports/validator_review.json` with `verdict="WARNING"` +
+  `notes` naming the orchestrator-detected breakage. Continue to Step 3.6.
+- **Verdict fail** (the validator ran cleanly and returned
+  `verdict ∈ {"WARNING", "CRITICAL"}`) is NOT a gate fail — it is the
+  validator doing its job. Pass through unchanged; the verdict surfaces in
+  the report; nothing else changes.
 
 ### Step 3.6 — Critic Review
 
-Invoke the critic sub-agent via the Task tool. Wait for
-reports/critic_was_here.txt and reports/critic_review.json. This stage typically
-takes 2–5 minutes; see the Sub-agent completion contract above — do NOT re-invoke
-if the marker has not yet appeared.
+Invoke the critic sub-agent via the Task tool. This stage typically takes
+2–5 minutes; see the Sub-agent completion contract above — do NOT re-invoke
+if the marker has not yet appeared. Do NOT generate critic review inline;
+always delegate to the critic sub-agent.
+
+**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
+same convention as Step 3.
 
 ```
 Use the critic sub-agent to review the validator output and modeler predictions.
 ```
 
-- Reads: `reports/validator_review.json`, `reports/model_results.json`,
+- Reads: `reports/modeler_completion.json` (precondition: `status == "ok"`),
+         `reports/pipeline_run.json` (freshness + cycle counter),
+         `reports/validator_review.json`, `reports/model_results.json`,
          `reports/predictions.csv`, `reports/features.json`,
          `reports/profile.json`, `data/features_train.parquet`
 - Writes: `reports/critic_review.json`, `reports/critic_was_here.txt`,
-          optionally `reports/critic_retune_requested.json` and
+          `reports/critic_completion.json` (extended status set incl.
+          `"retune_requested"`; carries `modeler_run_id`, `cycle`,
+          `retune_reason`), optionally
+          `reports/critic_retune_requested.json` and
           `reports/critic_retune_attempted.txt`
 - Budget: **5 minutes**
 
-NOTE: the retune cycle below is an INTENTIONAL, gated re-invocation of the modeler —
-distinct from the accidental double-invocation that the Sub-agent completion contract
-prohibits. The trigger is now the critic's structured completion status, with the
-cycle cap and budget guard enforced by `reports/pipeline_run.json` at the
-orchestrator — not by file-existence heuristics.
+Verify after completion — this is an **INDEPENDENT artifact gate**; do NOT
+trust the sub-agent's verbal "done" report. Re-run every check from this
+side. The gate runs FIRST; the retune-vs-proceed decision below consumes
+its outcome.
 
-**Retune-vs-proceed decision (orchestrator-side):**
+1. The sub-agent process has exited. If the marker is absent but the process
+   is still alive, continue waiting — this is NOT a failure state.
+2. `reports/critic_completion.json` exists, parses as JSON, has
+   `status ∈ {"ok", "failed", "blocked", "retune_requested"}` (extended set
+   per `critic.md`) and an integer `exit_code` field.
+3. `reports/critic_was_here.txt` exists AND its mtime is strictly newer than
+   `dispatch_time` (epoch-float comparison).
+4. `reports/critic_review.json` exists, size > 0, parses as JSON, and has a
+   top-level `status` field (the script's vocabulary,
+   `{"accepted", "retune_requested"}` — distinct from the completion
+   record's extended set). Other analytic keys (`checks`,
+   `gap_attribution_used`, `family_ablation`, `cycle`, `decision_rationale`)
+   are SOFT — log if missing, do NOT fail the gate.
+5. **Freshness:** `critic_completion.json["modeler_run_id"] ==
+   pipeline_run.json["current_modeler_run_id"]`. Mismatch → gate fails (the
+   critic ran against a pre-retune modeler pass).
+6. If `critic_completion.json["status"] == "retune_requested"`:
+   `reports/critic_retune_requested.json` also exists and parses (the
+   conditional retune-signal artifact named in the critic's outputs).
+   Absence → gate fails.
 
-1. Read `reports/critic_completion.json`. If its `status != "retune_requested"`
-   (i.e. it is `"ok"`, `"failed"`, or `"blocked"`), proceed to Step 4. No
-   retune.
-2. If `status == "retune_requested"`:
-   - Read `reports/pipeline_run.json`. Compute
-     `remaining_budget = session_start_epoch + total_budget_seconds − now()`.
-   - **Cycle cap check.** If `critic_cycle >= retune_cap` (cap = 1, matching
-     `critic.md`): force-proceed to Step 4. Log the cap-hit; do NOT dispatch
-     the retune. The critic should already have force-accepted at this cycle
-     by its own rules, so this branch is a defense-in-depth.
-   - **Budget guard.** If `remaining_budget < 25 * 60` seconds (a typical
-     retune cycle: modeler + validator + critic + slack): force-proceed to
-     Step 4. Log the budget-exhaustion reason; do NOT dispatch the retune.
-   - **Both checks pass — dispatch the retune.** In this order, atomically:
-     1. Increment `pipeline_run.json["critic_cycle"]` (write to disk BEFORE
-        re-dispatching — a partial run that crashes mid-retune must not
-        leave `critic_cycle` unincremented and re-attempt the loop on a
-        future invocation).
-     2. Re-invoke modeler (it reads `reports/critic_retune_requested.json`
-        and applies the suggested change). After the modeler verify gate
-        passes, the orchestrator updates
-        `pipeline_run.json["current_modeler_run_id"]` per Step 3's final
-        bullet — same as the initial pass.
-     3. Re-invoke validator (audits the new modeler output).
-     4. Re-invoke critic. At this cycle the critic's `cycle_cap_will_block`
-        (per `critic.md` Step 3) fires; the critic force-accepts; the
-        retune branch terminates.
-3. After at most one cap-bounded retune cycle, proceed to Step 4. The
-   pipeline always reaches submission_writer regardless of which branch
-   fires.
+**Gate-fail action** (record missing/stale/unparseable, marker absent or
+stale, freshness mismatch, retune-signal absent when status claims it):
+synthesize a minimal `reports/critic_completion.json` with `status="failed"`
+AND a minimal `reports/critic_review.json` with `status="accepted"` +
+`notes` describing the orchestrator-detected breakage. Continue to Step 4
+per "never blocks submission". **NEVER trigger the retune loop on a
+gate-fail.**
+
+**Status branch** (on full gate pass) — REPLACES the previous
+"Retune-vs-proceed decision" placement; the gate runs FIRST, the branch
+consumes its outcome:
+
+**`status == "ok"`** → proceed to Step 4.
+
+**`status == "retune_requested"`** — INTENTIONAL, gated re-invocation of
+the modeler, distinct from the accidental double-invocation that the
+Sub-agent completion contract prohibits. The trigger is the critic's
+structured completion status; the cycle cap and budget guard are enforced
+by `reports/pipeline_run.json` at the orchestrator, not by file-existence
+heuristics:
+
+   1. Read `reports/pipeline_run.json`. Compute
+      `remaining_budget = session_start_epoch + total_budget_seconds − now()`.
+   2. **Cycle cap check.** If `critic_cycle >= retune_cap` (cap = 1, matching
+      `critic.md`): force-proceed to Step 4. Log the cap-hit; do NOT dispatch
+      the retune. The critic should already have force-accepted at this cycle
+      by its own rules, so this branch is a defense-in-depth.
+   3. **Budget guard.** If `remaining_budget < 25 * 60` seconds (a typical
+      retune cycle: modeler + validator + critic + slack): force-proceed to
+      Step 4. Log the budget-exhaustion reason; do NOT dispatch the retune.
+   4. **Both checks pass — dispatch the retune.** In this order, atomically:
+      1. Increment `pipeline_run.json["critic_cycle"]` (write to disk BEFORE
+         re-dispatching — a partial run that crashes mid-retune must not
+         leave `critic_cycle` unincremented and re-attempt the loop on a
+         future invocation).
+      2. Re-invoke modeler (it reads `reports/critic_retune_requested.json`
+         and applies the suggested change). After the modeler verify gate
+         passes, the orchestrator updates
+         `pipeline_run.json["current_modeler_run_id"]` per Step 3's final
+         bullet — same as the initial pass.
+      3. Re-invoke validator (audits the new modeler output).
+      4. Re-invoke critic. At this cycle the critic's `cycle_cap_will_block`
+         (per `critic.md` Step 3) fires; the critic force-accepts; the
+         retune branch terminates.
 
 The cap value lives in `pipeline_run.json["retune_cap"]` (default `1`,
 matching `critic.md`). Raising the cap requires the coordinated changes
 spelled out in `critic.md` § "Future option: raising the cap to 2 retunes" —
 do NOT raise it here unilaterally.
 
-Do NOT generate critic review inline; always delegate to the critic
-sub-agent.
+**`status == "failed"` / `"blocked"`** → continue to Step 4 per "never
+blocks submission". Do NOT enter the retune loop. The critic ran but
+either could not produce a clean verdict (`"failed"`) or could not start
+because its precondition failed (`"blocked"`). The agent already wrote an
+honest `critic_completion.json` — no synthesis needed. If `critic_review.
+json` is absent, synthesize a minimal one with `status="accepted"` so the
+report_writer can call it out without crashing on a missing file.
 
-Verify after completion:
-- Before verifying, confirm the sub-agent process has exited. If the marker is absent
-  but the process is still alive, continue waiting — this is NOT a failure state.
-- `reports/critic_was_here.txt` exists (proves the sub-agent ran, not inline work)
-- `reports/critic_review.json` exists with a `status` field
-
-If the process has exited AND `reports/critic_was_here.txt` is still absent (genuine
-failure): write a minimal `reports/critic_review.json` with `status="accepted"` and a
-warning note. Always continue to `submission_writer` — a missing critic review never
-blocks submission.
+After at most one cap-bounded retune cycle, proceed to Step 4. The pipeline
+always reaches submission_writer regardless of which branch fires.
 
 ### Step 4 — submission_writer
 
-Invoke the submission_writer sub-agent via the Task tool. Wait for it to write
-`submission.csv` AND `reports/submission_writer_was_here.txt`. Do not proceed until
-the marker file exists. Do NOT write submission.csv inline — always delegate to the
-submission_writer sub-agent.
+Invoke the submission_writer sub-agent via the Task tool. Do NOT write
+`submission.csv` inline — always delegate to the submission_writer sub-agent.
+
+**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
+same convention as Step 3.
 
 ```
 Use the submission_writer sub-agent to validate and write submission.csv.
 ```
 
-- Reads: `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv`
+- Reads: `reports/modeler_completion.json` (precondition: `status == "ok"`),
+         `reports/pipeline_run.json` (freshness),
+         `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`,
+         `data/sample_submission.csv`
 - Writes: `submission.csv` at the repo root, `reports/submission_summary.json`,
-          `reports/submission_writer_was_here.txt`
+          `reports/submission_writer_was_here.txt`,
+          `reports/submission_writer_completion.json`
 - Budget: **10 minutes**
 
-Verify after completion:
-- `reports/submission_writer_was_here.txt` exists (proves the sub-agent ran, not inline work)
-- `submission.csv` exists at the repo root
-- Its schema matches `data/sample_submission.csv` (same columns, same row count)
+Verify after completion — this is an **INDEPENDENT artifact gate**.
+`submission.csv` is the scored deliverable; the gate MUST validate the
+file itself, not just the completion record. Re-run every check from this
+side:
 
-If this step fails: copy `reports/predictions.csv` to `submission.csv` with a warning
-logged to stdout.
+1. The sub-agent process has exited. If the marker is absent but the process
+   is still alive, continue waiting.
+2. `reports/submission_writer_completion.json` exists, parses as JSON, has
+   `status ∈ {"ok", "failed", "blocked"}` and an integer `exit_code` field.
+3. `reports/submission_writer_was_here.txt` exists AND its mtime is strictly
+   newer than `dispatch_time` (epoch-float comparison).
+4. `reports/submission_summary.json` exists, parses as JSON, and contains
+   `round_trip_audit.status == "PASS"` (HARD — the audit is the script's
+   own integrity check). Other analytic keys (`prediction_stats`,
+   `join_key_used`, `target_column`, etc.) are SOFT — log if missing, do
+   NOT fail the gate.
+5. **Scored-deliverable check on `submission.csv` itself — do NOT trust the
+   completion record alone:**
+   - File at the repo root exists, parses as CSV.
+   - Column names AND order exactly equal those of
+     `data/sample_submission.csv`.
+   - Row count equals `len(data/sample_submission.csv)`.
+   - The target column (the non-id column of `sample_submission.csv`) has
+     no NaN values.
+6. **Freshness:** `submission_writer_completion.json["modeler_run_id"] ==
+   pipeline_run.json["current_modeler_run_id"]`. Mismatch → gate fails.
+
+Only on full pass: dispatch Step 5.
+
+**Gate-fail action — build a fallback `submission.csv` with the CORRECT
+schema.** The prior fallback ("copy `reports/predictions.csv` to
+`submission.csv`") produced a file whose columns did NOT match
+`sample_submission.csv` — the evaluator would reject the schema. The new
+fallback always produces a schema-correct file; values may be wrong, but
+the submission is well-formed:
+
+1. Start from `data/sample_submission.csv`'s row layout so columns and row
+   IDs match the evaluator's expectations.
+2. Fill the target column. Preferred source: a composite-key join of
+   `reports/predictions.csv` onto `sample_submission.csv` (composite
+   business key from `profile.json`'s `group_cols + time_col` — same join
+   key `tools/build_submission.py` uses; do NOT join on `row_id`). If the
+   join cannot be performed (predictions absent, key columns missing, no
+   matches), fill the target column with the training-target mean from
+   whichever file the profile points to as the train target source.
+3. Log the failure reason and the chosen fill source. Continue to Step 5.
 
 ### Step 5 — report_writer
 
-Invoke the report_writer sub-agent via the Task tool. Wait for it to write
-`report.pdf` AND `reports/report_writer_was_here.txt`. Do not proceed until
-the marker file exists. Do NOT generate report.pdf inline — always delegate to
-the report_writer sub-agent. Verify the marker file exists; if missing, the
-sub-agent was not invoked.
+Invoke the report_writer sub-agent via the Task tool. Do NOT generate
+`report.pdf` inline — always delegate to the report_writer sub-agent.
+
+**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
+same convention as Step 3.
 
 ```
 Use the report_writer sub-agent to produce report.pdf.
 ```
 
-- Reads: all files in `reports/`, `data/DATA_DESCRIPTION.md`
+- Reads: `reports/modeler_completion.json`,
+         `reports/validator_completion.json`,
+         `reports/submission_writer_completion.json` (union of upstream
+         completion records — all must satisfy
+         `status == "ok"` per `report_writer.md` § Step 1),
+         `reports/pipeline_run.json` (freshness),
+         `reports/` (all analytic files), `data/DATA_DESCRIPTION.md`
 - Writes: `report.pdf` at the repo root, `reports/report_writer_was_here.txt`,
-          optionally `reports/feature_importance.png`, `reports/prediction_histogram.png`
+          `reports/report_writer_completion.json`,
+          optionally `reports/feature_importance.png`,
+          `reports/prediction_histogram.png`
 - Budget: **20 minutes**
 
-Verify after completion:
-- `reports/report_writer_was_here.txt` exists (proves the sub-agent ran, not inline work)
-- `report.pdf` exists at the repo root and is non-zero bytes
+Verify after completion — this is an **INDEPENDENT artifact gate**. Re-run
+every check from this side:
 
-If this step fails: write a minimal one-page `report.pdf` using Python + reportlab
-directly (do not invoke another agent) with: dataset name, problem type, model used,
-final metric from `reports/model_results.json`.
+1. The sub-agent process has exited. If the marker is absent but the process
+   is still alive, continue waiting.
+2. `reports/report_writer_completion.json` exists, parses as JSON, has
+   `status ∈ {"ok", "failed", "blocked"}` and an integer `exit_code` field.
+3. `reports/report_writer_was_here.txt` exists AND its mtime is strictly
+   newer than `dispatch_time` (epoch-float comparison).
+4. `report.pdf` at the repo root exists and size > 0. **`report.txt`-only is
+   treated as a gate FAIL** — `report.txt` is the script's degraded fallback
+   when `reportlab` is unavailable; the contract requires PDF, matching
+   `report_writer.md`'s own post-exit gate.
+5. **Freshness:** `report_writer_completion.json["modeler_run_id"] ==
+   pipeline_run.json["current_modeler_run_id"]`. Mismatch → gate fails.
+
+Only on full pass: pipeline complete.
+
+**Gate-fail action.** Write a minimal one-page `report.pdf` using Python +
+reportlab directly (do not invoke another agent) with: dataset name,
+problem type, model used, final metric from `reports/model_results.json`.
+If `reportlab` is unavailable in the orchestrator's environment, write a
+minimal `report.txt` and log that PDF generation is impossible — `report.txt`
+is not contract-compliant but is the only fallback when `reportlab` is
+genuinely missing system-wide.
 
 ---
 
@@ -569,10 +703,10 @@ fallback variants immediately.
 | `schema_analyst` | `data/`, `data/DATA_DESCRIPTION.md` | `reports/profile.json`, `reports/schema_analysis.md`, `reports/schema_analyst_was_here.txt` |
 | `feature_engineer` | `reports/schema_analysis.md`, `reports/profile.json`, `data/` | `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` |
 | `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt`, `reports/modeler_completion.json` (status / dispatch_time / exit_code / artifact paths — see Stage handoff contracts) |
-| `validator` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json` (includes `fold_maes`, `fold_train_sizes`, `gap_attribution` block), `reports/validator_was_here.txt` |
-| `critic` | `reports/validator_review.json` (reads `gap_attribution`), `reports/model_results.json`, `reports/predictions.csv`, `reports/features.json`, `reports/profile.json`, `data/features_train.parquet` | `reports/critic_review.json` (includes `gap_attribution_used`, `family_ablation`), `reports/critic_was_here.txt`, `reports/family_ablation.json` (via ablation tool), optionally `reports/critic_retune_requested.json` (may include `net_harmful_families`) and `reports/critic_retune_attempted.txt` |
-| `submission_writer` | `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv` | `submission.csv` (repo root), `reports/submission_summary.json`, `reports/submission_writer_was_here.txt` — renames `predicted_target` → actual target column name from `DATA_DESCRIPTION.md` |
-| `report_writer` | `reports/` (all files), `data/DATA_DESCRIPTION.md` | `report.pdf` (repo root), `reports/report_writer_was_here.txt`, optional `.png` charts |
+| `validator` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json` (includes `fold_maes`, `fold_train_sizes`, `gap_attribution` block), `reports/validator_was_here.txt`, `reports/validator_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts) |
+| `critic` | `reports/modeler_completion.json` (precondition + freshness source), `reports/pipeline_run.json` (cycle counter + freshness target), `reports/validator_review.json` (reads `gap_attribution`), `reports/model_results.json`, `reports/predictions.csv`, `reports/features.json`, `reports/profile.json`, `data/features_train.parquet` | `reports/critic_review.json` (includes `gap_attribution_used`, `family_ablation`), `reports/critic_was_here.txt`, `reports/critic_completion.json` (EXTENDED status ∈ {ok, failed, blocked, retune_requested} / dispatch_time / exit_code / artifact paths / modeler_run_id / cycle / retune_reason — see Stage handoff contracts and critic.md), `reports/family_ablation.json` (via ablation tool), optionally `reports/critic_retune_requested.json` (may include `net_harmful_families`) and `reports/critic_retune_attempted.txt` |
+| `submission_writer` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv` | `submission.csv` (repo root), `reports/submission_summary.json`, `reports/submission_writer_was_here.txt`, `reports/submission_writer_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts) — renames `predicted_target` → actual target column name from `DATA_DESCRIPTION.md` |
+| `report_writer` | `reports/modeler_completion.json`, `reports/validator_completion.json`, `reports/submission_writer_completion.json` (union of upstream completion records; all must satisfy `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/` (all files), `data/DATA_DESCRIPTION.md` | `report.pdf` (repo root), `reports/report_writer_was_here.txt`, `reports/report_writer_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts), optional `.png` charts |
 
 All inter-agent communication happens through files. Agents do not call each other
 directly. The orchestrator (this CLAUDE.md) is responsible for sequencing and
@@ -688,41 +822,20 @@ transparency, beyond the minimum competition requirements.
 
 ## Remaining contract work
 
-This pass wired `reports/pipeline_run.json` and the Step 3.6 retune branch.
-Two follow-up passes are required before every freshness check switches
-from heuristic-fallback to strict-enforcement and before the Step 3.5 / 3.6
-/ 4 / 5 verify blocks match the per-stage completion-record contracts.
+The orchestrator-side gates, the `pipeline_run.json` run-state record, and
+the `modeler_run_id` propagation chain through every completion record are
+all now in place end-to-end. The strict freshness check fires throughout.
+Two small known drifts remain in agent files, plus one documented future
+option that needs coordinated tool + orchestrator changes.
 
-### Next pass — `modeler_run_id` propagation through four agent files
+### Known drift cleanups (agent files; not orchestrator-side)
 
-The strict freshness check (`upstream.modeler_run_id ==
-pipeline_run.current_modeler_run_id`) cannot fire until every upstream
-completion record carries `modeler_run_id`. Each agent file below needs a
-small targeted edit:
+| File | Drift | Action |
+|---|---|---|
+| `.claude/agents/modeler.md` | In-flow Step 4 (the agent's own completion-contract step list) still says "predictions.csv row count == n_val_rows from profile.json". The Step 3 gate in this file already uses the correct `len(features_val.parquet)` reference (per the row-count fix earlier in this branch). Two source-of-truth drift. | Update modeler.md's in-flow Step 4 to match: row count == `len(data/features_val.parquet)`, not `profile.json.n_val_rows`. |
+| `.claude/agents/critic.md` | Critic's own precondition gate still documents a 3 h mtime heuristic fallback (the era when `pipeline_run.json` wasn't guaranteed). With Step 0 wired and the modeler propagating `modeler_run_id`, the strict nonce-match check is always available — same fix that landed in submission_writer.md and report_writer.md. | Switch critic.md's freshness check to strict `modeler_run_id` match against `pipeline_run.json["current_modeler_run_id"]`; replace the 3 h heuristic with the same "Step 0 didn't run" defensive branch the writers now use. |
 
-| File | Edit |
-|---|---|
-| `.claude/agents/modeler.md` | Add `modeler_run_id` to the modeler_completion.json schema as a REQUIRED field; specify generation as a `<UTC_compact>_<hex8>` nonce fresh per dispatch, written into modeler_completion.json by the agent before returning OK. Today the field is only implied (critic.md assumes it); modeler.md does not yet mandate writing it. |
-| `.claude/agents/validator.md` | One-line: copy `modeler_run_id` from `modeler_completion.json` into `validator_completion.json`. |
-| `.claude/agents/submission_writer.md` | (a) Copy `modeler_run_id` through into `submission_writer_completion.json`. (b) Switch the strict freshness check from `session_start_epoch >= dispatch_time` to `modeler_completion.json["modeler_run_id"] == pipeline_run.json["current_modeler_run_id"]`. The 3 h mtime heuristic stays as defensive fallback for the (now-impossible-in-normal-runs) case where `pipeline_run.json` is absent. |
-| `.claude/agents/report_writer.md` | Same as submission_writer, applied to every upstream completion record (modeler / validator / submission_writer). |
-
-### Next pass — Step 3.5 / 3.6 / 4 / 5 verify-block reconciliation
-
-The orchestrator-side verify blocks below were written before the
-completion-record contract existed. Each one currently gates on `*_was_here.txt`
-+ analytic-fields-in-review-JSON only; none of them gate on the
-corresponding `*_completion.json`. Update each to mirror the per-stage
-completion contract:
-
-| Step | What to add to the verify block |
-|---|---|
-| 3.5 (validator) | Gate on `reports/validator_completion.json` exists, parses, `status == "ok"`, `exit_code == 0`. Update "Writes" list to include `validator_completion.json`. |
-| 3.6 (critic) | Gate on `reports/critic_completion.json` exists, parses, `status ∈ {"ok", "failed", "blocked", "retune_requested"}`. The retune branch already documented above triggers on `status == "retune_requested"`; `"failed"` and `"blocked"` fall through to Step 4 per the existing no-block-on-critic-failure rule; only `"ok"` is a clean accept. Update "Writes" list to include `critic_completion.json`. |
-| 4 (submission_writer) | Gate on `reports/submission_writer_completion.json` exists, parses, `status == "ok"`. The scored-deliverable post-exit gate already lives in submission_writer.md and does not need to be duplicated at the orchestrator level. Update "Writes" list to include `submission_writer_completion.json`. |
-| 5 (report_writer) | Gate on `reports/report_writer_completion.json` exists, parses, `status == "ok"`. Update "Writes" list. |
-
-### Future (gated on tool + orchestrator both changing) — raise the retune cap to 2
+### Future option (NOT a known drift) — raise the retune cap to 2
 
 Tracked under `.claude/agents/critic.md` § "Future option: raising the cap
 to 2 retunes". Requires `tools/run_critic.py` sentinel → persisted-counter
