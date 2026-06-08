@@ -51,3 +51,7 @@ tools/run_modeler_v3.py
 _sweep_runner.py
 _sweep_results.json
 _data_backup_sweep/
+transform_bias_diagnositic.py
+recent_vs_full_adv.py
+recent_vs_full_dist.py
+scored_mae
