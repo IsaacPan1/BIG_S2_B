@@ -197,9 +197,20 @@ Use the modeler sub-agent to train models and generate predictions.
           `reports/modeler_completion.json`
 - Budget: **60 minutes**
 
-**Capture `dispatch_time` (UTC ISO8601) before invoking the sub-agent.** The
-sub-agent records this same value in `reports/modeler_completion.json`; the
-orchestrator uses it to detect stale markers.
+**Capture `dispatch_time` BEFORE invoking the sub-agent**, as a timezone-aware
+UTC value. Two equivalent options:
+
+- Python: `datetime.datetime.now(datetime.timezone.utc)` — store as both the
+  ISO8601 string (with `+00:00` offset) and the POSIX epoch float
+  (`.timestamp()`); record the string in the completion file, use the epoch
+  float for the mtime comparison.
+- Shell: `date -u +%s` for the epoch float plus `date -u --iso-8601=seconds`
+  for the string.
+
+NEVER reparse a naive ISO string with `datetime.fromisoformat(...).timestamp()`
+later — that interprets the string as local time and breaks the comparison on
+any machine outside UTC. Always carry the epoch float forward, or always carry
+a tz-aware ISO string that round-trips.
 
 Verify after completion — this is an **INDEPENDENT artifact gate**; do NOT trust
 the sub-agent's verbal "done" report. Re-run every check from this side:
@@ -208,13 +219,19 @@ the sub-agent's verbal "done" report. Re-run every check from this side:
    is still alive, continue waiting — this is NOT a failure state.
 2. `reports/modeler_completion.json` exists, parses as JSON, and has
    `status == "ok"` and `exit_code == 0`.
-3. `reports/modeler_was_here.txt` exists AND its mtime is newer than
-   `dispatch_time` (rejects leftover markers from prior runs).
+3. `reports/modeler_was_here.txt` exists AND its mtime is strictly newer than
+   `dispatch_time` (compare in epoch-float seconds; rejects leftover markers
+   from prior runs).
 4. `reports/model_results.json` exists, size > 0, parses as JSON.
-5. `reports/predictions.csv` exists, size > 0, row count matches
-   `n_val_rows` from `reports/profile.json`, the prediction column matches
+5. `reports/predictions.csv` exists, size > 0, the prediction column matches
    `target_col` (or is `predicted_target` for submission_writer to rename),
-   no NaN predictions.
+   no NaN predictions, **and `len(predictions.csv) == len(features_val.parquet)`
+   exactly**. The validation-feature parquet is the authoritative row-count
+   reference because feature_engineer may expand the raw validation rows
+   (e.g. cross-joining missing category levels) — `profile.json.n_val_rows`
+   is the RAW row count and will NOT match. Do not use
+   `model_results.json.n_val_rows` either: that is producer self-reporting
+   and gives circular agreement.
 6. `reports/oof_predictions.csv` exists, size > 0.
 
 Only on full pass: dispatch the validator (Step 3.5).
