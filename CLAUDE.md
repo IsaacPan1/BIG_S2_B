@@ -111,6 +111,71 @@ from a prior pipeline run. The orchestrator's gate must verify `marker.mtime >
 dispatch_time`. Sub-agents that write a completion record must capture
 `dispatch_time` BEFORE launching the backing script.
 
+#### Pipeline run state — `reports/pipeline_run.json`
+
+The above completion records are **write-once** — each sub-agent writes its own
+record at the end of its work. `reports/pipeline_run.json` is the one
+**mutated-mid-run** state file: the orchestrator's run-state record. It
+turns the freshness checks, budget guard, and cycle bound from heuristic
+fallbacks (documented per-stage) into real enforcement.
+
+**Schema** (no other fields; this file is strictly the cross-stage state the
+orchestrator needs):
+
+```json
+{
+  "session_start_iso":      "2026-06-08T21:01:12.540453+00:00",  // tz-aware UTC; convenience copy
+  "session_start_epoch":    1780952472.540453,                   // POSIX epoch float, UTC — primary reference
+  "total_budget_seconds":   7200,                                // 2 h, per the Hard constraints table
+  "current_modeler_run_id": null,                                // null at start; set after each modeler verify pass
+  "critic_cycle":           0,                                   // 0 at start; incremented before each retune dispatch
+  "retune_cap":             1                                    // matches critic.md contract; orchestrator-enforced
+}
+```
+
+**Ownership.** `pipeline_run.json` is **orchestrator-owned**. Sub-agents
+**READ** it; only the orchestrator **WRITES** it. There are no concurrent
+writers. Last-write-wins applies — but in practice, every write is a
+deliberate orchestrator action between agent dispatches.
+
+**Write semantics.** The file mutates at four well-defined points:
+
+1. **CREATE / OVERWRITE at pipeline start (Step 0).** Initialize a fresh
+   record with `session_start_iso` / `session_start_epoch` set from
+   `datetime.now(timezone.utc)`, `total_budget_seconds = 7200`,
+   `current_modeler_run_id = null`, `critic_cycle = 0`, `retune_cap = 1`.
+   **If a `pipeline_run.json` already exists from a prior run, OVERWRITE it
+   — never reuse.** Reusing a leftover record is the stale-state hole: it
+   would silently validate prior-run completion records as fresh. Overwrite
+   unconditionally.
+2. **UPDATE `current_modeler_run_id` after Step 3 modeler verify passes
+   (initial pass).** Copy
+   `modeler_completion.json["modeler_run_id"]` into
+   `pipeline_run.json["current_modeler_run_id"]`. Do this only after the
+   Step 3 artifact gate has passed.
+3. **UPDATE `critic_cycle` in the Step 3.6 retune branch — BEFORE
+   dispatching the retune modeler pass.** Increment `critic_cycle` and
+   persist BEFORE re-invoking the modeler. The cap check and budget guard
+   run against the post-increment value. You cannot afford to start a
+   retune cycle you can't finish in budget — check before dispatch, never
+   after.
+4. **UPDATE `current_modeler_run_id` after Step 3 modeler verify passes
+   (retune pass).** Same as (2). The field always tracks the **latest**
+   modeler pass; freshness checks downstream point at the most recent run.
+
+`session_start_*`, `total_budget_seconds`, and `retune_cap` are written
+once at Step 0 and never modified.
+
+**Enforcement this record powers** (each replacing a previously
+heuristic-only check; documented for clarity, not yet wired through all
+agent contracts — see "Remaining contract work" at the bottom):
+
+| Concern | Old fallback | Strict enforcement via pipeline_run.json |
+|---|---|---|
+| Freshness | submission_writer.md / report_writer.md / critic.md 3 h mtime window | every downstream completion record's `modeler_run_id` must equal `pipeline_run.current_modeler_run_id` |
+| Budget guard | critic.md "< 25 min" heuristic guess | `remaining = session_start_epoch + total_budget_seconds − now` — a real number |
+| Cycle cap | Step 3.6 narrative "Maximum one retune cycle per pipeline run" | `critic_cycle < retune_cap`, checked at orchestrator before dispatching a retune |
+
 **Producer → artifact → consumer table**
 
 | Producer | Artifact | Consumer | Precondition for consumer |
@@ -120,6 +185,7 @@ dispatch_time`. Sub-agents that write a completion record must capture
 | modeler | `reports/oof_predictions.csv` | validator, critic | exists, non-empty |
 | modeler | `reports/modeler_was_here.txt` | orchestrator | exists, `mtime > dispatch_time` |
 | modeler | `reports/modeler_completion.json` | validator, orchestrator | exists, `status == "ok"` |
+| orchestrator | `reports/pipeline_run.json` | critic, submission_writer, report_writer | exists (created at Step 0); critic + writers compare upstream `modeler_run_id` against `current_modeler_run_id`; critic also reads `session_start_epoch` for the budget guard and `critic_cycle` for the cycle counter |
 
 The validator's precondition is the full set of modeler artifacts above
 (`status == "ok"` plus the four named files). Verbal-only handoffs are NOT
@@ -127,7 +193,38 @@ permitted; if a downstream stage cannot find its required artifacts, it must
 FAIL its own gate and not invent fallbacks based on the subagent's narrative
 report.
 
-### Step 1 — schema_analyst (ALWAYS first)
+### Step 0 — initialize `reports/pipeline_run.json` (ALWAYS first concrete action)
+
+Before invoking ANY sub-agent — even schema_analyst — the orchestrator
+creates a fresh `reports/pipeline_run.json` per the schema in "Stage handoff
+contracts → Pipeline run state".
+
+```python
+import json, datetime, pathlib
+pathlib.Path("reports").mkdir(parents=True, exist_ok=True)
+now = datetime.datetime.now(datetime.timezone.utc)
+record = {
+    "session_start_iso":      now.isoformat(),
+    "session_start_epoch":    now.timestamp(),
+    "total_budget_seconds":   7200,        # 2 h, per Hard constraints
+    "current_modeler_run_id": None,
+    "critic_cycle":           0,
+    "retune_cap":             1,
+}
+with open("reports/pipeline_run.json", "w") as f:
+    json.dump(record, f, indent=2)
+```
+
+If `reports/pipeline_run.json` already exists from a prior pipeline run:
+**OVERWRITE it unconditionally.** Reusing a leftover record is the
+stale-state hole — it would silently validate prior-run completion records
+as fresh. There is no recovery / resume path off a prior pipeline_run.json;
+each pipeline run starts clean.
+
+Step 0 has no marker file and no sub-agent — it's a one-liner the
+orchestrator does itself.
+
+### Step 1 — schema_analyst (ALWAYS first sub-agent)
 
 ```
 Use the schema_analyst sub-agent on the data in data/.
@@ -234,7 +331,26 @@ the sub-agent's verbal "done" report. Re-run every check from this side:
    and gives circular agreement.
 6. `reports/oof_predictions.csv` exists, size > 0.
 
-Only on full pass: dispatch the validator (Step 3.5).
+**After all six checks pass, propagate `modeler_run_id` into the run-state
+record:** read `modeler_completion.json["modeler_run_id"]` and write it into
+`reports/pipeline_run.json["current_modeler_run_id"]`. This is the orchestrator's
+job; it applies to BOTH the initial Step 3 dispatch and any Step 3.6 retune
+re-dispatch — the field always tracks the latest modeler pass. After this
+update, downstream stages can use the strict `modeler_run_id`-match freshness
+check instead of the 3 h mtime heuristic their agent files currently document
+(once those agents are updated to consume it — see "Remaining contract work"
+at the bottom).
+
+```python
+import json
+mc = json.load(open("reports/modeler_completion.json"))
+pr = json.load(open("reports/pipeline_run.json"))
+pr["current_modeler_run_id"] = mc["modeler_run_id"]
+json.dump(pr, open("reports/pipeline_run.json", "w"), indent=2)
+```
+
+Only on full pass (all six checks AND the `pipeline_run.json` update): dispatch
+the validator (Step 3.5).
 
 On any failure (process exited with nonzero code, completion record missing
 or `status == "failed"`, stale marker, missing/empty/invalid artifact):
@@ -299,19 +415,50 @@ Use the critic sub-agent to review the validator output and modeler predictions.
 
 NOTE: the retune cycle below is an INTENTIONAL, gated re-invocation of the modeler —
 distinct from the accidental double-invocation that the Sub-agent completion contract
-prohibits. It is triggered only by `reports/critic_retune_requested.json` existing,
-never by the absence of a marker file.
+prohibits. The trigger is now the critic's structured completion status, with the
+cycle cap and budget guard enforced by `reports/pipeline_run.json` at the
+orchestrator — not by file-existence heuristics.
 
-If reports/critic_retune_requested.json exists AND
-reports/critic_retune_attempted.txt was just created in this run:
-- Re-invoke modeler (it will read critic_retune_requested.json
-  and apply the suggested change)
-- Then re-invoke validator (it audits the new modeler output)
-- Then re-invoke critic (it will detect critic_retune_attempted.txt
-  and accept the second result regardless of remaining concerns)
+**Retune-vs-proceed decision (orchestrator-side):**
 
-Maximum one retune cycle per pipeline run. Do NOT generate critic
-review inline; always delegate to the critic sub-agent.
+1. Read `reports/critic_completion.json`. If its `status != "retune_requested"`
+   (i.e. it is `"ok"`, `"failed"`, or `"blocked"`), proceed to Step 4. No
+   retune.
+2. If `status == "retune_requested"`:
+   - Read `reports/pipeline_run.json`. Compute
+     `remaining_budget = session_start_epoch + total_budget_seconds − now()`.
+   - **Cycle cap check.** If `critic_cycle >= retune_cap` (cap = 1, matching
+     `critic.md`): force-proceed to Step 4. Log the cap-hit; do NOT dispatch
+     the retune. The critic should already have force-accepted at this cycle
+     by its own rules, so this branch is a defense-in-depth.
+   - **Budget guard.** If `remaining_budget < 25 * 60` seconds (a typical
+     retune cycle: modeler + validator + critic + slack): force-proceed to
+     Step 4. Log the budget-exhaustion reason; do NOT dispatch the retune.
+   - **Both checks pass — dispatch the retune.** In this order, atomically:
+     1. Increment `pipeline_run.json["critic_cycle"]` (write to disk BEFORE
+        re-dispatching — a partial run that crashes mid-retune must not
+        leave `critic_cycle` unincremented and re-attempt the loop on a
+        future invocation).
+     2. Re-invoke modeler (it reads `reports/critic_retune_requested.json`
+        and applies the suggested change). After the modeler verify gate
+        passes, the orchestrator updates
+        `pipeline_run.json["current_modeler_run_id"]` per Step 3's final
+        bullet — same as the initial pass.
+     3. Re-invoke validator (audits the new modeler output).
+     4. Re-invoke critic. At this cycle the critic's `cycle_cap_will_block`
+        (per `critic.md` Step 3) fires; the critic force-accepts; the
+        retune branch terminates.
+3. After at most one cap-bounded retune cycle, proceed to Step 4. The
+   pipeline always reaches submission_writer regardless of which branch
+   fires.
+
+The cap value lives in `pipeline_run.json["retune_cap"]` (default `1`,
+matching `critic.md`). Raising the cap requires the coordinated changes
+spelled out in `critic.md` § "Future option: raising the cap to 2 retunes" —
+do NOT raise it here unilaterally.
+
+Do NOT generate critic review inline; always delegate to the critic
+sub-agent.
 
 Verify after completion:
 - Before verifying, confirm the sub-agent process has exited. If the marker is absent
@@ -418,6 +565,7 @@ fallback variants immediately.
 
 | Agent | Reads | Writes |
 |-------|-------|--------|
+| `orchestrator` (this CLAUDE.md, not a sub-agent) | — | `reports/pipeline_run.json` — created at Step 0, mutated at Step 3 verify (post-pass: `current_modeler_run_id` updated) and Step 3.6 retune dispatch (pre-dispatch: `critic_cycle` incremented). Read by critic, submission_writer, report_writer. See "Stage handoff contracts → Pipeline run state". |
 | `schema_analyst` | `data/`, `data/DATA_DESCRIPTION.md` | `reports/profile.json`, `reports/schema_analysis.md`, `reports/schema_analyst_was_here.txt` |
 | `feature_engineer` | `reports/schema_analysis.md`, `reports/profile.json`, `data/` | `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` |
 | `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt`, `reports/modeler_completion.json` (status / dispatch_time / exit_code / artifact paths — see Stage handoff contracts) |
@@ -535,3 +683,50 @@ transparency, beyond the minimum competition requirements.
 | `critic.md` | `critic` | **exists** | Step 3.6 — after validator completes; advisory + retune; never blocks submission |
 | `submission_writer.md` | `submission_writer` | **exists** | Step 4 — after critic completes (or fails gracefully) |
 | `report_writer.md` | `report_writer` | **exists** | Step 5 — after submission.csv is written |
+
+---
+
+## Remaining contract work
+
+This pass wired `reports/pipeline_run.json` and the Step 3.6 retune branch.
+Two follow-up passes are required before every freshness check switches
+from heuristic-fallback to strict-enforcement and before the Step 3.5 / 3.6
+/ 4 / 5 verify blocks match the per-stage completion-record contracts.
+
+### Next pass — `modeler_run_id` propagation through four agent files
+
+The strict freshness check (`upstream.modeler_run_id ==
+pipeline_run.current_modeler_run_id`) cannot fire until every upstream
+completion record carries `modeler_run_id`. Each agent file below needs a
+small targeted edit:
+
+| File | Edit |
+|---|---|
+| `.claude/agents/modeler.md` | Add `modeler_run_id` to the modeler_completion.json schema as a REQUIRED field; specify generation as a `<UTC_compact>_<hex8>` nonce fresh per dispatch, written into modeler_completion.json by the agent before returning OK. Today the field is only implied (critic.md assumes it); modeler.md does not yet mandate writing it. |
+| `.claude/agents/validator.md` | One-line: copy `modeler_run_id` from `modeler_completion.json` into `validator_completion.json`. |
+| `.claude/agents/submission_writer.md` | (a) Copy `modeler_run_id` through into `submission_writer_completion.json`. (b) Switch the strict freshness check from `session_start_epoch >= dispatch_time` to `modeler_completion.json["modeler_run_id"] == pipeline_run.json["current_modeler_run_id"]`. The 3 h mtime heuristic stays as defensive fallback for the (now-impossible-in-normal-runs) case where `pipeline_run.json` is absent. |
+| `.claude/agents/report_writer.md` | Same as submission_writer, applied to every upstream completion record (modeler / validator / submission_writer). |
+
+### Next pass — Step 3.5 / 3.6 / 4 / 5 verify-block reconciliation
+
+The orchestrator-side verify blocks below were written before the
+completion-record contract existed. Each one currently gates on `*_was_here.txt`
++ analytic-fields-in-review-JSON only; none of them gate on the
+corresponding `*_completion.json`. Update each to mirror the per-stage
+completion contract:
+
+| Step | What to add to the verify block |
+|---|---|
+| 3.5 (validator) | Gate on `reports/validator_completion.json` exists, parses, `status == "ok"`, `exit_code == 0`. Update "Writes" list to include `validator_completion.json`. |
+| 3.6 (critic) | Gate on `reports/critic_completion.json` exists, parses, `status ∈ {"ok", "failed", "blocked", "retune_requested"}`. The retune branch already documented above triggers on `status == "retune_requested"`; `"failed"` and `"blocked"` fall through to Step 4 per the existing no-block-on-critic-failure rule; only `"ok"` is a clean accept. Update "Writes" list to include `critic_completion.json`. |
+| 4 (submission_writer) | Gate on `reports/submission_writer_completion.json` exists, parses, `status == "ok"`. The scored-deliverable post-exit gate already lives in submission_writer.md and does not need to be duplicated at the orchestrator level. Update "Writes" list to include `submission_writer_completion.json`. |
+| 5 (report_writer) | Gate on `reports/report_writer_completion.json` exists, parses, `status == "ok"`. Update "Writes" list. |
+
+### Future (gated on tool + orchestrator both changing) — raise the retune cap to 2
+
+Tracked under `.claude/agents/critic.md` § "Future option: raising the cap
+to 2 retunes". Requires `tools/run_critic.py` sentinel → persisted-counter
+upgrade AND a corresponding orchestrator change (raise
+`pipeline_run.json["retune_cap"]` from 1 to 2 and adjust the Step 3.6
+narrative). A doc-only bump in either place desynchronises the contract
+from what is actually enforced — never do that.
