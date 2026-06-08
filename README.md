@@ -52,6 +52,20 @@ The pipeline writes an observability-only knowledge graph to `reports/knowledge_
 
 The graph records stage transitions (which agent ran and when), per-stage events (inferred problem type, resource counts, Optuna trial outcomes, hypothesis events), and rejected hypotheses from each stage. Its purpose is a run audit trail for transparency and post-hoc debugging — diagnostic tooling only, not a controller.
 
+## Per-Seed OOF Diagnostic
+
+The modeler writes an observability-only artifact at `reports/oof/oof_per_seed.csv`. It is a **derived, observability-only file** — no agent reads it, and the aggregated OOF in `reports/oof_predictions.csv`, the decision metric used by the modeler / validator / critic, and the final submission are all unaffected by its existence.
+
+It is produced during the outer-fold scoring step. Each outer fold already trains a small CatBoost ensemble across `OUTER_FOLD_FINAL_SEEDS` and aggregates their predictions on the held-out outer-val rows; the diagnostic simply persists those per-seed prediction arrays by slot index. Slot `k` corresponds to seed `OUTER_FOLD_FINAL_SEEDS[k]`; uncovered slots stay `NaN`. **Nothing is added, reordered, reseeded, or refit** — the artifact stores arrays the scoring step has already computed.
+
+The schema is **one row per covered OOF observation**, matching the row set in `reports/oof_predictions.csv`. Identifier columns are resolved generically from `profile.json` (no hardcoded names): a `row_index` join-key into the training frame, the group columns, the time column (when one is identified), `fold_id` (the outer-fold index), `y_true` (the held-out raw target), and one `pred_seed_{k}` column per outer-fold seed.
+
+**Integrity check.** Immediately after the file is written, the modeler rebuilds the OOF predictions row-wise by applying the **same aggregation callable the run used** — `np.mean` by default, or `np.median` when the critic-triggered `median_seed_aggregation` retune path is active — over the `pred_seed_*` columns (NaN-aware for partially populated slots). The resulting per-row aggregate must reproduce the in-memory `oof_preds` array to within `1e-9`; if `max |rowwise_agg − oof_preds|` exceeds that tolerance the modeler raises an `AssertionError` and the run aborts. A companion assertion enforces that the per-seed row count matches the covered OOF row count exactly.
+
+Under `--debug` only a single outer-fold seed is present, so the per-seed variance view is degenerate and not meaningful — mirroring the existing rule that debug OOF is not a valid score.
+
+The pointer block is logged in `model_results.json` under `oof_per_seed` with `seeds`, `n_seeds`, `n_rows`, `per_fold_seeds`, `agg` (the aggregation callable's name as actually used this run), `path`, and `debug`.
+
 ## Cross-Validation Strategy
 
 CV is treated as a frozen contract authored exactly once per run. `schema_analyst` invokes `tools/scheme_analysis.py`, the **only** module permitted to write `reports/cv_plan.json`. The plan selects a CV scheme from the inferred problem type — grouped or ungrouped time series default to `TimeSeriesExpanding`, tabular IID falls into `GroupKFold` / `StratifiedKFold` / `KFold` depending on whether group columns are present and whether the target is discrete — and is marked `frozen: true`. No downstream agent may modify it; the critic can request at most one replan by emitting `CV_INVALID`, in which case the orchestrator deletes `cv_plan.json` and re-invokes `schema_analyst` once.
@@ -115,9 +129,15 @@ The modeler uses a single predictor family: **CatBoost**. **Ridge** is trained a
 | CatBoost | Sole predictor             | Yes            |
 | Ridge    | Linear diagnostic baseline | No             |
 
-**Hyperparameter tuning.** CatBoost is tuned with Optuna inside each outer fold of the nested CV; final predictions are aggregated across 5 random seeds (3 seeds inside the outer-fold scoring step). Trial count is not fixed — each outer fold gets up to `OPTUNA_N_TRIALS` (8 in full mode) bounded by a per-fold time deadline derived from a global tuning budget (default 25 minutes total). The per-fold timeout is the remaining budget divided by the number of folds left, so later folds adapt to time already spent. If the budget is exhausted before an outer fold begins tuning, that fold **skips Optuna**, fits CatBoost with default hyperparameters, and still contributes its MAE to the OOF estimate — no fold is silently dropped for being late. `--debug` drops this to 1 trial per fold, a 60-second budget, and a 1-seed ensemble; debug OOF is not a valid score.
+**Hyperparameter tuning.** CatBoost is tuned with Optuna inside each outer fold of the nested CV; final predictions are aggregated across 5 random seeds (3 seeds inside the outer-fold scoring step — see [Per-Seed OOF Diagnostic](#per-seed-oof-diagnostic) for the observability-only artifact that exposes those per-seed arrays). Trial count is not fixed — each outer fold gets up to `OPTUNA_N_TRIALS` (8 in full mode) bounded by a per-fold time deadline derived from a global tuning budget (default 25 minutes total). The per-fold timeout is the remaining budget divided by the number of folds left, so later folds adapt to time already spent. If the budget is exhausted before an outer fold begins tuning, that fold **skips Optuna**, fits CatBoost with default hyperparameters, and still contributes its MAE to the OOF estimate — no fold is silently dropped for being late. `--debug` drops this to 1 trial per fold, a 60-second budget, and a 1-seed ensemble; debug OOF is not a valid score.
 
 **Ridge diagnostic.** Ridge is fit on the walk-forward holdout with alpha selected via probe split from `{0.01, 0.1, 1.0, 10.0, 100.0}`, then used for two diagnostic outputs in `model_results.json`: a linear-baseline OOF MAE to compare against CatBoost, and the top-10 absolute coefficients as a linear-importance signal. Ridge does not participate in `predictions.csv`.
+
+## Target Transform Selection
+
+The modeler exposes a `--transform` flag with choices `{auto, none, log1p, sqrt}`; the default is `auto`. Under `auto`, the modeler runs a data-driven A/B over the three forward maps `{none, sqrt, log1p}` on the same walk-forward probe split used elsewhere in the run. For each candidate a CatBoost probe is fit on the probe-training portion with identical pipeline transform and probe hyperparameters — only the forward map of the target changes — and its predictions on the held-out probe portion are **inverse-transformed back to raw scale before the metric is computed**. The decision metric is the scored walk-forward MAE in raw target space, so candidates are always compared in the metric's own space rather than in any transformed space. The argmin across `candidates_mae` is selected as the run's transform.
+
+**Selection is structural and measured, not hardcoded** to any one transform or dataset: the same A/B always runs and any candidate may win on any dataset. Target skewness is computed via `scipy.stats.skew` and **logged as context** for the decision, but it no longer drives the choice — optimising for de-skewing is not the same as optimising the scored metric. The explicit choices `--transform=none|log1p|sqrt` act as a manual override that skips the A/B entirely. The full decision — `candidates_mae`, `chosen`, `selection_metric` (`"raw_scored_wf_mae"`), `skew`, `manual_override`, and `requested` — is recorded in `model_results.json` under `transform_selection`.
 
 ## Scored-Category Optimization
 
