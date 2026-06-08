@@ -80,6 +80,53 @@ to be absent for 10+ minutes after invocation while Optuna trials are running. D
 treat this as a failure. Poll for the marker periodically; continue waiting as long as
 the launched process is alive.
 
+### Stage handoff contracts
+
+Every inter-stage handoff is an **artifact contract**, never a verbal one. A downstream
+sub-agent's precondition is the set of files produced by the upstream stage plus a
+small `reports/<stage>_completion.json` record (schema below). The orchestrator's
+"verify after completion" block is the gate that decides whether the next stage runs.
+
+**Completion-record schema** — written by every sub-agent whose contract requires one
+(currently: modeler; the same schema applies to any stage that adopts the pattern):
+
+```json
+{
+  "stage": "modeler",
+  "status": "ok",                       // "ok" | "failed"
+  "dispatch_time": "2026-01-01T00:00:00",// ISO8601 UTC, captured before the script runs
+  "exit_code": 0,
+  "artifacts": {
+    "model_results":   "reports/model_results.json",
+    "predictions":     "reports/predictions.csv",
+    "oof_predictions": "reports/oof_predictions.csv",
+    "marker":          "reports/modeler_was_here.txt"
+  },
+  "notes": ""                           // on failure: last ~50 lines of stdout/stderr
+}
+```
+
+**Stale-marker guard.** A marker file existing is not enough — it may be left over
+from a prior pipeline run. The orchestrator's gate must verify `marker.mtime >
+dispatch_time`. Sub-agents that write a completion record must capture
+`dispatch_time` BEFORE launching the backing script.
+
+**Producer → artifact → consumer table**
+
+| Producer | Artifact | Consumer | Precondition for consumer |
+|---|---|---|---|
+| modeler | `reports/model_results.json` | validator, critic, report_writer | exists, non-empty, parses as JSON |
+| modeler | `reports/predictions.csv` | submission_writer, critic, report_writer | exists, non-empty, row count == `n_val_rows`, `predicted_target` has no NaN |
+| modeler | `reports/oof_predictions.csv` | validator, critic | exists, non-empty |
+| modeler | `reports/modeler_was_here.txt` | orchestrator | exists, `mtime > dispatch_time` |
+| modeler | `reports/modeler_completion.json` | validator, orchestrator | exists, `status == "ok"` |
+
+The validator's precondition is the full set of modeler artifacts above
+(`status == "ok"` plus the four named files). Verbal-only handoffs are NOT
+permitted; if a downstream stage cannot find its required artifacts, it must
+FAIL its own gate and not invent fallbacks based on the subagent's narrative
+report.
+
 ### Step 1 — schema_analyst (ALWAYS first)
 
 ```
@@ -146,21 +193,37 @@ Use the modeler sub-agent to train models and generate predictions.
 - Reads: `reports/schema_analysis.md`, `reports/features.json`,
          `data/features_train.parquet`, `data/features_val.parquet`
 - Writes: `reports/model_results.json`, `reports/predictions.csv`,
-          `reports/modeler_was_here.txt`
+          `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`,
+          `reports/modeler_completion.json`
 - Budget: **60 minutes**
 
-Verify after completion:
-- Before verifying, confirm the sub-agent process has exited. If the marker is absent
-  but the process is still alive, continue waiting — this is NOT a failure state.
-- `reports/modeler_was_here.txt` exists (proves the sub-agent ran, not inline work)
-- `reports/predictions.csv` exists
-- Row count matches the validation set (check against `n_val_rows` in `reports/profile.json`)
-- Prediction column name matches `target_col` from the profile
-- No NaN predictions
+**Capture `dispatch_time` (UTC ISO8601) before invoking the sub-agent.** The
+sub-agent records this same value in `reports/modeler_completion.json`; the
+orchestrator uses it to detect stale markers.
 
-If the process has exited AND `reports/modeler_was_here.txt` is still absent (genuine
-failure): generate a group-mean baseline prediction for `reports/predictions.csv`
-using Python directly (do not invoke another agent), log the fallback, and continue.
+Verify after completion — this is an **INDEPENDENT artifact gate**; do NOT trust
+the sub-agent's verbal "done" report. Re-run every check from this side:
+
+1. The sub-agent process has exited. If the marker is absent but the process
+   is still alive, continue waiting — this is NOT a failure state.
+2. `reports/modeler_completion.json` exists, parses as JSON, and has
+   `status == "ok"` and `exit_code == 0`.
+3. `reports/modeler_was_here.txt` exists AND its mtime is newer than
+   `dispatch_time` (rejects leftover markers from prior runs).
+4. `reports/model_results.json` exists, size > 0, parses as JSON.
+5. `reports/predictions.csv` exists, size > 0, row count matches
+   `n_val_rows` from `reports/profile.json`, the prediction column matches
+   `target_col` (or is `predicted_target` for submission_writer to rename),
+   no NaN predictions.
+6. `reports/oof_predictions.csv` exists, size > 0.
+
+Only on full pass: dispatch the validator (Step 3.5).
+
+On any failure (process exited with nonzero code, completion record missing
+or `status == "failed"`, stale marker, missing/empty/invalid artifact):
+generate a group-mean baseline prediction for `reports/predictions.csv` using
+Python directly (do not invoke another agent), log the fallback, and continue
+to `submission_writer`. Do NOT dispatch the validator on partial state.
 
 ### Step 3.5 — validator
 
@@ -340,8 +403,8 @@ fallback variants immediately.
 |-------|-------|--------|
 | `schema_analyst` | `data/`, `data/DATA_DESCRIPTION.md` | `reports/profile.json`, `reports/schema_analysis.md`, `reports/schema_analyst_was_here.txt` |
 | `feature_engineer` | `reports/schema_analysis.md`, `reports/profile.json`, `data/` | `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` |
-| `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt` |
-| `validator` | `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json` (includes `fold_maes`, `fold_train_sizes`, `gap_attribution` block), `reports/validator_was_here.txt` |
+| `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt`, `reports/modeler_completion.json` (status / dispatch_time / exit_code / artifact paths — see Stage handoff contracts) |
+| `validator` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json` (includes `fold_maes`, `fold_train_sizes`, `gap_attribution` block), `reports/validator_was_here.txt` |
 | `critic` | `reports/validator_review.json` (reads `gap_attribution`), `reports/model_results.json`, `reports/predictions.csv`, `reports/features.json`, `reports/profile.json`, `data/features_train.parquet` | `reports/critic_review.json` (includes `gap_attribution_used`, `family_ablation`), `reports/critic_was_here.txt`, `reports/family_ablation.json` (via ablation tool), optionally `reports/critic_retune_requested.json` (may include `net_harmful_families`) and `reports/critic_retune_attempted.txt` |
 | `submission_writer` | `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv` | `submission.csv` (repo root), `reports/submission_summary.json`, `reports/submission_writer_was_here.txt` — renames `predicted_target` → actual target column name from `DATA_DESCRIPTION.md` |
 | `report_writer` | `reports/` (all files), `data/DATA_DESCRIPTION.md` | `report.pdf` (repo root), `reports/report_writer_was_here.txt`, optional `.png` charts |
