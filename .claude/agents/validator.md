@@ -87,15 +87,34 @@ Reuse the schema defined in `CLAUDE.md` § "Stage handoff contracts" verbatim
 {
   "stage": "validator",
   "status": "ok",                       // "ok" | "failed" | "blocked"
-  "dispatch_time": "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
+  "dispatch_time":   "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
   "exit_code": 0,
   "artifacts": {
     "validator_review": "reports/validator_review.json",
     "marker":           "reports/validator_was_here.txt"
   },
-  "notes": ""
+  "notes": "",
+  "modeler_run_id": "20260608T180000Z_a1b2c3d4"   // REQUIRED — copied verbatim from upstream modeler_completion.json; see "modeler_run_id propagation" below
 }
 ```
+
+### modeler_run_id propagation (REQUIRED)
+
+`modeler_run_id` is the per-pass nonce produced by the modeler (see
+`.claude/agents/modeler.md` § "modeler_run_id — per-dispatch nonce"). The
+validator does NOT generate one; it copies the value verbatim from the
+upstream `modeler_completion.json` that satisfied its precondition. The
+copy is what makes the freshness chain auditable end-to-end — without it
+the downstream consumers (critic, submission_writer, report_writer) cannot
+prove the validator review they're consuming was produced against the same
+modeler pass `pipeline_run.json["current_modeler_run_id"]` now points at.
+
+The field is REQUIRED on every record regardless of status:
+- `"ok"` / `"failed"` — copy the value read in the precondition gate.
+- `"blocked"` — `modeler_completion.json` was the gate that failed; if it
+  could be partially read, copy whatever `modeler_run_id` value (or absence)
+  was observed and record the situation in `notes`. If the file did not
+  parse at all, record `modeler_run_id: null` and explain in `notes`.
 
 `status` values:
 - `"ok"` — precondition satisfied, script exited 0, every post-exit check passed.
@@ -117,9 +136,11 @@ Before doing anything else:
 
 1. Read `reports/modeler_completion.json` from disk. If the file is missing,
    does not parse, has `status != "ok"`, or has `exit_code != 0`: write
-   `reports/validator_completion.json` with `status="blocked"`, populate
-   `notes` with the specific reason, return `BLOCKED`. Do NOT invoke
-   `tools/validate.py`. Do NOT write `validator_review.json` or the marker.
+   `reports/validator_completion.json` with `status="blocked"`,
+   `modeler_run_id` set to whatever value was observed in the upstream record
+   (or `null` if the file did not parse), populate `notes` with the specific
+   reason, return `BLOCKED`. Do NOT invoke `tools/validate.py`. Do NOT write
+   `validator_review.json` or the marker.
 2. Independently verify each modeler artifact named in
    `modeler_completion.json["artifacts"]` exists and is non-empty on disk:
    `reports/model_results.json`, `reports/predictions.csv`,
@@ -164,10 +185,14 @@ non-fatal — its absence does NOT fail the gate.
 Write `reports/validator_completion.json` to disk:
 
 - On full pass: `status="ok"`, `exit_code=0`, the captured tz-aware ISO
-  `dispatch_time`, artifact paths from the outputs table, `notes=""`.
+  `dispatch_time`, `modeler_run_id` copied from the upstream
+  `modeler_completion.json` that satisfied the precondition, artifact paths
+  from the outputs table, `notes=""`.
 - On any failure in steps 3-4: `status="failed"`, the real exit_code,
-  artifact paths populated for whatever exists, `notes` containing the last
-  ~50 lines of combined stdout/stderr from the run.
+  `modeler_run_id` copied from the same upstream record (the precondition
+  passed, so the field is available), artifact paths populated for whatever
+  exists, `notes` containing the last ~50 lines of combined stdout/stderr
+  from the run.
 
 Return `OK` / `BLOCKED` / `FAILED` matching the completion record. Do NOT
 return `OK` on a partial pass. Do NOT return before step 5 has written the
