@@ -179,7 +179,8 @@ to a group-mean baseline.
    - On any failure (nonzero exit, missing/empty/invalid artifact, stale
      marker): `status="failed"`, the real `exit_code`, the recorded
      `modeler_run_id` (still emit it — the orchestrator distinguishes failed
-     passes by run_id too), artifact paths populated for whatever exists, and
+     passes by `modeler_run_id` too), artifact paths populated for whatever
+     exists, and
      `notes` containing the last ~50 lines of combined stdout/stderr from the
      run.
 6. **Return your verdict to the orchestrator** matching the completion record:
