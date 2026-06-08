@@ -103,7 +103,7 @@ if ALL of these exist and pass their checks. You do not pick which to skip.
 {
   "stage": "modeler",
   "status": "ok",
-  "dispatch_time": "<UTC ISO8601 captured BEFORE the script ran>",
+  "dispatch_time":  "<tz-aware UTC ISO8601 captured BEFORE the script ran>",
   "exit_code": 0,
   "artifacts": {
     "model_results":   "reports/model_results.json",
@@ -111,9 +111,42 @@ if ALL of these exist and pass their checks. You do not pick which to skip.
     "oof_predictions": "reports/oof_predictions.csv",
     "marker":          "reports/modeler_was_here.txt"
   },
-  "notes": ""
+  "notes": "",
+  "modeler_run_id": "20260608T180000Z_a1b2c3d4"   // see "modeler_run_id" below — FRESH PER DISPATCH
 }
 ```
+
+### modeler_run_id — per-dispatch nonce (REQUIRED)
+
+The modeler is the source of truth for `modeler_run_id`. It is a per-dispatch
+nonce that distinguishes each modeler pass — initial pass, retune pass-2,
+hypothetical pass-3 — from every other. Downstream stages (validator, critic,
+submission_writer, report_writer) and the orchestrator's `pipeline_run.json`
+all key freshness off this value, so it must:
+
+- Be **freshly derived on every dispatch.** Never reuse a value from a prior
+  run, prior pass, or prior process. The retune branch in `CLAUDE.md`
+  Step 3.6 re-invokes the modeler; that re-invocation MUST produce a different
+  `modeler_run_id` than the initial pass, or downstream freshness checks will
+  silently pass against the wrong artifacts.
+- Use the format `<UTC_compact>_<hex8>` — e.g. `20260608T180000Z_a1b2c3d4` —
+  composed as:
+
+  ```python
+  import datetime, secrets
+  now = datetime.datetime.now(datetime.timezone.utc)
+  modeler_run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
+  ```
+
+  The timestamp prefix makes runs human-orderable in `reports/`; the 8-hex-char
+  suffix protects against same-second collisions if two dispatches ever land
+  in the same UTC second.
+- Be captured at dispatch time — same step that captures `dispatch_time` —
+  and held in memory for the completion-record write at the end. Both fields
+  refer to the same dispatch.
+- Be written verbatim into `modeler_completion.json["modeler_run_id"]` on every
+  status (`"ok"` and `"failed"` alike). The orchestrator and downstream stages
+  expect the field to exist whenever the record exists.
 
 ## Completion contract — what you MUST do
 
@@ -122,8 +155,12 @@ re-runs the same gate independently — if you return success without these
 conditions met, the orchestrator will catch it and the pipeline will fall back
 to a group-mean baseline.
 
-1. **Capture `dispatch_time` (UTC ISO8601) before doing anything else.** Hold it
-   for the completion record.
+1. **Capture `dispatch_time` (tz-aware UTC ISO8601) AND generate
+   `modeler_run_id` before doing anything else.** Both are produced once per
+   dispatch — see "modeler_run_id — per-dispatch nonce" above. Hold both for
+   the completion record. The retune path re-invokes the modeler; the
+   re-invocation runs this step again and produces a different
+   `modeler_run_id` from the initial pass.
 2. **Run `python tools/run_modeler.py` blocking in the foreground.** Wait for
    the process to exit. Never background it. Never treat "started" or
    "backgrounded" as "done". Never return while the process is still alive.
@@ -138,11 +175,13 @@ to a group-mean baseline.
      `dispatch_time` (rejects leftover markers from prior runs).
 5. **Write `reports/modeler_completion.json`** as the last step:
    - On full pass: `status="ok"`, `exit_code=0`, the recorded `dispatch_time`,
-     artifact paths from the table, `notes=""`.
+     the recorded `modeler_run_id`, artifact paths from the table, `notes=""`.
    - On any failure (nonzero exit, missing/empty/invalid artifact, stale
-     marker): `status="failed"`, the real `exit_code`, artifact paths
-     populated for whatever exists, and `notes` containing the last ~50 lines
-     of combined stdout/stderr from the run.
+     marker): `status="failed"`, the real `exit_code`, the recorded
+     `modeler_run_id` (still emit it — the orchestrator distinguishes failed
+     passes by run_id too), artifact paths populated for whatever exists, and
+     `notes` containing the last ~50 lines of combined stdout/stderr from the
+     run.
 6. **Return your verdict to the orchestrator** matching the completion record:
    `OK` (full pass) or `FAILED` (with the reason). Do NOT return `OK` on a
    partial pass. Do NOT return before step 5 has written the record to disk.
