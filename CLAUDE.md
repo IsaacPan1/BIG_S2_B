@@ -825,15 +825,8 @@ transparency, beyond the minimum competition requirements.
 The orchestrator-side gates, the `pipeline_run.json` run-state record, and
 the `modeler_run_id` propagation chain through every completion record are
 all now in place end-to-end. The strict freshness check fires throughout.
-Two small known drifts remain in agent files, plus one documented future
-option that needs coordinated tool + orchestrator changes.
-
-### Known drift cleanups (agent files; not orchestrator-side)
-
-| File | Drift | Action |
-|---|---|---|
-| `.claude/agents/modeler.md` | In-flow Step 4 (the agent's own completion-contract step list) still says "predictions.csv row count == n_val_rows from profile.json". The Step 3 gate in this file already uses the correct `len(features_val.parquet)` reference (per the row-count fix earlier in this branch). Two source-of-truth drift. | Update modeler.md's in-flow Step 4 to match: row count == `len(data/features_val.parquet)`, not `profile.json.n_val_rows`. |
-| `.claude/agents/critic.md` | Critic's own precondition gate still documents a 3 h mtime heuristic fallback (the era when `pipeline_run.json` wasn't guaranteed). With Step 0 wired and the modeler propagating `modeler_run_id`, the strict nonce-match check is always available — same fix that landed in submission_writer.md and report_writer.md. | Switch critic.md's freshness check to strict `modeler_run_id` match against `pipeline_run.json["current_modeler_run_id"]`; replace the 3 h heuristic with the same "Step 0 didn't run" defensive branch the writers now use. |
+One documented future option remains, gated on coordinated tool +
+orchestrator changes.
 
 ### Future option (NOT a known drift) — raise the retune cap to 2
 
