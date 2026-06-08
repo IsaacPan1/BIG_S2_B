@@ -169,7 +169,10 @@ to a group-mean baseline.
    - file exists,
    - size > 0,
    - JSON files parse,
-   - `predictions.csv` row count == `n_val_rows` from `profile.json`,
+   - `predictions.csv` row count == `len(data/features_val.parquet)`
+     (NOT `profile.json.n_val_rows` — raw, pre-cross-join — and NOT
+     `model_results.json.n_val_rows` — producer self-report, circular;
+     see the Required-outputs table above for the rationale),
    - `predicted_target` in `predictions.csv` has no NaN,
    - `reports/modeler_was_here.txt` mtime is strictly newer than
      `dispatch_time` (rejects leftover markers from prior runs).
