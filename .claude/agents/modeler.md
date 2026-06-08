@@ -91,7 +91,7 @@ if ALL of these exist and pass their checks. You do not pick which to skip.
 
 | Path | Required content |
 |---|---|
-| `reports/predictions.csv` | `row_id`, identifier columns from `group_cols`/`time_col`, `predicted_target`. Row count == `n_val_rows` from `profile.json`. No NaN in `predicted_target`. |
+| `reports/predictions.csv` | `row_id`, identifier columns from `group_cols`/`time_col`, `predicted_target`. **Row count == `len(data/features_val.parquet)`** — the feature-engineer's val parquet is the authoritative row-count reference because feature_engineer may expand the raw validation rows (e.g. cross-joining missing category levels). Do NOT compare against `profile.json.n_val_rows` (raw, pre-cross-join) and do NOT compare against `model_results.json.n_val_rows` (producer self-report = circular agreement). No NaN in `predicted_target`. |
 | `reports/oof_predictions.csv` | identifier columns + `fold` + `predicted_target`. One row per OOF observation. |
 | `reports/model_results.json` | Parses as JSON. Contains at minimum: `algorithm`, `objective`, `best_params`, `n_estimators`, `oof_mae`, `per_fold_maes`, `nested_cv` block, `families.catboost`, `families.ridge`, `feature_importance_all`, `ridge_top_coefficients`, `target_transform`, `transform_selection`, `lag_forecasting`, `val_prediction_stats`. |
 | `reports/modeler_was_here.txt` | Completion marker. Mtime must be newer than dispatch_time. |
