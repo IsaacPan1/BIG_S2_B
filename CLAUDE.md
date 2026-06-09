@@ -275,74 +275,154 @@ Log the fallback in stdout and continue to the modeler with whatever feature fil
 
 ### Step 3 — modeler
 
-Invoke the modeler sub-agent via the Task tool. Wait for it to write
-`reports/model_results.json`, `reports/predictions.csv`, AND
-`reports/modeler_was_here.txt`. Do not proceed until the marker file exists.
-Do NOT perform modeling inline — always delegate to the modeler sub-agent.
+**Execute `tools/run_modeler.py` synchronously, in the foreground, from the
+orchestrator's own Bash tool call. Do NOT invoke the `modeler` sub-agent via
+the Task tool. Do NOT use `run_in_background`. Do NOT use trailing `&`,
+`nohup`, `Start-Process -NoWait`, PowerShell jobs, or any other detach /
+backgrounding mechanism.**
 
-This is the longest-running stage: Optuna hyperparameter tuning typically takes
-8–15 minutes. The marker `reports/modeler_was_here.txt` will be absent throughout
-this time — that is expected, not a failure. Poll for the marker periodically;
-continue waiting as long as the launched process is alive. See the Sub-agent
-completion contract above.
+**Why the contract changed.** The previous Task-subagent dispatch path has
+failed five consecutive runs in two characteristic ways: (a) the subagent
+returned before `run_modeler.py` finished, leaving the verify gate to fire
+against half-written artifacts; and (b) the subagent backgrounded the
+training script and exited, leaving an orphaned Python worker (the "zombie"
+process) consuming the next ~hour of CPU outside the orchestrator's
+process tree. Both failure modes share the same root cause: the
+orchestrator was not the direct parent of the training process and had no
+synchronous wait on its exit. The subagent path is therefore removed from
+the contract. The orchestrator now invokes the training script directly
+and owns the wait.
 
-```
-Use the modeler sub-agent to train models and generate predictions.
-```
+**Two structural invariants this enforces — neither can orphan:**
+1. The orchestrator's tool call is the direct parent of `run_modeler.py`.
+   No `Agent` / `Task` indirection sits between them.
+2. The orchestrator's tool call does not return until the child exits.
+   No background flag, no detachment, no polling loop racing the child.
+
+Together they guarantee that when control returns to the Step 3 verify
+gate, all modeler work is fully done: either the script wrote its
+artifacts and exited 0, or it crashed with a non-zero exit code. There is
+no "still running" branch to wait on, no marker-absence race, and no
+orphaned worker behind the scenes.
+
+This is the longest-running stage — Optuna hyperparameter tuning typically
+takes 8–15 minutes — so the single blocking Bash call is expected to sit
+open for that long. That is the correct behavior, not a hang.
 
 - Reads: `reports/schema_analysis.md`, `reports/features.json`,
          `data/features_train.parquet`, `data/features_val.parquet`
-- Writes: `reports/model_results.json`, `reports/predictions.csv`,
-          `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`,
-          `reports/modeler_completion.json`
+- Writes (by `tools/run_modeler.py`):
+         `reports/model_results.json`, `reports/predictions.csv`,
+         `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`
+- Writes (by the orchestrator, after the script exits):
+         `reports/modeler_completion.json`
 - Budget: **60 minutes**
 
-**Capture `dispatch_time` BEFORE invoking the sub-agent**, as a timezone-aware
-UTC value. Two equivalent options:
+**Invocation contract.** Mint `dispatch_time` AND `modeler_run_id` BEFORE
+the script runs (the orchestrator now owns both — `run_modeler.py` itself
+mints neither), then issue a SINGLE blocking subprocess call:
 
-- Python: `datetime.datetime.now(datetime.timezone.utc)` — store as both the
-  ISO8601 string (with `+00:00` offset) and the POSIX epoch float
-  (`.timestamp()`); record the string in the completion file, use the epoch
-  float for the mtime comparison.
-- Shell: `date -u +%s` for the epoch float plus `date -u --iso-8601=seconds`
-  for the string.
+```python
+import datetime, json, os, secrets, subprocess, sys
 
-NEVER reparse a naive ISO string with `datetime.fromisoformat(...).timestamp()`
-later — that interprets the string as local time and breaks the comparison on
-any machine outside UTC. Always carry the epoch float forward, or always carry
-a tz-aware ISO string that round-trips.
+now            = datetime.datetime.now(datetime.timezone.utc)
+dispatch_iso   = now.isoformat()                                  # tz-aware, "+00:00"
+dispatch_epoch = now.timestamp()                                  # POSIX float, UTC
+modeler_run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
 
-Verify after completion — this is an **INDEPENDENT artifact gate**; do NOT trust
-the sub-agent's verbal "done" report. Re-run every check from this side:
+# BLOCKING. Returns only when the child has fully exited.
+# No run_in_background, no shell &, no nohup, no detach.
+proc = subprocess.run(
+    [sys.executable, "tools/run_modeler.py"],
+    cwd=os.getcwd(),
+    check=False,
+    capture_output=True,
+    text=True,
+    timeout=60 * 60,        # 60 min hard ceiling matching the budget
+)
+exit_code = proc.returncode
+tail = "\n".join(
+    (proc.stdout or "").splitlines()[-25:]
+    + (proc.stderr or "").splitlines()[-25:]
+)
+```
 
-1. The sub-agent process has exited. If the marker is absent but the process
-   is still alive, continue waiting — this is NOT a failure state.
+If invoked through the Bash tool rather than `subprocess.run`, the
+equivalent command is a plain `python tools/run_modeler.py` line WITHOUT
+`run_in_background=true` set on the tool call. The Bash tool's default
+foreground semantics already block until exit and propagate the exit
+code; the only failure mode is enabling backgrounding, so do not.
+
+NEVER reparse a naive ISO string with `datetime.fromisoformat(...).
+timestamp()` later — that interprets the string as local time and breaks
+the mtime comparison on any machine outside UTC. Always carry
+`dispatch_epoch` forward as a float, or always carry a tz-aware ISO
+string that round-trips.
+
+**After the script exits — synthesize the completion record FIRST, then
+gate.** `tools/run_modeler.py` writes `modeler_was_here.txt` and the
+three analytic artifacts, but it does NOT write `modeler_completion.json`
+and it does NOT mint `modeler_run_id`. That ownership now sits with the
+orchestrator. Write the record unconditionally — downstream gates need a
+parsable record on both the success and failure paths:
+
+```python
+status = "ok" if exit_code == 0 else "failed"
+completion = {
+    "stage": "modeler",
+    "status": status,
+    "dispatch_time": dispatch_iso,
+    "exit_code": exit_code,
+    "modeler_run_id": modeler_run_id,
+    "artifacts": {
+        "model_results":   "reports/model_results.json",
+        "predictions":     "reports/predictions.csv",
+        "oof_predictions": "reports/oof_predictions.csv",
+        "marker":          "reports/modeler_was_here.txt",
+    },
+    "notes": "" if status == "ok" else tail,
+}
+with open("reports/modeler_completion.json", "w") as f:
+    json.dump(completion, f, indent=2)
+```
+
+Verify after completion — this is an **INDEPENDENT artifact gate**; do
+NOT trust the recorded status alone. Re-run every check from this side:
+
+1. `subprocess.run` returned (the child process has exited). This is now
+   structurally guaranteed by the invocation contract above — there is
+   no "still running" branch to handle. If the call raised
+   `TimeoutExpired`, treat it as `exit_code = -1`, `status = "failed"`,
+   and `notes = "timeout at 3600s"` when synthesizing the completion
+   record, then fall through to the failure branch below.
 2. `reports/modeler_completion.json` exists, parses as JSON, and has
    `status == "ok"` and `exit_code == 0`.
-3. `reports/modeler_was_here.txt` exists AND its mtime is strictly newer than
-   `dispatch_time` (compare in epoch-float seconds; rejects leftover markers
-   from prior runs).
+3. `reports/modeler_was_here.txt` exists AND its mtime is strictly newer
+   than `dispatch_epoch` (compare in epoch-float seconds; rejects
+   leftover markers from prior runs).
 4. `reports/model_results.json` exists, size > 0, parses as JSON.
-5. `reports/predictions.csv` exists, size > 0, the prediction column matches
-   `target_col` (or is `predicted_target` for submission_writer to rename),
-   no NaN predictions, **and `len(predictions.csv) == len(features_val.parquet)`
-   exactly**. The validation-feature parquet is the authoritative row-count
-   reference because feature_engineer may expand the raw validation rows
-   (e.g. cross-joining missing category levels) — `profile.json.n_val_rows`
-   is the RAW row count and will NOT match. Do not use
-   `model_results.json.n_val_rows` either: that is producer self-reporting
-   and gives circular agreement.
+5. `reports/predictions.csv` exists, size > 0, the prediction column
+   matches `target_col` (or is `predicted_target` for submission_writer
+   to rename), no NaN predictions, **and `len(predictions.csv) ==
+   len(features_val.parquet)` exactly**. The validation-feature parquet
+   is the authoritative row-count reference because feature_engineer may
+   expand the raw validation rows (e.g. cross-joining missing category
+   levels) — `profile.json.n_val_rows` is the RAW row count and will
+   NOT match. Do not use `model_results.json.n_val_rows` either: that is
+   producer self-reporting and gives circular agreement.
 6. `reports/oof_predictions.csv` exists, size > 0.
 
-**After all six checks pass, propagate `modeler_run_id` into the run-state
-record:** read `modeler_completion.json["modeler_run_id"]` and write it into
-`reports/pipeline_run.json["current_modeler_run_id"]`. This is the orchestrator's
-job; it applies to BOTH the initial Step 3 dispatch and any Step 3.6 retune
-re-dispatch — the field always tracks the latest modeler pass. After this
-update, the downstream validator / critic / submission_writer /
-report_writer freshness checks all fire against `current_modeler_run_id`
-in their own Step 1 precondition gates AND at the orchestrator-side Step
-3.x verify gates — every downstream agent contract consumes the field.
+**After all six checks pass, propagate `modeler_run_id` into the
+run-state record.** The value is already in
+`modeler_completion.json["modeler_run_id"]` because the orchestrator
+wrote it there one step earlier; copy it into
+`reports/pipeline_run.json["current_modeler_run_id"]`. This applies to
+BOTH the initial Step 3 dispatch and any Step 3.6 retune re-dispatch —
+the field always tracks the latest modeler pass. After this update, the
+downstream validator / critic / submission_writer / report_writer
+freshness checks all fire against `current_modeler_run_id` in their own
+Step 1 precondition gates AND at the orchestrator-side Step 3.x verify
+gates — every downstream agent contract consumes the field.
 
 ```python
 import json
@@ -352,14 +432,24 @@ pr["current_modeler_run_id"] = mc["modeler_run_id"]
 json.dump(pr, open("reports/pipeline_run.json", "w"), indent=2)
 ```
 
-Only on full pass (all six checks AND the `pipeline_run.json` update): dispatch
-the validator (Step 3.5).
+Only on full pass (all six checks AND the `pipeline_run.json` update):
+dispatch the validator (Step 3.5).
 
-On any failure (process exited with nonzero code, completion record missing
-or `status == "failed"`, stale marker, missing/empty/invalid artifact):
-generate a group-mean baseline prediction for `reports/predictions.csv` using
-Python directly (do not invoke another agent), log the fallback, and continue
-to `submission_writer`. Do NOT dispatch the validator on partial state.
+On any failure (non-zero exit code or timeout, missing/empty/invalid
+artifact, stale marker): the orchestrator-written completion record
+already captures `status == "failed"` and the stdout/stderr tail —
+nothing to synthesize. Generate a group-mean baseline prediction for
+`reports/predictions.csv` using Python directly (do not invoke another
+agent), log the fallback, and continue to `submission_writer`. Do NOT
+dispatch the validator on partial state.
+
+**Step 3.6 retune re-dispatch uses this same procedure.** When the
+Step 3.6 retune branch fires, the orchestrator re-runs `tools/run_modeler.py`
+through the identical blocking-subprocess contract above — minting a
+fresh `dispatch_time` and a fresh `modeler_run_id`, synthesizing a fresh
+`modeler_completion.json`, re-running the six-check gate, and updating
+`current_modeler_run_id` on pass. The Task-subagent path is not used on
+the retune either.
 
 ### Step 3.5 — validator
 
