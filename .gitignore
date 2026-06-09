@@ -39,3 +39,7 @@ tools/run_modeler_full.py
 tools/run_modeler_retune.py
 tools/run_modeler_v2.py
 tools/run_modeler_v3.py
+_archive_features/
+_archive_modelers/
+runs/
+tests/
