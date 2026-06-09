@@ -267,64 +267,101 @@ all three gates must hold: `frac_improved ≥ 0.60`, `rel ≥ 0.25`,
 
 ### 6.2 Cross-Validation Decision Record
 
-This records the CV design as an explicit decision record — options, choice, evidence,
-and the cost of the rejected alternative — re-derived from `cv_plan.json`,
-`features.json`, and `validator_review.json` each run. Nothing is invented.
+This section documents the **selection criteria** — the rules the pipeline applies to
+*any* dataset to choose a problem type and CV scheme. It is not a record of one run's
+outcome: the same logic runs on every dataset, and a different input selects a
+different branch. For a given run, the branch actually taken and the evidence behind it
+are re-derived from `cv_plan.json`, `features.json`, and `validator_review.json` and
+surfaced in `report.pdf`. Nothing is hardcoded to a particular dataset.
 
-**Decision 1 — Problem Type** (`plain_regression` / `univariate_time_series` /
-`panel_forecasting`)
+**Decision 1 — Problem Type.** Inferred from the presence of a time axis and group
+structure, plus target characteristics. The pipeline selects the branch whose
+preconditions the data satisfies:
 
-| Candidate | Outcome | Reason |
-|-----------|---------|--------|
-| `plain_regression` | REJECTED | Treats rows as IID; CV would train on future to predict past (temporal leakage → optimistic, fails at submission). |
-| `univariate_time_series` | REJECTED | One model per group discards cross-group shared seasonality/covariate effects; lower per-group signal. |
-| `panel_forecasting` | **SELECTED** | Time column (regular cadence) + group columns detected; covariates keyed on (group, time); cross-group signal available, ordering respected. |
+| Branch | Selected when | Why, and what the alternatives would cost |
+|--------|---------------|-------------------------------------------|
+| `plain_regression` / classification (IID) | No ordered time column is detected | Rows are exchangeable, so random/stratified k-fold is valid. Imposing a time-series scheme here would waste folds on a non-existent ordering; treating it as panel would invent group structure that isn't there. |
+| `univariate_time_series` | Time column present, **no** usable group structure | A single ordered series; expanding/sliding CV applies. Pooling across non-existent groups is impossible; IID k-fold would leak future into past. |
+| `panel_forecasting` | Time column present **and** repeated observations across multiple groups | Cross-group signal (shared seasonality, shared covariate effects) is poolable while temporal order is preserved. Treating it as IID regression would leak future→past; treating each group as an isolated series would discard the cross-group signal and lower per-group signal-to-noise. |
 
-**Decision 2 — CV Scheme** (random k-fold / single holdout / expanding / sliding)
+The decision is evidence-driven: a regular time cadence is confirmed from the median
+inter-observation step and its regularity (`features.json → time_granularity`); group
+structure is confirmed from repeated (group, time) keys (`cv_plan.json →
+group_columns`). When no time axis is found, the pipeline falls to the IID branch and
+chooses a non-temporal CV scheme — it does **not** force temporal machinery onto
+non-temporal data.
 
-Choice: **`TimeSeriesExpanding`** (frozen in `cv_plan.json`). Random k-fold is invalid
-for ordered data; expanding window respects the arrow of time with the last fold
-anchored at *T*. The expanding-vs-sliding gate is data-driven (the three gates above);
-sliding is taken only on demonstrated recency-reducible shift.
+**Decision 2 — CV Scheme.** Follows directly from the problem type, then a data-driven
+refinement for the time-series case:
 
-| Rejected scheme | Cost |
-|-----------------|------|
-| Random k-fold | Optimistic, meaningless estimate for ordered targets. |
-| Single holdout | High variance; no scaling evidence; no fold-ensemble variance reduction. |
-| Sliding (no gate) | Discards still-valid older data without demonstrated benefit. |
+| Problem type | CV scheme chosen | Rationale |
+|--------------|------------------|-----------|
+| IID regression / classification, **with** group columns | `GroupKFold` | Keeps each group entirely within one fold so the model is tested on unseen groups, not memorized ones. |
+| IID classification, discrete target, no groups | `StratifiedKFold` | Preserves class balance across folds for a stable estimate. |
+| IID regression, no groups | `KFold` | Standard random partition; valid because rows are exchangeable. |
+| Time series (univariate or panel) | `TimeSeriesExpanding` (default) or `TimeSeriesSliding` | Respects the arrow of time; the last fold is anchored at the final period *T*, mirroring the real train→submission boundary. |
 
-Embargo/purge: the validator's strict re-audit uses a 2-period embargo, dropping
-boundary-adjacent observations to prevent lag-feature leakage across the fold edge.
+For the time-series branch, **expanding vs sliding** is itself a data-driven decision,
+not a fixed choice. The pipeline defaults to expanding (use all history) and switches to
+sliding (fixed recent window) **only** when a recent-vs-full drift diagnostic shows the
+train→val shift is *recency-reducible* — i.e. restricting training to recent periods
+measurably narrows the covariate gap. All three gates must hold simultaneously:
+`frac_improved ≥ 0.60`, `rel ≥ 0.25`, `n_features_scanned ≥ 12`; every fallback path
+returns expanding. This means older data is discarded only when there is breadth of
+evidence that it has become unrepresentative — never by default.
 
-Nested tuning: Optuna runs inside each outer fold (`inner_folds = 3`) on inner-train
-rows only, so outer-fold MAE is an honest estimate of the configuration the pipeline
-*would have selected without seeing held-out data* — not a hindsight best.
+**Why these schemes and not the simpler defaults**, in general terms:
+
+| Rejected default | Why it is avoided (when a better-fitting scheme applies) |
+|------------------|----------------------------------------------------------|
+| Random k-fold on ordered data | Trains on future periods to predict past ones — leaks the answer and produces an optimistic estimate that does not transfer to a forecast. |
+| Single train/test holdout | High-variance estimate dependent on one split point; gives no fold-ensemble variance reduction and no evidence of how error scales with training size. |
+| Group-blind k-fold when groups exist | Lets the model memorize group identity, inflating the score relative to performance on unseen groups. |
+
+**Leakage controls applied to every scheme.** `cv_engine.CVEngine` enforces no
+train/valid index overlap; for time-series schemes it enforces
+`max(train_time) + gap ≤ min(valid_time)`; for `GroupKFold` it enforces disjoint
+groups. The validator's independent re-audit additionally applies a purge/embargo
+around fold boundaries, dropping boundary-adjacent observations so lag/rolling features
+whose lookback spans the boundary cannot leak across it.
+
+**Nested tuning** is applied regardless of scheme: hyperparameter search runs inside
+each outer fold on inner-training rows only, so the outer-fold metric estimates the
+performance of the configuration the pipeline *would have selected without seeing the
+held-out data* — not a hindsight best.
 
 **Decision 3 — Why the OOF Is Honest, and Its Limit**
 
-Honest within the training distribution because each row is predicted by a model that
-never saw it (expanding split + nested tuning), and the validator's independent purged
-re-audit classifies any modeler-vs-strict gap: `CV_SCHEME` = structural pessimism from
-smaller early-fold windows (not overfit); `monotone_score = 1.0` = MAE improves as the
-training window grows.
+Honest within the training distribution because, whatever scheme was selected, each row
+is predicted by a model that never saw it during training or hyperparameter selection:
+the fold construction guarantees train/validation separation (temporal ordering for
+time-series schemes, disjoint groups for `GroupKFold`, no index overlap for all), and
+nested tuning keeps held-out rows out of the search. For time-series schemes, the
+validator's independent purged re-audit additionally classifies any gap between the
+modeler's CV and the strict re-audit: a `CV_SCHEME` classification means the gap is
+structural pessimism (smaller early-fold training windows), not model overfit, and a
+high `monotone_score` means error improves in the expected direction as training data
+grows.
 
-The limit is **distribution shift.** Adversarial validation trains a classifier to
-separate train from val rows on covariates; a high AUC means the model will be
-evaluated on systematically different data. **OOF MAE is a within-training-distribution
+The limit is **distribution shift**, and it applies to any scheme. Adversarial
+validation trains a classifier to separate training from validation rows on covariates
+alone; a high AUC means the model will be evaluated on data that looks systematically
+different from what it trained on. **The OOF metric is a within-training-distribution
 estimate** — when adversarial AUC is high, true test error exceeds OOF by an amount no
-within-training CV can quantify (the correction needs the unavailable test
-distribution). Adversarial sample weighting partially compensates but is a bounded
-heuristic. **OOF MAE is not presented as a leaderboard prediction.**
+within-training CV can quantify, because the correction would require the (unavailable)
+test distribution. Adversarial sample weighting partially compensates but is a bounded
+heuristic, not an exact correction. The OOF metric is therefore reported as a
+within-distribution estimate, **not** as a prediction of leaderboard position.
 
 **Decision 4 — What This Framework Does Not Claim**
 
 | Claim | Why withheld |
 |-------|-------------|
-| OOF MAE ≈ leaderboard | Leaderboard is out-of-sample; shift drives a gap CV cannot quantify. |
-| Model predicts within-cell variation | It predicts the cell's expected value; within-cell deviation is noise-floor variance. |
-| All categories contribute equally | MAE with differing category means is size-weighted; large categories dominate. |
-| More Optuna trials guarantee better generalization | Tuning toward an optimistic CV objective can increase overfit. |
-| Submission covers the full training distribution | Only the submission-covered category subset is scored. |
+| The internal metric ≈ leaderboard score | The leaderboard is out-of-sample; the internal metric is within-training-distribution. When distribution shift is present (high adversarial AUC), it drives a gap no within-training CV can quantify. |
+| The model predicts within-cell / within-group fine-grained variation | The model predicts the expected value at each unit (e.g. group × period); residual within-unit deviation that is noise from the model's perspective is not presented as predictable signal. |
+| Every category contributes equally to the score | When the metric is an unweighted average over rows but category magnitudes differ, high-magnitude categories dominate the absolute error. The pipeline reports per-category breakdowns rather than implying uniform contribution. |
+| More tuning guarantees better generalization | Tuning minimizes a CV-estimated objective; if that estimate carries residual optimism (e.g. from shift), further tuning toward it can increase overfit rather than improve test performance. |
+| The submission covers the full training distribution | When the submission template restricts to a subset of training categories, only that scored subset reflects in the leaderboard metric; performance on unscored categories is not directly evaluated. |
 
 ---
 
