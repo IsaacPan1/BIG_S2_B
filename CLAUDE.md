@@ -71,7 +71,7 @@ window during normal operation — this is expected, not a failure):
 | Stage | Typical duration | Outer budget |
 |-------|-----------------|--------------|
 | feature_engineer | 2–5 min | 15 min |
-| modeler | 8–15 min (Optuna tuning across families) | 60 min |
+| modeler | 8–15 min (Optuna tuning across families) | 90 min |
 | validator | 3–8 min | 10 min |
 | critic | 2–5 min | 5 min |
 
@@ -316,7 +316,7 @@ open for that long. That is the correct behavior, not a hang.
          `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`
 - Writes (by the orchestrator, after the script exits):
          `reports/modeler_completion.json`
-- Budget: **60 minutes**
+- Budget: **90 minutes**
 
 **Invocation contract.** Mint `dispatch_time` AND `modeler_run_id` BEFORE
 the script runs (the orchestrator now owns both — `run_modeler.py` itself
@@ -338,7 +338,11 @@ proc = subprocess.run(
     check=False,
     capture_output=True,
     text=True,
-    timeout=60 * 60,        # 60 min hard ceiling matching the budget
+    timeout=90 * 60,        # 90 min hard ceiling — single source of truth for Step 3 & 3.6.
+                            # Basis: measured full-mode pass ~46 min clean / ~58 min under
+                            # memory pressure; 90 min clears the worst case while leaving
+                            # ~30 min for validator/critic/submission/report inside the 2 h
+                            # total budget. NOT 120 min — that would starve downstream stages.
 )
 exit_code = proc.returncode
 tail = "\n".join(
@@ -393,7 +397,7 @@ NOT trust the recorded status alone. Re-run every check from this side:
    structurally guaranteed by the invocation contract above — there is
    no "still running" branch to handle. If the call raised
    `TimeoutExpired`, treat it as `exit_code = -1`, `status = "failed"`,
-   and `notes = "timeout at 3600s"` when synthesizing the completion
+   and `notes = "timeout at 5400s"` when synthesizing the completion
    record, then fall through to the failure branch below.
 2. `reports/modeler_completion.json` exists, parses as JSON, and has
    `status == "ok"` and `exit_code == 0`.
@@ -445,8 +449,10 @@ dispatch the validator on partial state.
 
 **Step 3.6 retune re-dispatch uses this same procedure.** When the
 Step 3.6 retune branch fires, the orchestrator re-runs `tools/run_modeler.py`
-through the identical blocking-subprocess contract above — minting a
-fresh `dispatch_time` and a fresh `modeler_run_id`, synthesizing a fresh
+through the identical blocking-subprocess contract above — including the
+same 90-min `timeout=90 * 60` ceiling (the Step 3 literal is the single
+source of truth; do not redeclare it here) — minting a fresh
+`dispatch_time` and a fresh `modeler_run_id`, synthesizing a fresh
 `modeler_completion.json`, re-running the six-check gate, and updating
 `current_modeler_run_id` on pass. The Task-subagent path is not used on
 the retune either.
@@ -756,13 +762,13 @@ genuinely missing system-wide.
 |-------|--------|-------|
 | schema_analyst | 5 min | Non-negotiable — never skip or shorten |
 | feature_engineer | 15 min | Reduce feature complexity if falling behind |
-| modeler | 60 min | Cap Optuna at 30 trials if time is short |
+| modeler | 90 min | Subprocess hard ceiling. Basis: measured ~46 min clean / ~58 min under memory pressure; 90 min clears the worst case. Cap Optuna at 30 trials if time is short |
 | validator | 10 min | Diagnostic only; never blocks submission |
 | critic | 5 min | Advisory + retune; never blocks submission |
 | submission_writer | 10 min | Should be fast; escalate if it stalls |
 | report_writer | 20 min | Reduce to text-only PDF if time is short |
 | Buffer | 15 min | Reserved for retries and fallback logic |
-| **Total** | **140 min** | Nominal total assuming no retune cycle; phases must compress if falling behind the 120-minute wall-clock limit |
+| **Total** | **170 min** | Sum of outer ceilings (modeler bumped to 90 min). Typical wall-clock is well under this — measured modeler runs ~46–58 min, not 90. Phases must compress if falling behind the 120-minute wall-clock limit; the 90-min modeler ceiling is a kill-switch, not a target |
 
 If critic triggers a retune, modeler + validator + critic re-run, adding ~75 minutes. Subsequent phases must reduce to their fallback variants if this happens.
 
