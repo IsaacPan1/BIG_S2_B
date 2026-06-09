@@ -67,16 +67,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tune-mode",
         choices=["per_fold", "once"],
-        default="per_fold",
-        help="Hyperparameter tuning scope. 'per_fold' (default, current behavior): "
-             "fresh Optuna study per outer fold on its outer-train inner CV "
-             "(N_OUTER × OPTUNA_N_TRIALS × N_INNER_FOLDS inner CatBoost fits). "
-             "'once': single Optuna study run BEFORE the outer loop on a full-train "
-             "N_INNER_FOLDS-panel-purged inner CV; the picked params apply to every "
-             "outer fold's final fit (per-fold weights still independent — only "
-             "the hyperparameter SEARCH is shared, never weights or pipeline "
-             "statistics). Use --tune-mode once for an A/B against the default "
-             "before switching. Default stays per_fold until A/B passes.",
+        default="once",
+        help="Hyperparameter tuning scope. 'once' (default): single Optuna study "
+             "run BEFORE the outer loop on a full-train N_INNER_FOLDS-panel-purged "
+             "inner CV; the picked params apply to every outer fold's final fit "
+             "(per-fold weights still independent — only the hyperparameter SEARCH "
+             "is shared, never weights or pipeline statistics). 'per_fold' (legacy "
+             "opt-in): fresh Optuna study per outer fold on its outer-train inner "
+             "CV (N_OUTER × OPTUNA_N_TRIALS × N_INNER_FOLDS inner CatBoost fits).",
     )
     _cli_args = parser.parse_args()
     DEBUG = _cli_args.debug
