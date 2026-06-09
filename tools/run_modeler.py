@@ -67,7 +67,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--group-relational",
         choices=["on", "off"],
-        default="off",
+        default="on",
         help="Adaptive group-relational feature family (3 features per "
              "qualifying high-cardinality + heavy-right-tail group column: "
              "group_target_rank, peer_group_mean, gap_to_top_groups). Fit per "

@@ -16,3 +16,8 @@ robust loss Huber/Fair (rejected), transform none/sqrt/log1p (neutral ~1%),
 Ridge (1.19-1.34, loses to CatBoost on matched metric), explicit features (above).
 Real lever = recursive forecasting (scored ~1.9 -> ~1.32). Generalization merit =
 clean CV + honest contracts, not more modeling.
+
+group-relational features (rank/peer/gap on high-card jurisdiction): KEPT, default on.
+A/B 1 run: OOF neutral (2.049->2.044), recursive -2.8% (1.369->1.330), all_drugs tail
+-1.4% + val max ->59.7, opioids +2.9% worse. Leak-safe (gap conservative, verify 0).
+Marginal keep on recursive+tail; OOF within noise. Not confirmed across multiple runs.

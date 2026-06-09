@@ -78,6 +78,141 @@ CV is treated as a frozen contract authored exactly once per run. `schema_analys
 
 **Drift gate (expanding-vs-sliding).** `scheme_analysis.py` defaults to expanding and switches to sliding **only** when a recent-vs-full drift diagnostic shows the train→val shift is **recency-reducible**. For each shared numeric, non-window covariate (seasonality and time-index columns are excluded by name), it computes the standardised mean shift `|μ_train − μ_val| / pooled_std` twice — using the full training window and using only the last `RECENT_PERIODS = 14` periods — and aggregates `mean_improvement`, `rel = mean_improvement / mean_dist_full`, and `frac_improved` (share of features whose per-feature improvement exceeds 0.05). The sliding branch is taken **only** when all three affirmative gates hold simultaneously: `frac_improved ≥ 0.60` (primary), `rel ≥ 0.25` (secondary), and `n_features_scanned ≥ 12` (evidence-breadth floor). Every fallback path — no val frame, no time axis, fewer than `RECENT_PERIODS` of history, no rank, no shared numeric covariates — returns expanding. The diagnostic uses validation **covariates** (provided by the competition); the validation target is never read.
 
+## Cross-Validation Decision Record
+
+This section records the CV design as an explicit decision record — options considered,
+choice made, evidence that drove the choice, and what rejecting the alternative would
+have cost. Every claim is grounded in `reports/cv_plan.json`, `reports/features.json`,
+and `reports/validator_review.json` written by the most recent pipeline run. No claim
+is invented; the record is re-derived from those artifacts at each run.
+
+### Decision 1 — Problem Type
+
+**Candidates:** `plain_regression`, `univariate_time_series`, `panel_forecasting`
+
+| Candidate | Outcome | Reason |
+|-----------|---------|--------|
+| `plain_regression` | REJECTED | Treats every row as IID. During cross-validation, training folds contain rows from future periods used to predict past periods — temporal leakage that produces an optimistically biased estimate and fails at submission time because the model receives no time-ordered signal. |
+| `univariate_time_series` | REJECTED | One model per group. Cross-group patterns — shared seasonal cycles, shared covariate effects, correlated trend changes — are discarded. Per-group signal-to-noise is lower because training history is partitioned by group instead of pooled across groups. |
+| `panel_forecasting` | **SELECTED** | Panel structure confirmed: both a time column (regular monthly cadence; `cv_plan.json: time_column`) and multiple group columns (`cv_plan.json: group_columns`) are detected. External numeric covariates are keyed on `(group, time)`. Cross-group signal is available and the temporal ordering is respected. |
+
+**Evidence from artifacts:** regular time cadence detected (median step ≈ 744 h,
+step CV < 0.03, `features.json: time_granularity`); group × time structure present;
+problem type recorded as `grouped_time_series` / `panel_forecasting` in
+`cv_plan.json: problem_type`.
+
+### Decision 2 — CV Scheme
+
+**Candidates:** random k-fold, single holdout, expanding window, sliding window
+
+**Choice:** `TimeSeriesExpanding` — frozen in `reports/cv_plan.json`:
+`cv_type = "TimeSeriesExpanding"`, `n_splits = 5`, `valid_size = 7`, `gap = 0`,
+`shuffle = false`.
+
+**Why expanding window for a forecasting target:**
+Random k-fold is invalid for ordered data: observations from future periods flow into
+training folds that predict past periods, leaking the answer and producing estimates
+that are meaningless for forecasting evaluation. Expanding window respects the arrow
+of time — training always uses data from `[0 : fold_end]`, validation is the
+immediately following `valid_size` periods, and the **last** fold ends at the final
+training period T, mirroring the actual train → submission boundary.
+
+**Expanding vs. sliding gate (`cv_plan.json → cv_selection_reason`):**
+The pipeline runs a data-driven diagnostic before freezing the scheme. Sliding window
+(fixed recent training window) is chosen **only** when three conditions hold
+simultaneously:
+
+1. `frac_improved >= 0.60` (primary gate) — majority of covariates have smaller
+   train-vs-val distribution distance when the training window is restricted to the
+   most recent periods.
+2. `rel >= 0.25` (secondary gate) — mean improvement is material relative to total
+   shift magnitude.
+3. `n_features_scanned >= 12` (evidence-breadth floor) — enough features to make
+   the conclusion robust.
+
+In the recorded run (`cv_plan.json: cv_selection_reason.drift_metrics`):
+`frac_improved = 0.556 < 0.60` — the primary gate did not pass; expanding window
+retained. Sliding would have discarded older training data without demonstrated
+shift-reduction benefit.
+
+**Embargo / purge gap:**
+The validator's independent strict re-audit uses a 2-period embargo
+(`validator_review.json: strict_cv_scheme`). The embargo drops observations adjacent
+to the train/val fold boundary from both sides, preventing leakage from lag features
+whose lookback window spans the boundary — a form of leakage a gap-free split does
+not address.
+
+**Nested tuning:**
+Hyperparameter search runs **inside** each outer fold using `inner_folds = 3` inner
+splits (`model_results.json: nested_cv.inner_folds`). The Optuna objective is the
+inner-fold MAE, computed only on inner-fold training rows. The outer-fold validation
+rows are never seen during the search, so the outer-fold MAE is an honest estimate of
+the performance achieved by the configuration the pipeline would have selected without
+access to the held-out data — not the best achievable configuration in hindsight.
+
+**Cost of rejected schemes:**
+
+| Rejected scheme | What the cost would have been |
+|-----------------|-------------------------------|
+| Random k-fold | Produces a lower (optimistic) CV MAE by training on future data to predict past. The estimate is meaningless for an ordered forecasting target. |
+| Single holdout | High-variance estimate dependent on which single period was held out; no evidence about how performance scales with training size; no fold-ensemble variance reduction. |
+| Sliding window (no affirmative gate) | Discards older training data whose patterns may remain valid; no demonstrated shift-reduction benefit in this run; would have required sliding without evidence. |
+
+### Decision 3 — Why the OOF Is Honest, and Its Limit
+
+**Why it is honest within the training distribution:**
+
+The OOF is constructed so that each row's prediction is made by a model that has never
+seen that row during training or hyperparameter selection:
+
+- The expanding-window split ensures every outer-fold validation row is strictly later
+  than every outer-fold training row in the same fold.
+- Nested tuning (inner folds inside each outer fold) ensures no hyperparameter is
+  selected using outer-fold validation rows.
+- The validator's independent purged walk-forward re-audit provides a second estimate
+  with an explicit embargo. Its gap-attribution block
+  (`validator_review.json → gap_attribution`) classifies the gap between modeler CV
+  MAE and strict validator MAE. A classification of `CV_SCHEME` means the gap is
+  **structural pessimism** from smaller training windows in early folds — not model
+  overfit. A `monotone_score = 1.0` means every fold pair shows MAE improving in the
+  expected direction as the training window grows.
+
+**The limit — distribution shift:**
+
+Adversarial validation trains a binary classifier to distinguish training rows from
+validation rows using only covariate features. The resulting AUC
+(`features.json → adversarial_validation.auc_train_vs_val`) measures how reliably the
+two populations can be separated by a linear or tree-based model.
+
+When AUC is near 1.0, the populations are nearly perfectly separable — the model will
+be evaluated on data that looks systematically different from what it trained on. This
+is a general mechanism, not a dataset-specific quirk: any domain where economic
+conditions, search behavior, or environmental signals shift substantially between the
+training and evaluation windows will produce a high adversarial AUC.
+
+**The OOF MAE is a within-training-distribution estimate.** When adversarial AUC is
+high, the true test error exceeds OOF by an amount that no within-training CV
+technique can quantify, because the correction would require knowing the test
+distribution — which is not available at training time. The pipeline partially
+compensates by applying adversarial sample weights (rows resembling the validation
+distribution receive higher training weight), but this is a bounded heuristic, not an
+exact correction.
+
+The pipeline reports OOF MAE as a within-distribution estimate only. It is **not**
+presented as a prediction of leaderboard position.
+
+### Decision 4 — What This Framework Does Not Claim
+
+| Claim | Why it is withheld |
+|-------|-------------------|
+| OOF MAE ≈ leaderboard score | Leaderboard is out-of-sample; OOF is within-training-distribution. Distribution shift (adversarial AUC) drives a gap that training-side CV cannot quantify. The pipeline reports no expected-test figure. |
+| The model predicts within-cell variation | The model predicts the expected value at each cell (group × period). Within-cell deviation is noise-floor variance from the model's perspective — not predictable signal. Targets dominated by noise at the cell level are effectively noise-floored regardless of modeling effort. |
+| All categories contribute equally to the scored metric | When scoring uses MAE and category means differ substantially, high-magnitude categories dominate the score even when per-category error rates are uniform. The metric is a size-weighted aggregate, not a uniform one. |
+| More Optuna trials guarantee better generalization | Optuna minimizes a CV-estimated objective. If the CV estimate carries residual optimism (e.g., from distribution shift), further tuning toward that objective can increase overfit rather than improve test performance. |
+| The submission covers the full training distribution | Training uses all available overdose categories; only a subset of those categories appear in the submission template. The scored metric reflects performance only on the submission-covered subset. |
+
+---
+
 ## Problem Subtype Detection
 
 The pipeline detects a problem subtype from the target column characteristics, not just the broad problem type. This determines which ensemble path is used.

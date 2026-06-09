@@ -19,12 +19,14 @@ substitute it. You do not write `report.pdf` inline.
 - Reads upstream artifacts via two helpers (`load_json`, `load_text`)
   that record missing inputs without crashing — so the script tolerates a
   missing optional file and reports the gap rather than failing.
-- Renders sections covering: problem classification, data quality
-  (distribution shift, image presence), feature engineering families,
-  modeling (algorithm, best params, CV MAE, top feature importances),
-  cross-validation and integrity (validator audit, critic review),
-  predictions and submission stats, limitations and risks, methodology
-  notes.
+- Renders sections covering: problem classification (including data-description
+  text when the file is found), data quality (distribution shift, image presence),
+  feature engineering families, modeling (algorithm, best params, CV MAE, top
+  feature importances), cross-validation and integrity (validator audit, critic
+  review, threshold documentation, and a **CV decision record** — Section 5D —
+  documenting problem-type and scheme choices as options-considered → choice → why
+  → cost-of-rejected, grounded in `cv_plan.json` and `features.json`),
+  predictions and submission stats, limitations and risks.
 - Generates two optional charts via matplotlib when available:
   `reports/feature_importance.png` and `reports/prediction_histogram.png`.
 - Writes `report.pdf` at the repo root via reportlab. If reportlab is
@@ -62,7 +64,8 @@ record contract; will be upgraded as the rollout proceeds):
 - `reports/critic_was_here.txt`
 
 Required orientation file:
-- `data/DATA_DESCRIPTION.md`
+- `data/DATA_DESCRIPTION.md` (or any equivalent casing — matched
+  case-insensitively; see precondition check 5 below)
 
 Script inputs (read by `tools/generate_report.py`, all under `reports/`
 unless noted; missing files are tolerated by the script and noted in
@@ -74,7 +77,9 @@ unless noted; missing files are tolerated by the script and noted in
 - `reports/critic_review.json`
 - `reports/validator_review.json`
 - `reports/schema_analysis.md`
-- `data/DATA_DESCRIPTION.md`
+- `data/DATA_DESCRIPTION.md` (case-insensitive glob — `Data_Description.md`,
+  `data_description.md`, etc. all match; non-fatal if absent but omits the
+  data-description section from the report)
 - `reports/predictions.csv` (for the prediction-histogram chart;
   non-fatal if missing)
 
@@ -172,7 +177,12 @@ Before doing anything else:
      is `null` (Step 3 verify never propagated the latest modeler's
      nonce), that is an orchestrator-side bug — `BLOCKED` with the
      specific cause in `notes`, do not improvise.
-5. `data/DATA_DESCRIPTION.md` must exist. Missing → `BLOCKED`.
+5. A data-description file must exist in `data/`. The canonical lookup used by
+   `tools/generate_report.py` is case-insensitive and separator-tolerant: it globs
+   `data/` for any file whose name lowercased and with `-`/` ` replaced by `_` equals
+   `data_description.md` (e.g., `Data_Description.md`, `DATA_DESCRIPTION.md`, and
+   `data_description.md` all match). Apply the same logic here — do not hard-code the
+   exact filename. If no match is found → `BLOCKED` with the glob pattern in `notes`.
 
 ### Step 2 — capture dispatch_time (BEFORE launch)
 

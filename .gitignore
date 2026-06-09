@@ -63,3 +63,6 @@ scored_mae
 drugs_diagnostics
 
 .claude/*.lock
+
+
+data/*
