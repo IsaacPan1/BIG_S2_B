@@ -66,3 +66,9 @@ drugs_diagnostics
 
 
 data/*
+
+tests/
+_archive_features/
+_tmp_mi_data/
+unused_main_arch/
+EOF
