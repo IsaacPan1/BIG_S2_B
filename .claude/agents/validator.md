@@ -54,10 +54,16 @@ No other flags are required for pipeline runs.
 
 ## Inputs
 
-Precondition input (gate — must be satisfied before invocation):
+Precondition inputs (gate — must be satisfied before invocation):
 - `reports/modeler_completion.json` — must exist, parse, have `status == "ok"`,
-  `exit_code == 0`, and reference modeler artifacts that all exist non-empty
-  on disk.
+  `exit_code == 0`, carry a `modeler_run_id`, and reference modeler artifacts
+  that all exist non-empty on disk.
+- `reports/pipeline_run.json` — must exist (created by the orchestrator at
+  Step 0) and have a non-null `current_modeler_run_id` (propagated by the
+  orchestrator at Step 3 verify) that EQUALS the upstream
+  `modeler_completion.json["modeler_run_id"]`. This is the strict per-pass
+  freshness check; see Step 1.3 below for the exact form and the defensive
+  branch.
 
 Script inputs (read by `tools/validate.py`):
 - `reports/profile.json` — `problem_type`, `target_col`, `group_cols`, `time_col`
@@ -146,6 +152,43 @@ Before doing anything else:
    `reports/model_results.json`, `reports/predictions.csv`,
    `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`. Any failure
    → same `BLOCKED` path as above.
+3. Read `modeler_run_id` from `modeler_completion.json`. If absent →
+   `BLOCKED` with `notes = "modeler_completion.json missing modeler_run_id"`.
+   The modeler's contract (modeler.md) requires the field; absence is an
+   upstream contract violation.
+4. **Strict freshness check — per-pass nonce match.** A stale `"ok"`
+   `modeler_completion.json` from a prior pipeline run, or from an earlier
+   pass within the current run that has since been superseded by a retune,
+   must NOT satisfy the precondition. The check has one strict form and one
+   defensive branch for the orchestrator-side failure where Step 0 did not
+   run:
+   - **Strict (the normal path).** Read
+     `reports/pipeline_run.json["current_modeler_run_id"]`. Require
+     `modeler_completion.json["modeler_run_id"] == current_modeler_run_id`.
+     If they differ, the modeler artifacts are stale or from a prior pass
+     (e.g. pass-1 left in place after a retune that should have superseded
+     them) → `BLOCKED` with `notes` recording both ids and which record was
+     consulted.
+   - **Defensive (orchestrator failure to initialize Step 0).**
+     `reports/pipeline_run.json` should always exist by the time the
+     validator runs — Step 0 of CLAUDE.md creates it. If it does NOT exist,
+     the orchestrator failed to run Step 0; log a
+     `[freshness] pipeline_run.json missing — Step 0 not initialized`
+     line and `BLOCKED` with that exact reason in `notes`. There is no 3 h
+     mtime heuristic anymore — the prior fallback was for the era when
+     `pipeline_run.json` was not guaranteed to exist; with Step 0 wired,
+     that era is over.
+   - The strict path is REQUIRED — never fall back to time-window
+     heuristics. If `pipeline_run.json` exists but `current_modeler_run_id`
+     is `null` (Step 3 verify never propagated the latest modeler's nonce),
+     that is an orchestrator-side bug — `BLOCKED` with the specific cause
+     in `notes`, do not improvise.
+
+After all four sub-steps pass, the upstream `modeler_run_id` is the validated
+freshness identity for this pass. Carry it through Step 5 verbatim — the
+downstream stages (critic, submission_writer, report_writer) and the
+orchestrator-side Step 3.5 verify all cross-check against
+`pipeline_run.json["current_modeler_run_id"]`.
 
 ### Step 2 — capture dispatch_time (BEFORE launch)
 
@@ -186,8 +229,10 @@ Write `reports/validator_completion.json` to disk:
 
 - On full pass: `status="ok"`, `exit_code=0`, the captured tz-aware ISO
   `dispatch_time`, `modeler_run_id` copied from the upstream
-  `modeler_completion.json` that satisfied the precondition, artifact paths
-  from the outputs table, `notes=""`.
+  `modeler_completion.json` that satisfied the precondition (this is the
+  same value the strict freshness check just confirmed equals
+  `pipeline_run.json["current_modeler_run_id"]`), artifact paths from the
+  outputs table, `notes=""`.
 - On any failure in steps 3-4: `status="failed"`, the real exit_code,
   `modeler_run_id` copied from the same upstream record (the precondition
   passed, so the field is available), artifact paths populated for whatever
