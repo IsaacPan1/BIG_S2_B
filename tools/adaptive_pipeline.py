@@ -108,6 +108,264 @@ class FoldScaler(BaseEstimator, TransformerMixin):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 2.5 — GroupRelationalEncoder (leak-safe group-level relational features)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from scipy.stats import skew as _scipy_skew
+except Exception:
+    _scipy_skew = None
+
+
+class GroupRelationalEncoder(BaseEstimator, TransformerMixin):
+    """Fit-on-train, leak-safe group-relational features for high-cardinality
+    heavy-right-tail categorical group columns.
+
+    For each candidate column ``G`` that passes the data-driven detection rule
+    (``n_unique >= min_cardinality`` AND ``signed_skew(group_means_y) >=
+    skew_threshold``) the encoder emits three numeric features per row:
+
+      - ``group_target_rank_<G>``: dense rank (descending; 1 = heaviest group)
+        of the row's group within the fit-fold group-mean(y) distribution.
+      - ``peer_group_mean_<G>``: mean of OTHER groups' mean(y), excluding the
+        row's own group.
+      - ``gap_to_top_groups_<G>``: row's group_mean(y) minus the mean of the
+        top-K groups by mean(y). Frozen-recent v1 — the top-K reference is
+        computed once at fit() from y_tr and does NOT slide on val rows or
+        across recursive forecasting steps.
+
+    Detection uses SIGNED skew (not abs) so the family targets the heavy RIGHT
+    tail (whale groups); left-skewed distributions are skipped.
+
+    Leak safety:
+      - Train rows: inner-KFold over the training frame; each row's three
+        encodings are computed using only OTHER inner folds' rows. The
+        peer-group-mean further excludes the row's own group from the peer
+        aggregate, so a train row's encoded value depends on no row that
+        shares either its inner-fold OR its group_id.
+      - Val / unseen rows: full fit-fold lookup table.
+      - Recursive forecasting: production pipeline is fit on full train; the
+        lookups are keyed on the unchanging group column and are bit-identical
+        across every recursive step (the 3 features are
+        constant-within-(group, fold) by construction).
+
+    Train vs val rows are distinguished by index-identity (length + value
+    equality of ``self._train_index_``) — same convention as ``TargetEncoderCV``.
+    The encoder is fit AFTER ``FoldImputer`` (which preserves the index via
+    ``DataFrame.copy()``) and BEFORE ``TargetEncoderCV`` (which drops the source
+    group columns on the Ridge path), so the identity round-trip holds.
+
+    The encoder is a strict no-op when no candidate column qualifies (returns
+    X unchanged), making it safe to enable on arbitrary datasets.
+    """
+
+    _summary_logged = False  # class-level — print qualifying cols once per process
+
+    def __init__(self,
+                 targets: Optional[list[str]] = None,
+                 min_cardinality: int = 20,
+                 skew_threshold: float = 1.0,
+                 top_k: int = 3,
+                 inner_folds: int = 5,
+                 random_state: int = 42):
+        self.targets         = list(targets or [])
+        self.min_cardinality = min_cardinality
+        self.skew_threshold  = skew_threshold
+        self.top_k           = top_k
+        self.inner_folds     = inner_folds
+        self.random_state    = random_state
+
+    @staticmethod
+    def _signed_skew(values: np.ndarray) -> float:
+        """Fisher–Pearson moment skewness; signed (positive = right tail)."""
+        v = np.asarray(values, dtype=float)
+        v = v[~np.isnan(v)]
+        if v.size < 3:
+            return 0.0
+        if _scipy_skew is not None:
+            try:
+                return float(_scipy_skew(v))
+            except Exception:
+                pass
+        m = v.mean()
+        s = v.std(ddof=0)
+        if s == 0.0:
+            return 0.0
+        return float(np.mean(((v - m) / s) ** 3))
+
+    def fit(self, X: pd.DataFrame, y):
+        if y is None:
+            raise ValueError("GroupRelationalEncoder.fit requires y.")
+        y_arr = np.asarray(y, dtype=float)
+        n = len(X)
+        self.global_mean_y_ = float(np.nanmean(y_arr)) if y_arr.size else 0.0
+
+        candidate_cols = [c for c in self.targets if c in X.columns]
+
+        self.qualifying_cols_:    list[str]              = []
+        self.full_rank_:          dict[str, pd.Series]   = {}
+        self.full_peer_mean_:     dict[str, pd.Series]   = {}
+        self.full_gap_top_:       dict[str, pd.Series]   = {}
+        self.global_mean_rank_:   dict[str, float]       = {}
+        self._train_oof_:         dict[str, dict[str, np.ndarray]] = {}
+        self._detection_log_:     list[dict]             = []
+
+        for col in candidate_cols:
+            cats_full = X[col].astype("object").fillna("__NA__")
+            n_unique  = int(cats_full.nunique())
+            log_entry = {"col": col, "n_unique": n_unique, "skew": None,
+                         "qualifies": False, "reason": ""}
+            if n_unique < self.min_cardinality:
+                log_entry["reason"] = (
+                    f"cardinality {n_unique} < {self.min_cardinality}"
+                )
+                self._detection_log_.append(log_entry)
+                continue
+            gm_full = pd.Series(y_arr).groupby(cats_full.values).mean()
+            gm_clean = gm_full.dropna()
+            if gm_clean.size < 3:
+                log_entry["reason"] = f"only {gm_clean.size} non-NaN group means"
+                self._detection_log_.append(log_entry)
+                continue
+            sk = self._signed_skew(gm_clean.values)
+            log_entry["skew"] = round(sk, 3)
+            if sk < self.skew_threshold:
+                log_entry["reason"] = (
+                    f"signed skew {sk:.2f} < {self.skew_threshold} "
+                    f"(left-tailed or symmetric)"
+                )
+                self._detection_log_.append(log_entry)
+                continue
+
+            # ── full-fold lookups (val rows + recursive forecasting) ──────
+            rank_full = gm_full.rank(method="dense", ascending=False)
+            if len(gm_full) >= 2:
+                peer_full = (gm_full.sum() - gm_full) / (len(gm_full) - 1)
+            else:
+                peer_full = pd.Series([self.global_mean_y_],
+                                      index=gm_full.index)
+            top_k_eff = min(self.top_k, len(gm_full))
+            top_k_mean_full = float(gm_full.nlargest(top_k_eff).mean())
+            gap_full = gm_full - top_k_mean_full
+
+            self.qualifying_cols_.append(col)
+            self.full_rank_[col]        = rank_full
+            self.full_peer_mean_[col]   = peer_full
+            self.full_gap_top_[col]     = gap_full
+            self.global_mean_rank_[col] = float(rank_full.mean())
+            log_entry["qualifies"] = True
+            log_entry["reason"]    = "passed cardinality + heavy-right-tail"
+            self._detection_log_.append(log_entry)
+
+            # ── inner-KFold OOF for train rows ────────────────────────────
+            # Per-row encoding uses only OTHER inner folds' rows; peer_mean
+            # additionally excludes the row's own group from the aggregate.
+            oof_rank = np.full(n, self.global_mean_rank_[col], dtype=float)
+            oof_peer = np.full(n, self.global_mean_y_,         dtype=float)
+            oof_gap  = np.full(n, 0.0,                          dtype=float)
+
+            if self.inner_folds >= 2 and n >= self.inner_folds:
+                kf = KFold(n_splits=self.inner_folds, shuffle=True,
+                           random_state=self.random_state)
+                cats_arr = cats_full.values
+                for tr_idx, va_idx in kf.split(np.arange(n)):
+                    # Group means on inner-train rows ONLY — peer-mean below
+                    # then excludes each row's own group from those means, so
+                    # the va row's encoding depends on neither its own inner
+                    # fold NOR its own group_id.
+                    inner_gm = pd.Series(y_arr[tr_idx]).groupby(
+                        cats_arr[tr_idx]
+                    ).mean()
+                    if inner_gm.dropna().size == 0:
+                        continue
+                    inner_rank = inner_gm.rank(method="dense", ascending=False)
+                    if len(inner_gm) >= 2:
+                        # peer = (sum_all_other_groups) / (n_other_groups)
+                        inner_peer = (
+                            (inner_gm.sum() - inner_gm) / (len(inner_gm) - 1)
+                        )
+                    else:
+                        inner_peer = pd.Series([self.global_mean_y_],
+                                               index=inner_gm.index)
+                    inner_top_k_eff  = min(self.top_k, len(inner_gm))
+                    inner_top_k_mean = float(inner_gm.nlargest(inner_top_k_eff).mean())
+                    inner_gap = inner_gm - inner_top_k_mean
+
+                    va_cats = pd.Series(cats_arr[va_idx])
+                    fallback_rank = float(inner_rank.mean())
+                    oof_rank[va_idx] = va_cats.map(inner_rank).fillna(
+                        fallback_rank
+                    ).values
+                    oof_peer[va_idx] = va_cats.map(inner_peer).fillna(
+                        self.global_mean_y_
+                    ).values
+                    oof_gap[va_idx]  = va_cats.map(inner_gap).fillna(0.0).values
+
+            self._train_oof_[col] = {
+                "group_target_rank": oof_rank,
+                "peer_group_mean":   oof_peer,
+                "gap_to_top_groups": oof_gap,
+            }
+
+        self._train_index_ = X.index
+
+        if not GroupRelationalEncoder._summary_logged:
+            qualifying = [
+                f"{e['col']}:n={e['n_unique']},skew={e['skew']:+.2f}"
+                for e in self._detection_log_ if e["qualifies"]
+            ]
+            skipped = [
+                f"{e['col']} ({e['reason']})"
+                for e in self._detection_log_ if not e["qualifies"]
+            ]
+            print(
+                f"GroupRelationalEncoder: qualifying={qualifying or 'NONE (no-op)'} "
+                f"skipped={skipped or 'NONE'} "
+                f"(min_card={self.min_cardinality}, skew_threshold>="
+                f"{self.skew_threshold}, top_k={self.top_k}, "
+                f"inner_folds={self.inner_folds})"
+            )
+            GroupRelationalEncoder._summary_logged = True
+
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        out = X.copy()
+        if not getattr(self, "qualifying_cols_", []):
+            return out
+        is_train_frame = (
+            len(out) == len(self._train_index_)
+            and out.index.equals(self._train_index_)
+        )
+        for col in self.qualifying_cols_:
+            if col not in out.columns:
+                # group column was dropped upstream — emit fallback scalars
+                for feat_name in ("group_target_rank", "peer_group_mean",
+                                  "gap_to_top_groups"):
+                    out[f"{feat_name}_{col}"] = (
+                        self.global_mean_rank_[col] if feat_name == "group_target_rank"
+                        else self.global_mean_y_   if feat_name == "peer_group_mean"
+                        else 0.0
+                    )
+                continue
+            cats = out[col].astype("object").fillna("__NA__")
+            specs = [
+                ("group_target_rank", self.full_rank_[col],
+                 self.global_mean_rank_[col]),
+                ("peer_group_mean",   self.full_peer_mean_[col],
+                 self.global_mean_y_),
+                ("gap_to_top_groups", self.full_gap_top_[col],
+                 0.0),
+            ]
+            for feat_name, full_lookup, fallback in specs:
+                out_col = f"{feat_name}_{col}"
+                if is_train_frame:
+                    out[out_col] = self._train_oof_[col][feat_name]
+                else:
+                    out[out_col] = cats.map(full_lookup).fillna(fallback).values
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 3 — TargetEncoderCV (smoothed KFold target encoder)
 # ─────────────────────────────────────────────────────────────────────────────
 class TargetEncoderCV(BaseEstimator, TransformerMixin):
@@ -271,6 +529,7 @@ def build_pipeline(
     scale_targets:         list[str] = []
     target_encode_targets: list[str] = []
     target_encode_smooth:  float     = 10.0
+    group_relational_step: Optional[dict] = None
 
     for step in adaptive_steps:
         nm = step.get("name")
@@ -282,6 +541,8 @@ def build_pipeline(
         elif nm == "target_encode":
             target_encode_targets = list(step.get("targets", []))
             target_encode_smooth  = float(step.get("smoothing", 10.0))
+        elif nm == "group_relational":
+            group_relational_step = step
 
     steps: list[tuple[str, BaseEstimator]] = []
 
@@ -289,6 +550,22 @@ def build_pipeline(
         steps.append((
             "impute",
             FoldImputer(strategy=impute_strategy, targets=impute_targets),
+        ))
+
+    # GroupRelationalEncoder runs AFTER FoldImputer (which preserves the index
+    # for train-frame identity detection) and BEFORE TargetEncoderCV (which
+    # drops the source group columns on the Ridge path).
+    if group_relational_step is not None and group_relational_step.get("targets"):
+        steps.append((
+            "group_relational",
+            GroupRelationalEncoder(
+                targets=list(group_relational_step.get("targets", [])),
+                min_cardinality=int(group_relational_step.get("min_cardinality", 20)),
+                skew_threshold=float(group_relational_step.get("skew_threshold", 1.0)),
+                top_k=int(group_relational_step.get("top_k", 3)),
+                inner_folds=int(group_relational_step.get("inner_folds", 5)),
+                random_state=int(group_relational_step.get("random_state", 42)),
+            ),
         ))
 
     if for_model == "ridge":

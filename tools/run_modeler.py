@@ -65,6 +65,20 @@ if __name__ == "__main__":
              "force the named transform and skip the A/B (manual override).",
     )
     parser.add_argument(
+        "--group-relational",
+        choices=["on", "off"],
+        default="off",
+        help="Adaptive group-relational feature family (3 features per "
+             "qualifying high-cardinality + heavy-right-tail group column: "
+             "group_target_rank, peer_group_mean, gap_to_top_groups). Fit per "
+             "fold inside the modeler with inner-KFold OOF on train rows and "
+             "full-fold lookup on val/recursion rows. 'off' (default) "
+             "preserves the baseline; 'on' injects a 'group_relational' step "
+             "into adaptive_steps at runtime. Detection rule is data-driven "
+             "(n_unique >= 20 AND signed skew(group_means_y) >= 1.0); no-op "
+             "if no column qualifies.",
+    )
+    parser.add_argument(
         "--tune-mode",
         choices=["per_fold", "once"],
         default="once",
@@ -80,10 +94,12 @@ if __name__ == "__main__":
     DEBUG = _cli_args.debug
     TRANSFORM_REQUEST = _cli_args.transform
     TUNE_MODE = _cli_args.tune_mode
+    GROUP_RELATIONAL = _cli_args.group_relational
 
     if DEBUG:
         print("*** DEBUG MODE — reduced compute; OOF is NOT a valid score ***")
     print(f"*** TUNE MODE: {TUNE_MODE} ***")
+    print(f"*** GROUP RELATIONAL: {GROUP_RELATIONAL} ***")
 
     # Compute knobs gated by --debug. Default OFF = current full behavior.
     DEFAULT_ITERS          = 200 if DEBUG else 400
@@ -123,7 +139,7 @@ if __name__ == "__main__":
     group_cols = feat_meta["group_cols"]
     time_col   = feat_meta["time_col"]
 
-    adaptive_steps  = config.get("adaptive_steps", [])
+    adaptive_steps  = list(config.get("adaptive_steps", []))
     model_settings  = config.get("model_settings", {})
     cb_objective    = model_settings.get("objective", "MAE")
 
@@ -131,6 +147,22 @@ if __name__ == "__main__":
     # raw CatBoost loss name ("MAE", "RMSE", "Huber:delta=1.0") or "MAE"/"RMSE".
     _cb_loss        = cb_objective
     _cb_eval_metric = "MAE" if cb_objective.startswith("MAE") else cb_objective.split(":")[0]
+
+    # Runtime-inject the group_relational step when the flag is on. Candidates
+    # are the panel group columns; the encoder's own data-driven detection rule
+    # (cardinality + signed skew) decides which of them actually qualify and is
+    # a no-op if none do. Keep pipeline_config.json baseline-clean.
+    if GROUP_RELATIONAL == "on" and group_cols:
+        adaptive_steps.append({
+            "name":            "group_relational",
+            "targets":         list(group_cols),
+            "min_cardinality": 20,
+            "skew_threshold":  1.0,
+            "top_k":           3,
+            "inner_folds":     5,
+            "random_state":    42,
+        })
+        print(f"GroupRelational candidates: {list(group_cols)}")
 
     print(f"Problem type: {problem_type} / {problem_subtype}")
     print(f"Target: {target_col}   Groups: {group_cols}   Time: {time_col}")
@@ -1490,6 +1522,15 @@ if __name__ == "__main__":
         "tune_mode":                TUNE_MODE,
         "tune_once_params":         tune_once_params,
         "tune_once_n_trials":       int(tune_once_n_trials),
+        "group_relational": {
+            "mode":            GROUP_RELATIONAL,
+            "qualifying_cols": (
+                list(production_bp_cat.pipeline.named_steps["group_relational"].qualifying_cols_)
+                if (GROUP_RELATIONAL == "on"
+                    and "group_relational" in production_bp_cat.pipeline.named_steps)
+                else []
+            ),
+        },
         "oof_scoring_note":         (
             "OOF scored with shared fixed params from a single up-front "
             "Optuna study run on full-train N_INNER_FOLDS-panel-purged "
