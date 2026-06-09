@@ -64,12 +64,28 @@ if __name__ == "__main__":
              "raw scored MAE on the WF probe split. 'none'/'log1p'/'sqrt' "
              "force the named transform and skip the A/B (manual override).",
     )
+    parser.add_argument(
+        "--tune-mode",
+        choices=["per_fold", "once"],
+        default="per_fold",
+        help="Hyperparameter tuning scope. 'per_fold' (default, current behavior): "
+             "fresh Optuna study per outer fold on its outer-train inner CV "
+             "(N_OUTER × OPTUNA_N_TRIALS × N_INNER_FOLDS inner CatBoost fits). "
+             "'once': single Optuna study run BEFORE the outer loop on a full-train "
+             "N_INNER_FOLDS-panel-purged inner CV; the picked params apply to every "
+             "outer fold's final fit (per-fold weights still independent — only "
+             "the hyperparameter SEARCH is shared, never weights or pipeline "
+             "statistics). Use --tune-mode once for an A/B against the default "
+             "before switching. Default stays per_fold until A/B passes.",
+    )
     _cli_args = parser.parse_args()
     DEBUG = _cli_args.debug
     TRANSFORM_REQUEST = _cli_args.transform
+    TUNE_MODE = _cli_args.tune_mode
 
     if DEBUG:
         print("*** DEBUG MODE — reduced compute; OOF is NOT a valid score ***")
+    print(f"*** TUNE MODE: {TUNE_MODE} ***")
 
     # Compute knobs gated by --debug. Default OFF = current full behavior.
     DEFAULT_ITERS          = 200 if DEBUG else 400
@@ -664,6 +680,51 @@ if __name__ == "__main__":
 
     TUNING_DEADLINE = start_time + TUNING_BUDGET_SECONDS  # cap on the nested-CV phase
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 7a — TUNE-ONCE up-front Optuna (only when --tune-mode once)
+    #
+    # Runs ONE Optuna study on the FULL training data using N_INNER_FOLDS
+    # panel-purged inner splits BEFORE the outer-fold loop. The resulting
+    # tune_once_params is then applied to every outer fold's final CatBoost
+    # fit; the per-fold inner-Optuna search is skipped. Folds remain
+    # independent fits — only the hyperparameter SEARCH is shared, never
+    # weights, pipeline statistics, or rows. The inner splits use the same
+    # _panel_purged_splits machinery with EMBARGO_PERIODS=2 the outer scheme
+    # uses, so each inner-val window is strictly later than its inner-train
+    # window with a 2-period embargo — tuning never peeks across the boundary.
+    # ─────────────────────────────────────────────────────────────────────────
+    tune_once_params   = None
+    tune_once_n_trials = 0
+    if TUNE_MODE == "once":
+        _tune_once_inner_splits = build_inner_splits(train_df)
+        _tune_once_inner_splits_pos = [
+            (np.asarray(tr, dtype=int), np.asarray(va, dtype=int))
+            for tr, va in _tune_once_inner_splits
+        ]
+        _tune_once_objective = _cb_objective_factory(
+            train_df[all_feature_cols].reset_index(drop=True),
+            y_full, _adv_weights, _tune_once_inner_splits_pos,
+            train_scored_mask,
+        )
+        _tune_once_study   = optuna.create_study(direction="minimize")
+        _tune_once_timeout = None if DEBUG else TUNING_BUDGET_SECONDS
+        print(f"Tune-once: starting single Optuna study "
+              f"(n_trials={OPTUNA_N_TRIALS}, timeout={_tune_once_timeout}s) on "
+              f"full-train {len(_tune_once_inner_splits_pos)}-fold panel-purged "
+              f"inner CV")
+        _tune_once_study.optimize(
+            _tune_once_objective, n_trials=OPTUNA_N_TRIALS,
+            timeout=_tune_once_timeout, catch=(Exception,),
+        )
+        tune_once_params = (_tune_once_study.best_params
+                            if _tune_once_study.best_trial is not None else {})
+        tune_once_n_trials = len(_tune_once_study.trials)
+        _tune_once_best_val = (_tune_once_study.best_value
+                               if _tune_once_study.best_trial is not None
+                               else float("inf"))
+        print(f"Tune-once: {tune_once_n_trials} trials done, best inner MAE = "
+              f"{_tune_once_best_val:.4f}  params={tune_once_params}")
+
     for of_i, (outer_tr_idx, outer_va_idx) in enumerate(outer_splits):
         # HEARTBEAT — printed at the START of every fold (debug AND full modes),
         # BEFORE Optuna search. Fires for budget-exceeded folds too — those still
@@ -685,7 +746,14 @@ if __name__ == "__main__":
         sw_outer_tr   = _adv_weights[outer_tr_idx] if _adv_weights is not None else None
         outer_fold_sizes.append(len(outer_tr_idx))
 
-        if budget_exceeded:
+        if TUNE_MODE == "once":
+            # Single up-front tune produced tune_once_params; apply across folds.
+            # Per-fold inner-Optuna is skipped; this fold's CatBoost still fits
+            # only on its outer-train slice — only best_params (config) is shared.
+            best_params = tune_once_params if tune_once_params is not None else {}
+            print(f"  Outer fold {of_i}: tune-once mode — applying shared "
+                  f"params {best_params} (no per-fold Optuna)")
+        elif budget_exceeded:
             print(f"  Outer fold {of_i}: tuning budget exceeded — fitting CatBoost "
                   f"with default hparams (no Optuna), still scoring fold")
             best_params = {}
@@ -810,8 +878,14 @@ if __name__ == "__main__":
         return agg
 
 
+    # Under --tune-mode once, the per-fold loop ran zero inner Optuna studies;
+    # the up-front study's trial count is the only Optuna work in this run.
+    # Surface it in the same reporting field downstream consumers already read.
+    if TUNE_MODE == "once":
+        total_optuna_trials = tune_once_n_trials
+
     final_hparams = _aggregate_params(outer_fold_best_params)
-    print(f"Final aggregated hyperparameters: {final_hparams}")
+    print(f"Final aggregated hyperparameters: {final_hparams}  (tune_mode={TUNE_MODE})")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Step 8 — Walk-forward 80/20 holdout (for n_estimators probe + Ridge baseline)
@@ -1415,6 +1489,20 @@ if __name__ == "__main__":
         "training_time_seconds":    training_time,
         "optuna_trials_completed":  total_optuna_trials,
         "optuna_succeeded":         total_optuna_trials > 0,
+        "tune_mode":                TUNE_MODE,
+        "tune_once_params":         tune_once_params,
+        "tune_once_n_trials":       int(tune_once_n_trials),
+        "oof_scoring_note":         (
+            "OOF scored with shared fixed params from a single up-front "
+            "Optuna study run on full-train N_INNER_FOLDS-panel-purged "
+            "inner CV; each outer fold's CatBoost still fits only on its "
+            "outer-train slice (per-fold weights independent — only "
+            "hyperparameters shared)."
+            if TUNE_MODE == "once" else
+            "OOF scored with per-fold-tuned params (one Optuna study per "
+            "outer fold on its outer-train inner CV); per-fold weights and "
+            "hyperparameters both independent."
+        ),
         "val_prediction_stats": {
             "min":  float(ensemble_preds.min()),
             "max":  float(ensemble_preds.max()),
