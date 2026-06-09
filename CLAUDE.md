@@ -167,8 +167,11 @@ deliberate orchestrator action between agent dispatches.
 once at Step 0 and never modified.
 
 **Enforcement this record powers** (each replacing a previously
-heuristic-only check; documented for clarity, not yet wired through all
-agent contracts — see "Remaining contract work" at the bottom):
+heuristic-only check; the strict path is now wired through every downstream
+agent contract — validator, critic, submission_writer, report_writer all
+read `pipeline_run.json` directly in their precondition gates and BLOCK on
+mismatch; the orchestrator-side Step 3.x verify gates re-run the check
+independently):
 
 | Concern | Old fallback | Strict enforcement via pipeline_run.json |
 |---|---|---|
@@ -185,7 +188,7 @@ agent contracts — see "Remaining contract work" at the bottom):
 | modeler | `reports/oof_predictions.csv` | validator, critic | exists, non-empty |
 | modeler | `reports/modeler_was_here.txt` | orchestrator | exists, `mtime > dispatch_time` |
 | modeler | `reports/modeler_completion.json` | validator, orchestrator | exists, `status == "ok"` |
-| orchestrator | `reports/pipeline_run.json` | critic, submission_writer, report_writer | exists (created at Step 0); critic + writers compare upstream `modeler_run_id` against `current_modeler_run_id`; critic also reads `session_start_epoch` for the budget guard and `critic_cycle` for the cycle counter |
+| orchestrator | `reports/pipeline_run.json` | validator, critic, submission_writer, report_writer | exists (created at Step 0); every downstream agent compares its upstream `modeler_run_id` against `current_modeler_run_id` in Step 1 and BLOCKs on mismatch; critic also reads `session_start_epoch` for the budget guard and `critic_cycle` for the cycle counter |
 
 The validator's precondition is the full set of modeler artifacts above
 (`status == "ok"` plus the four named files). Verbal-only handoffs are NOT
@@ -336,9 +339,10 @@ record:** read `modeler_completion.json["modeler_run_id"]` and write it into
 `reports/pipeline_run.json["current_modeler_run_id"]`. This is the orchestrator's
 job; it applies to BOTH the initial Step 3 dispatch and any Step 3.6 retune
 re-dispatch — the field always tracks the latest modeler pass. After this
-update, the downstream validator / submission_writer / report_writer
-freshness checks fire against `current_modeler_run_id` (their agent
-contracts now consume the field).
+update, the downstream validator / critic / submission_writer /
+report_writer freshness checks all fire against `current_modeler_run_id`
+in their own Step 1 precondition gates AND at the orchestrator-side Step
+3.x verify gates — every downstream agent contract consumes the field.
 
 ```python
 import json
@@ -822,11 +826,16 @@ transparency, beyond the minimum competition requirements.
 
 ## Remaining contract work
 
-The orchestrator-side gates, the `pipeline_run.json` run-state record, and
-the `modeler_run_id` propagation chain through every completion record are
-all now in place end-to-end. The strict freshness check fires throughout.
-One documented future option remains, gated on coordinated tool +
-orchestrator changes.
+The orchestrator-side gates, the `pipeline_run.json` run-state record, the
+`modeler_run_id` propagation chain through every completion record, AND the
+agent-side strict freshness check in every downstream precondition gate
+(validator → critic → submission_writer → report_writer) are all in place
+end-to-end. Each downstream agent reads `pipeline_run.json` directly,
+compares its upstream `modeler_run_id` against `current_modeler_run_id`,
+and BLOCKs on mismatch — no time-window or mtime heuristic remains in any
+active freshness path. The orchestrator-side Step 3.x verify gates re-run
+the same check independently as defense in depth. One documented future
+option remains, gated on coordinated tool + orchestrator changes.
 
 ### Future option (NOT a known drift) — raise the retune cap to 2
 
