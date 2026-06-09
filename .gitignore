@@ -51,7 +51,15 @@ tools/run_modeler_v3.py
 _sweep_runner.py
 _sweep_results.json
 _data_backup_sweep/
+_archive_features
+unused_main_arch
+practice_data_archive_features
+_tmp_mi__data
+oof_per_seed_FULL_20260608_185001.csv
 transform_bias_diagnositic.py
 recent_vs_full_adv.py
 recent_vs_full_dist.py
 scored_mae
+drugs_diagnostics
+
+.claude/*.lock
