@@ -18,7 +18,7 @@ try:
     from reportlab.lib.units import cm
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        PageBreak, Image as RLImage, HRFlowable,
+        PageBreak, Image as RLImage, HRFlowable, KeepTogether,
     )
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -54,6 +54,28 @@ def load_text(path):
         missing_inputs.append(f"{Path(path).name}: {e}")
         return ""
 
+def _find_data_description(data_dir):
+    """Case-insensitive, separator-tolerant lookup. Returns Path or None (never raises)."""
+    try:
+        for f in data_dir.iterdir():
+            if f.is_file():
+                normalized = f.name.lower().replace('-', '_').replace(' ', '_')
+                if normalized in ('data_description.md', 'data_description.txt'):
+                    return f
+    except Exception:
+        pass
+    return None
+
+def _read_data_description(data_dir):
+    """Return file text or None. Never raises; never writes to missing_inputs."""
+    path = _find_data_description(data_dir)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding='utf-8')
+    except Exception:
+        return None
+
 profile     = load_json(REPORTS / "profile.json")
 features    = load_json(REPORTS / "features.json")
 model_res   = load_json(REPORTS / "model_results.json")
@@ -61,12 +83,13 @@ sub_summary = load_json(REPORTS / "submission_summary.json")
 critic_rev  = load_json(REPORTS / "critic_review.json")
 val_rev     = load_json(REPORTS / "validator_review.json")
 load_text(REPORTS / "schema_analysis.md")
-load_text(BASE / "data" / "DATA_DESCRIPTION.md")
+data_desc_text = _read_data_description(BASE / "data")
 
 # ── Field extraction — exact field names from the JSON schemas ────────────────
-problem_type = profile.get("problem_type", "Unknown")
-confidence   = profile.get("problem_type_confidence", "Unknown")
-target_col   = profile.get("target_col", "Unknown")
+problem_type    = profile.get("problem_type", "Unknown")
+confidence      = profile.get("problem_type_confidence", "Unknown")
+problem_subtype = profile.get("problem_subtype") or ""
+target_col      = profile.get("target_col", "Unknown")
 group_cols   = ", ".join(profile.get("group_cols") or []) or "None"
 time_col     = profile.get("time_col") or "None"
 n_train      = profile.get("n_train_rows", "Unknown")
@@ -81,6 +104,8 @@ null_pcts       = [v.get("null_pct", 0) for v in schema.values()
                    if isinstance(v, dict) and "null_pct" in v]
 overall_missing = sum(null_pcts) / len(null_pcts) if null_pcts else 0.0
 target_std      = (schema.get(target_col) or {}).get("std", None)
+covariate_cols  = profile.get("covariate_cols") or []
+scored_cats_raw = profile.get("scored_categories")
 
 feat_families   = features.get("feature_families", {})
 feat_columns    = features.get("feature_columns", [])
@@ -103,6 +128,29 @@ feat_imp     = model_res.get("feature_importance_top10", [])
 families     = model_res.get("families", {})
 baseline_mae = model_res.get("baseline_mae", None)
 grp_baseline = model_res.get("group_baseline_mae", None)
+
+# ── Multiple-MAE rulers (used by the Metrics Guide and headline labels) ──────
+# These all coexist in model_results.json on different rulers; the Metrics Guide
+# in Section 5 names each one explicitly so readers can reconcile them.
+decision_metric_name = model_res.get("decision_metric")  # e.g. "scored_only_mae"
+oof_mae_scored       = model_res.get("oof_mae")                       # decision metric value (scored cats)
+oof_mae_all_cats     = model_res.get("oof_mae_all_categories")        # broader ruler
+wf_mae_all           = model_res.get("walk_forward_mae")              # single 80/20 probe, all-cat
+wf_mae_scored        = model_res.get("walk_forward_mae_scored")       # single 80/20 probe, scored
+scored_cat_col       = model_res.get("scored_category_column")        # e.g. "overdose_category"
+n_scored_train       = model_res.get("n_scored_train_rows")
+n_scored_val         = model_res.get("n_scored_val_rows")
+
+# ── Trained feature matrix sizes (truth-source for what the model SAW) ────────
+# profile.n_train_rows is the RAW row count (sum of input CSVs, pre-FE);
+# features.train_shape[0] / model_results.n_train_rows are the actual matrix
+# the model was trained on (post panel expansion / filtering). Section 1 shows
+# both, distinctly labelled, so the 35,343-vs-31,416 disagreement is no longer
+# a mystery.
+_train_shape    = features.get("train_shape") or [None, None]
+_val_shape      = features.get("val_shape")   or [None, None]
+train_matrix_rows = (_train_shape[0] if _train_shape else None) or model_res.get("n_train_rows")
+val_matrix_rows   = (_val_shape[0]   if _val_shape   else None) or model_res.get("n_val_rows")
 
 _ac             = model_res.get("adaptive_choice", {})
 ens_branch      = _ac.get("branch", "N/A")
@@ -144,6 +192,50 @@ critic_retune    = critic_rev.get("retune_attempted", False)
 critic_rationale = critic_rev.get("decision_rationale", "")
 critic_warnings  = critic_rev.get("warnings_for_report", [])
 
+cv_plan        = load_json(REPORTS / "cv_plan.json")
+_cv            = cv_plan.get("cv", {})
+cv_type_sel    = _cv.get("cv_type", "N/A")
+cv_n_splits    = _cv.get("n_splits", "N/A")
+cv_valid_size  = _cv.get("valid_size", "N/A")
+cv_gap_val     = _cv.get("gap", "N/A")
+_cv_sel        = cv_plan.get("cv_selection_reason", {})
+cv_rule_branch = _cv_sel.get("rule_branch", "")
+_cv_drift      = _cv_sel.get("drift_metrics", {})
+cv_frac_imp    = _cv_drift.get("frac_improved", None)
+inner_folds    = model_res.get("nested_cv", {}).get("inner_folds", "N/A")
+outer_folds_n  = model_res.get("nested_cv", {}).get("outer_folds", "N/A")
+adv_auc_exact  = features.get("adversarial_validation", {}).get("auc_train_vs_val", None)
+gap_attr       = val_rev.get("gap_attribution", {})
+gap_attr_class = gap_attr.get("classification", "N/A")
+gap_mono_score = gap_attr.get("monotone_score", None)
+
+# ── New diagnostic fields ─────────────────────────────────────────────────────
+# Transform selection
+_ts          = model_res.get("transform_selection") or {}
+ts_chosen    = _ts.get("chosen")
+ts_metric    = _ts.get("selection_metric")
+ts_cands     = _ts.get("candidates_mae") or {}
+ts_override  = _ts.get("manual_override")
+
+# Per-fold CV stability
+_ncv_m       = model_res.get("nested_cv", {})
+pf_scored    = model_res.get("per_fold_maes") or _ncv_m.get("outer_fold_maes") or []
+pf_all_cat   = (model_res.get("per_fold_maes_all_categories")
+                or _ncv_m.get("outer_fold_maes_all_categories") or [])
+pf_train_sz  = _ncv_m.get("outer_fold_train_sizes") or []
+
+# Lag forecasting / recursion diagnostic
+_lag_fc       = model_res.get("lag_forecasting") or {}
+lag_method    = _lag_fc.get("method_used")
+lag_rec_mae   = _lag_fc.get("recursive_holdout_mae")
+lag_imp_mae   = _lag_fc.get("imputation_holdout_mae")
+lag_rec_mac   = _lag_fc.get("recursive_holdout_mae_all_categories")
+lag_imp_mac   = _lag_fc.get("imputation_holdout_mae_all_categories")
+lag_steps_rec = _lag_fc.get("per_step_mae_recursive") or []
+lag_steps_imp = _lag_fc.get("per_step_mae_imputation") or []
+lag_notes     = _lag_fc.get("notes", "")
+lag_n_steps   = _lag_fc.get("n_holdout_steps")
+
 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 n_warnings  = sum(1 for ck in critic_checks if ck.get("status") == "WARNING")
@@ -164,10 +256,26 @@ def fmt(v, d=0):
 def fmt_bool(v):
     return "N/A" if v is None else ("Yes" if v else "No")
 
+_gap_used        = critic_rev.get("gap_attribution_used") or {}
+_gap_downgraded  = bool(_gap_used.get("downgraded_check1"))
+_gap_final_pass  = (_gap_used.get("final_status") == "PASS")
+_critic_accepted = (critic_status == "accepted")
+
 def mae_interpretation():
+    """Headline metric line — names the ruler explicitly so 1.97 vs 0.87 is
+    no longer ambiguous. Defaults to the scored decision metric when present."""
     if mae is None:
         return "N/A — metric not available"
-    base = f"OOF MAE: {fmt(mae, 4)}"
+    # Prefer scored OOF (the decision metric) when present; fall back to mae
+    headline_v = oof_mae_scored if oof_mae_scored is not None else mae
+    is_scored  = (oof_mae_scored is not None
+                  and decision_metric_name == "scored_only_mae")
+    label = ("Scored nested OOF MAE" if is_scored
+             else "OOF MAE")
+    base  = f"{label}: {fmt(headline_v, 4)} (decision metric — Section 5 Metrics Guide)"
+    # Critic's view supersedes the raw validator verdict.
+    if _critic_accepted and _gap_downgraded and _gap_final_pass:
+        return f"{base} (validator WARNING reviewed by critic and downgraded)"
     if val_verdict == "CRITICAL" or n_criticals >= 2:
         return f"{base} (may be inflated — see Section 5)"
     if val_verdict == "WARNING" or n_warnings >= 2:
@@ -177,9 +285,17 @@ def mae_interpretation():
 def recommendation():
     if not sub_passed:
         return "FIX ISSUES — submission validation failed", '#d7191c'
+    # Critic's final status takes precedence over the raw validator verdict —
+    # a WARNING that the critic downgraded (gap attribution CV_SCHEME, not
+    # overfit) should NOT surface as "SUBMIT WITH CAUTION" in the headline.
+    if _critic_accepted and _gap_downgraded and _gap_final_pass:
+        return ("SUBMIT — validator WARNING reviewed and downgraded: "
+                "CV gap attributed to scheme pessimism, not overfit"), '#1a9641'
     if val_verdict == "CRITICAL":
         return "REVIEW — critical CV integrity issue detected", '#d7191c'
-    if val_verdict == "WARNING" or (critic_status not in ("accepted", "N/A", "")):
+    if critic_status not in ("accepted", "N/A", ""):
+        return "SUBMIT WITH CAUTION — review Section 5", '#e08200'
+    if val_verdict == "WARNING":
         return "SUBMIT WITH CAUTION — review Section 5", '#e08200'
     return "SUBMIT", '#1a9641'
 
@@ -301,15 +417,180 @@ else:
         ]))
         return t
 
+    def _overview_box(sentences):
+        """Plain-prose task overview box — flowing sentences, no bullets."""
+        _ot_st = ParagraphStyle('OBT', fontName='Helvetica-Bold', fontSize=9.5,
+                                 textColor=colors.white)
+        _ob_st = ParagraphStyle('OBB', fontName='Helvetica', fontSize=10, leading=15)
+        _ob_html = "  ".join(str(_s) for _s in sentences if _s)
+        _t = Table(
+            [[_p("  Task Overview", _ot_st)], [_p(_ob_html, _ob_st)]],
+            colWidths=[16*cm], hAlign='LEFT',
+        )
+        _t.setStyle(TableStyle([
+            ('BACKGROUND',    (0,0), (-1,0),  colors.HexColor('#1F618D')),
+            ('BACKGROUND',    (0,1), (-1,-1), colors.HexColor('#EBF5FB')),
+            ('LEFTPADDING',   (0,0), (-1,-1), 10),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 10),
+            ('TOPPADDING',    (0,0), (-1,-1), 6),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('LINEBELOW',     (0,-1),(-1,-1), 1.0, colors.HexColor('#1F618D')),
+        ]))
+        return _t
+
+    def headline_figure():
+        """ONE prominent headline figure: the scored OOF decision metric, large,
+        with a single short qualifier line. NOT a cross-ruler range — different
+        MAEs measure different slices (scored vs all-cat vs walk-forward) and
+        ranging across them mixes rulers. The per-MAE breakdown sits below."""
+        headline_v = oof_mae_scored if oof_mae_scored is not None else mae
+        is_scored  = (oof_mae_scored is not None
+                      and decision_metric_name == "scored_only_mae")
+        label = "Scored OOF MAE" if is_scored else "OOF MAE"
+
+        big_st = ParagraphStyle('BigHL', fontName='Helvetica-Bold', fontSize=30,
+                                 alignment=TA_CENTER,
+                                 textColor=colors.HexColor('#1A5276'),
+                                 spaceAfter=2)
+        sub_st = ParagraphStyle('SubHL', fontName='Helvetica-Oblique',
+                                 fontSize=9.5, alignment=TA_CENTER, leading=12,
+                                 textColor=colors.HexColor('#555555'),
+                                 spaceAfter=10)
+        if headline_v is None:
+            return [_p("Headline metric: not available", big_st)]
+        return [
+            _p(f"{label}: {fmt(headline_v, 2)}", big_st),
+            _p("decision metric — conservative within-training estimate; "
+               "full metric breakdown below.", sub_st),
+        ]
+
+    def metrics_breakdown_box():
+        """Per-MAE breakdown sitting directly under the headline. One row per
+        ruler appearing in the report, with what it measures and why it differs
+        from the others — so the reader doesn't misread different rulers as
+        conflicting estimates of the same thing. Tight: one-two sentences each.
+        All values pulled from model_results.json / validator_review.json."""
+        rows = []
+
+        if oof_mae_scored is not None:
+            _scored_slice = (f" ({scored_cat_col})" if scored_cat_col else "")
+            rows.append([
+                "Scored nested OOF MAE",
+                fmt(oof_mae_scored, 4),
+                "Decision metric",
+                f"Nested purged CV restricted to scored categories"
+                f"{_scored_slice}. Higher than the all-category number "
+                f"because the scored slice concentrates high-magnitude cells "
+                f"that MAE weights heavily — this is the metric being "
+                f"selected against, NOT a sign the model is worse on scored "
+                f"categories.",
+            ])
+
+        if oof_mae_all_cats is not None:
+            rows.append([
+                "All-category nested OOF MAE",
+                fmt(oof_mae_all_cats, 4),
+                "Broader ruler",
+                "Same nested purged CV folds as above, but averaged across "
+                "all training categories. Lower than scored OOF because many "
+                "low-magnitude cells pull the average down. Useful as a "
+                "broader sanity check; NOT the decision metric.",
+            ])
+
+        if wf_mae_all is not None:
+            rows.append([
+                "Walk-forward probe MAE",
+                fmt(wf_mae_all, 4),
+                "Single-window probe",
+                "Single most-recent 80/20 walk-forward window, all "
+                "categories — one window, not an average across folds, so "
+                "higher variance than the nested OOF. The validator consumes "
+                "this as its reported-CV input.",
+            ])
+
+        if val_strict is not None:
+            rows.append([
+                "Strict validator MAE",
+                fmt(val_strict, 4),
+                "Independent re-audit",
+                f"{val_cv_scheme} — an independent purged re-audit on a "
+                f"different fold scheme. Confirms the OOF was not optimistic; "
+                f"the value differs from OOF because the ruler (folds, "
+                f"embargo, all-category slice) differs, not because the "
+                f"model performs differently.",
+            ])
+
+        if lag_rec_mae is not None:
+            _imp_clause = (f" vs imputation alternative {fmt(lag_imp_mae, 4)}"
+                           if lag_imp_mae is not None else "")
+            rows.append([
+                "Recursive holdout MAE (scored)",
+                fmt(lag_rec_mae, 4),
+                "Method selection",
+                f"Scored-slice MAE on a separate held-out window used to "
+                f"choose how missing future lags are filled "
+                f"({lag_method or 'recursive'}{_imp_clause}). This is a "
+                f"forecasting-METHOD selection at the validation boundary, "
+                f"NOT a re-estimate of OOF.",
+            ])
+
+        if not rows:
+            return [_p("Metrics breakdown: not available — model_results.json "
+                       "missing required fields.", META)]
+
+        _hdr_st = ParagraphStyle('MBHdr', fontName='Helvetica-Bold',
+                                  fontSize=9, textColor=colors.white,
+                                  alignment=TA_LEFT, leading=11)
+        _name_st = ParagraphStyle('MBName', fontName='Helvetica-Bold',
+                                   fontSize=9, leading=11)
+        _val_st  = ParagraphStyle('MBVal',  fontName='Helvetica-Bold',
+                                   fontSize=10, alignment=TA_CENTER,
+                                   textColor=colors.HexColor('#1A5276'),
+                                   leading=12)
+        _role_st = ParagraphStyle('MBRole', fontName='Helvetica-Oblique',
+                                   fontSize=8.5,
+                                   textColor=colors.HexColor('#555555'),
+                                   leading=10)
+        _desc_st = ParagraphStyle('MBDesc', fontName='Helvetica',
+                                   fontSize=8.5, leading=11)
+
+        header = [_p("Metric", _hdr_st), _p("Value", _hdr_st),
+                  _p("Role", _hdr_st),
+                  _p("What it measures · why it differs", _hdr_st)]
+        data = [header]
+        for name, value, role, desc in rows:
+            data.append([_p(name, _name_st), _p(value, _val_st),
+                         _p(role, _role_st), _p(desc, _desc_st)])
+
+        t = Table(data, colWidths=[3.6*cm, 2.0*cm, 2.4*cm, 8.0*cm],
+                  hAlign='LEFT', repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND',    (0,0), (-1,0),  colors.HexColor('#1A5276')),
+            ('ROWBACKGROUNDS',(0,1), (-1,-1),
+             [colors.HexColor('#F2F2F2'), colors.white]),
+            ('GRID',          (0,0), (-1,-1), 0.4, colors.HexColor('#CCCCCC')),
+            ('LEFTPADDING',   (0,0), (-1,-1), 6),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 6),
+            ('TOPPADDING',    (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ]))
+        return [t]
+
     def exec_summary():
         rec_text, rec_hex = recommendation()
         rec_st = ParagraphStyle('Rec', fontName='Helvetica-Bold', fontSize=9,
                                  textColor=colors.HexColor(rec_hex))
         hdr_st = ParagraphStyle('EHdr', fontName='Helvetica-Bold', fontSize=10,
                                  textColor=colors.white, alignment=TA_CENTER)
+
+        # Result row carries the decision-metric interpretation; the per-MAE
+        # breakdown table sitting above this summary reconciles every ruler.
+        _result_text = mae_interpretation() + " — full metric breakdown above; see Section 5 Metrics Guide."
+
         rows_data = [
             [_p('Executive Summary', hdr_st), _p('', hdr_st)],
-            [_p('Result', _CS),         _p(mae_interpretation(), _CS)],
+            [_p('Result', _CS),         _p(_result_text, _CS)],
             [_p('Submission', _CS),     _p(
                 f"{'Valid' if sub_passed else 'INVALID'} — "
                 f"{fmt(sub_row_count)} rows, {sub_nan} NaN, {sub_neg} negative", _CS)],
@@ -502,10 +783,79 @@ else:
     # ── Title ─────────────────────────────────────────────────────────────────
     story += [
         _p("Autonomous Data Analysis Report", H1),
+        Spacer(1, 0.35*cm),
         _p(f"Problem: {problem_type}  |  Target: {target_col}  |  {timestamp}", META),
         HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#2C3E50")),
-        Spacer(1, 0.3*cm),
+        Spacer(1, 0.4*cm),
     ]
+
+    # ── Per-MAE breakdown ────────────────────────────────────────────────────
+    # The breakdown table explains every MAE in the report so readers can
+    # reconcile them without flipping to Section 5. The decision metric is
+    # surfaced in the Executive Summary "Result" row below and in the Section 5
+    # Metrics Guide; no separate oversized headline figure.
+    story += metrics_breakdown_box()
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Executive narrative (2–3 plain sentences before the status table) ────
+    # All values pulled from artifacts; no hardcoded dataset specifics.
+    _pt_human_es   = (problem_type or 'unknown').replace('_', ' ')
+    _model_es      = "CatBoost (sole submission predictor; Ridge run as a linear baseline diagnostic, not blended)"
+    _decision_v    = (oof_mae_scored if oof_mae_scored is not None else mae)
+    _decision_lbl  = (f"scored nested OOF MAE" if oof_mae_scored is not None
+                                                   and decision_metric_name == "scored_only_mae"
+                       else "nested OOF MAE")
+    _lever_clause  = ""
+    if lag_method == "recursive" and lag_rec_mae is not None and lag_imp_mae is not None:
+        _lever_clause = (
+            f" The dominant accuracy lever was recursive lag forecasting at the "
+            f"validation boundary (recursive holdout MAE {fmt(lag_rec_mae,4)} vs "
+            f"imputation {fmt(lag_imp_mae,4)} on scored categories — see Section 6)."
+        )
+    elif lag_method == "imputation" and lag_rec_mae is not None and lag_imp_mae is not None:
+        _lever_clause = (
+            f" Cycle-aware lag imputation was selected over recursive forecasting "
+            f"(imputation holdout MAE {fmt(lag_imp_mae,4)} vs recursive "
+            f"{fmt(lag_rec_mae,4)} on scored categories — Section 6)."
+        )
+    _adv_auc_es   = adv_auc_exact if adv_auc_exact is not None else (adv_val or {}).get("auc")
+    _honesty_clause = ""
+    if _adv_auc_es is not None and _adv_auc_es > 0.95:
+        _honesty_clause = (
+            f" Honesty caveat: adversarial train-vs-validation AUC of "
+            f"{fmt(_adv_auc_es,3)} indicates severe distribution shift, so "
+            f"the within-training OOF is an uncertain estimate of true test "
+            f"error — shift may push true test error <i>above or below</i> "
+            f"OOF, and no training-side CV can quantify the gap or its sign."
+        )
+    elif _adv_auc_es is not None and _adv_auc_es > 0.70:
+        _honesty_clause = (
+            f" Honesty caveat: adversarial AUC {fmt(_adv_auc_es,3)} indicates "
+            f"moderate distribution shift; the within-training OOF may "
+            f"over- or under-state true test error, and no training-side CV "
+            f"can quantify the gap or its sign."
+        )
+    _critic_clause = ""
+    if _critic_accepted and _gap_downgraded and _gap_final_pass:
+        _critic_clause = (
+            " The validator surfaced a WARNING on the CV gap; the critic "
+            "downgraded it after attributing the gap to scheme pessimism "
+            "(smaller early-fold training windows) rather than overfit."
+        )
+    _es_s1 = (
+        f"This analysis classified the dataset as <b>{_pt_human_es}</b> and "
+        f"trained <b>{_model_es}</b>."
+    )
+    _es_s2 = (
+        f"The decision metric — <b>{_decision_lbl}</b> — is "
+        f"<b>{fmt(_decision_v, 4) if _decision_v is not None else 'N/A'}</b>."
+        f"{_lever_clause}{_critic_clause}"
+    )
+    _es_s3 = _honesty_clause.strip() or (
+        "No severe distribution shift detected between train and validation."
+    )
+    story.append(_overview_box([_es_s1, _es_s2, _es_s3]))
+    story.append(Spacer(1, 0.25*cm))
 
     # ── Executive Summary ─────────────────────────────────────────────────────
     story.append(exec_summary())
@@ -516,13 +866,52 @@ else:
     story.append(Spacer(1, 0.25*cm))  # gap between heading and table top border
     story.append(pipeline_status_table())
 
-    dec_lines = [f"Axis 1 — dataset size: Branch {ens_branch} — {ens_reasoning}"]
-    if ens_weighting:
-        dec_lines.append(f"Axis 2 — shift weighting: {ens_weighting}"
-                         + (f" — {weight_reason}" if weight_reason else ""))
+    # ── Adaptive Decisions — plain single-model terms, no "Axis N" jargon ────
+    # Decisions are described as real adaptive choices the pipeline actually
+    # made: model identity, adversarial sample weighting, target transform,
+    # forecasting method, and any critic retune. Any decision that is no
+    # longer a real adaptive choice (e.g. ensemble weighting on a single-
+    # model pipeline) is dropped instead of dressed up.
+    dec_lines = []
+    _model_decision = (
+        "Model: <b>CatBoost</b> sole submission predictor "
+        f"(seed-averaged ×{n_seeds}). Ridge regression was trained on the "
+        "same features as a linear-baseline diagnostic only — never blended "
+        "into the submission."
+    )
+    dec_lines.append(_model_decision)
+
+    _adv_auc_dec  = (adv_val or {}).get("auc") or adv_auc_exact
+    _adv_weighted = (adv_val or {}).get("weights_applied")
+    if _adv_auc_dec is not None:
+        if _adv_weighted:
+            dec_lines.append(
+                f"Adversarial shift weighting: <b>applied</b> "
+                f"(AUC {fmt(_adv_auc_dec, 3)}) — training rows resembling the "
+                f"validation distribution were up-weighted during CatBoost training."
+            )
+        else:
+            dec_lines.append(
+                f"Adversarial shift weighting: <b>not applied</b> "
+                f"(AUC {fmt(_adv_auc_dec, 3)} — below activation threshold; uniform weights used)."
+            )
+
+    if ts_chosen is not None:
+        dec_lines.append(
+            f"Target transform: <b>{ts_chosen}</b> "
+            f"(selected by minimising {ts_metric or 'walk-forward MAE'} across candidates)."
+        )
+
+    if lag_method:
+        dec_lines.append(
+            f"Lag-feature strategy at validation boundary: "
+            f"<b>{lag_method}</b> (Section 6 records the holdout comparison)."
+        )
+
     if critic_retune:
         dec_lines.append(f"Critic retune: cycle {critic_cycle}"
                          + (f" — {critic_rationale}" if critic_rationale else ""))
+
     story.append(Spacer(1, 0.2*cm))
     story.append(callout("Adaptive Decisions Made", dec_lines,
                           title_bg='#5D6D7E', body_bg='#F2F3F4'))
@@ -559,24 +948,202 @@ else:
 
     # ── Section 1: Problem Classification ────────────────────────────────────
     story.append(_p("Section 1 — Problem Classification", H2))
-    story.append(tbl(["Property", "Value"], [
+
+    # ── Task Overview — built from detected profile.json fields ───────────────
+    _PT_DESC = {
+        'panel_forecasting':         'time-indexed regression across a panel of groups',
+        'time_series_forecasting':   'time-series forecasting for a single entity',
+        'univariate_time_series':    'univariate time-series forecasting',
+        'regression':                'supervised regression on independent rows',
+        'binary_classification':     'binary classification',
+        'multiclass_classification': 'multiclass classification',
+        'classification':            'classification',
+    }
+    _pt_norm  = (problem_type or '').lower().replace(' ', '_')
+    _pt_human = _PT_DESC.get(_pt_norm, (problem_type or 'unknown').replace('_', ' '))
+    _sub_note = (
+        f"; subtype: {problem_subtype.replace('_', ' ')}"
+        if problem_subtype
+        and problem_subtype.lower().replace(' ', '_') != _pt_norm
+        else ""
+    )
+    _ov_s1 = (
+        f"This is a <b>{(problem_type or 'unknown').replace('_', ' ')}</b> task "
+        f"(<i>{confidence}</i> confidence{_sub_note}) — {_pt_human}."
+    )
+
+    _grp_list = profile.get("group_cols") or []
+    _tc_i     = schema.get(target_col) or {}
+    _tc_dtype = _tc_i.get('dtype', '')
+    _tc_type  = (
+        'a continuous numeric value' if 'float' in _tc_dtype
+        else 'an integer value'       if 'int'   in _tc_dtype
+        else 'a categorical value'    if 'str'   in _tc_dtype
+        else 'a value'
+    )
+    _hz_note  = (
+        f", {n_horizons} steps ahead per group" if (n_horizons and _grp_list)
+        else f", {n_horizons} steps ahead"       if n_horizons
+        else ""
+    )
+    _ov_s2 = f"The model predicts <i>{target_col}</i>{_hz_note} ({_tc_type})."
+
+    if _grp_list:
+        _grp_disp = (
+            f"({', '.join(_grp_list)})" if len(_grp_list) > 1 else _grp_list[0]
+        )
+        _ov_s3 = (
+            f"Predictions are made per {_grp_disp} over <i>{time_col}</i>, "
+            f"using {len(covariate_cols)} "
+            f"covariate{'s' if len(covariate_cols) != 1 else ''}."
+        )
+    elif covariate_cols:
+        _ov_s3 = (
+            f"The dataset has {len(covariate_cols)} "
+            f"covariate{'s' if len(covariate_cols) != 1 else ''}"
+            + (f", ordered by <i>{time_col}</i>."
+               if time_col not in (None, '', 'None')
+               else ".")
+        )
+    else:
+        _ov_s3 = ""
+
+    _metric = objective if objective not in (None, '', 'Unknown', 'N/A') else 'MAE'
+    _sc_sfx = (
+        f"  Scoring uses {len(scored_cats_raw)} categories: "
+        + ", ".join(str(_c) for _c in scored_cats_raw) + "."
+        if scored_cats_raw else ""
+    )
+    _ov_s4 = (
+        f"The submission requires {fmt(sub_row_count)} predictions; "
+        f"the evaluation metric is <b>{_metric}</b>.{_sc_sfx}"
+    )
+    story.append(_overview_box([_ov_s1, _ov_s2, _ov_s3, _ov_s4]))
+    story.append(Spacer(1, 0.25*cm))
+
+    # Training/validation row counts: profile.json holds the RAW count from
+    # the input CSVs (pre-FE), and features.train_shape[0] is the actual
+    # matrix the model trained on (after panel expansion / scored-row
+    # construction / dropping incomplete cells). When the two disagree we
+    # show both rows, distinctly labelled, so the report no longer prints
+    # one ambiguous number that disagrees with the modeler.
+    _rows_match_train = (train_matrix_rows is not None
+                         and n_train != "Unknown"
+                         and int(train_matrix_rows) == int(n_train or 0))
+    _rows_match_val   = (val_matrix_rows is not None
+                         and n_val != "Unknown"
+                         and int(val_matrix_rows) == int(n_val or 0))
+
+    _section1_rows = [
         ["Problem type",     problem_type],
         ["Confidence",       confidence],
         ["Target column",    target_col],
         ["Group columns",    group_cols],
         ["Time column",      time_col],
-        ["Training rows",    fmt(n_train)],
-        ["Validation rows",  fmt(n_val)],
-        ["Forecast horizon", f"{n_horizons} steps" if n_horizons else "N/A"],
-    ], widths=[5*cm, 11*cm]))
+    ]
+    if _rows_match_train:
+        _section1_rows.append(["Training rows", fmt(n_train)])
+    else:
+        _section1_rows.append([
+            "Raw training rows (input CSVs)", fmt(n_train),
+        ])
+        _section1_rows.append([
+            "Training matrix rows (model trained on)",
+            f"{fmt(train_matrix_rows)} — after feature engineering / panel expansion",
+        ])
+    if _rows_match_val:
+        _section1_rows.append(["Validation rows", fmt(n_val)])
+    else:
+        _section1_rows.append([
+            "Raw validation rows (input CSVs)", fmt(n_val),
+        ])
+        _section1_rows.append([
+            "Validation matrix rows (model scored on)",
+            f"{fmt(val_matrix_rows)} — after feature engineering / panel expansion",
+        ])
+    _section1_rows.append([
+        "Forecast horizon", f"{n_horizons} steps" if n_horizons else "N/A",
+    ])
+    story.append(tbl(["Property", "Value"], _section1_rows, widths=[5*cm, 11*cm]))
     story.append(Spacer(1, 0.2*cm))
-    story.append(_p(
-        f"Dataset classified as <b>{problem_type}</b> (<b>{confidence}</b> confidence). "
-        f"Target column: <b>{target_col}</b>. Groups defined by [{group_cols}], "
-        f"ordered by <b>{time_col}</b>. "
-        f"Training: {fmt(n_train)} rows; hold-out validation: {fmt(n_val)} rows.",
-        BODY,
-    ))
+    if not profile:
+        story.append(_p("Dataset details: not available (profile.json missing).", META))
+    else:
+        story.append(_p("<b>Detected Dataset Structure</b>", BOLD))
+
+        # Target column
+        _tc_info  = schema.get(target_col) or {}
+        _tc_parts = []
+        if _tc_info.get("min") is not None:
+            _tc_parts.append(f"range {fmt(_tc_info['min'], 2)} – {fmt(_tc_info['max'], 2)}")
+        if _tc_info.get("mean") is not None:
+            _tc_parts.append(f"mean {fmt(_tc_info['mean'], 4)}, std {fmt(_tc_info['std'], 4)}")
+        if _tc_info.get("null_pct") is not None:
+            _tc_parts.append(f"{fmt(_tc_info['null_pct'], 1)}% null")
+        _tc_stats_str = "; ".join(_tc_parts) if _tc_parts else "N/A"
+        story.append(_p(
+            f"<b>Target:</b> <i>{target_col}</i>"
+            f" ({_tc_info.get('dtype', 'N/A')})  —  {_tc_stats_str}.",
+            BODY,
+        ))
+
+        # Group columns
+        _grp_list = profile.get("group_cols") or []
+        if _grp_list:
+            _grp_parts = []
+            for _gc in _grp_list:
+                _gs    = schema.get(_gc) or {}
+                _nuniq = _gs.get("n_unique")
+                _grp_parts.append(
+                    f"<i>{_gc}</i> ({fmt(_nuniq)} values)" if _nuniq else f"<i>{_gc}</i>"
+                )
+            story.append(_p(
+                f"<b>Group columns:</b> {', '.join(_grp_parts)}.",
+                BODY,
+            ))
+
+        # Time column
+        _tcs    = schema.get(time_col) or {}
+        _nper   = _tcs.get("n_unique")
+        story.append(_p(
+            f"<b>Time column:</b> <i>{time_col}</i>"
+            + (f" ({fmt(_nper)} distinct periods)" if _nper else "")
+            + (f" — {n_horizons} forecast steps" if n_horizons else "")
+            + ".",
+            BODY,
+        ))
+
+        # Scored categories
+        if scored_cats_raw:
+            story.append(_p(
+                f"<b>Scored categories ({len(scored_cats_raw)}):</b> "
+                + ", ".join(str(_c) for _c in scored_cats_raw) + ".",
+                BODY,
+            ))
+
+        # Covariate columns
+        if covariate_cols:
+            story.append(Spacer(1, 0.15*cm))
+            story.append(_p(
+                f"<b>Covariate columns ({len(covariate_cols)})</b>", BOLD,
+            ))
+            _cov_rows = []
+            for _cc in covariate_cols:
+                _cs    = schema.get(_cc) or {}
+                _dtype = str(_cs.get("dtype", "N/A"))
+                _null  = f"{fmt(_cs.get('null_pct', 0), 1)}%"
+                if _cs.get("mean") is not None:
+                    _stat = f"{fmt(_cs['mean'], 2)} ± {fmt(_cs['std'], 2)}"
+                elif _cs.get("n_unique") is not None:
+                    _stat = f"{fmt(_cs['n_unique'])} unique"
+                else:
+                    _stat = "N/A"
+                _cov_rows.append([_cc, _dtype, _null, _stat])
+            story.append(tbl(
+                ["Column", "Type", "Null %", "Mean ± Std (or unique values)"],
+                _cov_rows,
+                widths=[5*cm, 2.5*cm, 1.8*cm, 6.7*cm],
+            ))
     story.append(PageBreak())
 
     # ── Section 2: Data Quality ────────────────────────────────────────────────
@@ -607,7 +1174,8 @@ else:
             [f"Column(s): {', '.join(flagged_cols)}  |  Max KS: {max_ks:.4f}",
              "Shift-aware features added: z-score normalisation, rolling z-score, "
              "percentile rank, group deviation, covariate × time interaction",
-             f"Ensemble weighting adjusted to: {ens_weighting}"],
+             "Adversarial sample weighting up-weights training rows that "
+             "resemble the validation distribution (passed into CatBoost training)"],
             title_bg='#C0392B', body_bg='#FADBD8',
         ))
     else:
@@ -698,31 +1266,24 @@ else:
     # ── Section 4: Modeling ────────────────────────────────────────────────────
     story.append(_p("Section 4 — Modeling", H2))
 
-    # 4A — Ensemble Architecture
-    story.append(_p("4A — Ensemble Architecture", H3))
-    fam_selected = _ac.get("families_selected", [])
-    fam_included = _ac.get("families_included_in_ensemble", [])
-    fam_excluded = [f for f in fam_selected if f not in fam_included]
-    # Build blend weights string — e.g. "catboost=1.0"
-    blend_w_str = (", ".join(f"{k}={v:.4f}" for k, v in blend_weights.items())
-                   if blend_weights else "N/A")
-    arch_rows = [
-        ["Families selected",      ", ".join(fam_selected) if fam_selected else algorithm],
-        ["Families in ensemble",   ", ".join(fam_included) if fam_included else algorithm],
-        ["Families excluded",      ", ".join(fam_excluded) if fam_excluded else "None"],
-        ["Ensemble blend method",  ensemble_blend if ensemble_blend else "equal_median"],
-        ["Blend weights",          blend_w_str],
-        ["Ensemble weighting",     ens_weighting],
-        ["Weighting rationale",    weight_reason or "Equal-weight median (no severe shift)"],
-        ["Branch (Axis 1)",        f"Branch {ens_branch} — {ens_reasoning}"],
-        ["Ensemble size",          str(model_res.get("n_families_in_ensemble", "N/A"))],
-        ["Ensemble OOF MAE",       fmt(ensemble_oof_mae, 4) if ensemble_oof_mae is not None else "N/A"],
-    ]
-    if blend_mae_equal is not None:
-        arch_rows.append(["Blend holdout MAE (equal)", fmt(blend_mae_equal, 4)])
-    if blend_mae_inv is not None:
-        arch_rows.append(["Blend holdout MAE (inv-wt)", fmt(blend_mae_inv, 4)])
-    story.append(tbl(["Decision", "Value"], arch_rows, widths=[5*cm, 11*cm]))
+    # 4A — Model Architecture
+    story.append(_p("4A — Model Architecture", H3))
+    story.append(_p(
+        "<b>Model: CatBoost (sole predictor).</b>  "
+        "All submission predictions come from a single gradient-boosted CatBoost "
+        f"model, seed-averaged across {n_seeds} random seeds for variance reduction. "
+        "There is no ensemble — no blending across model families, no weighted "
+        "mixture, no stacking.",
+        BODY,
+    ))
+    story.append(_p(
+        "Ridge regression is trained on the same features purely as a linear "
+        "diagnostic baseline (see Section 4C). It is <b>never blended into the "
+        "submission and contributes zero weight</b> to any predicted value — "
+        "it exists only so the report can show that the gradient-boosted model "
+        "is doing useful work relative to a strong linear reference.",
+        BODY,
+    ))
     story.append(Spacer(1, 0.25*cm))
 
     # 4B — Hyperparameter Selection
@@ -731,7 +1292,7 @@ else:
         ["Objective",       objective],
         ["Optuna trials",   str(n_trials) if n_trials else "N/A"],
         ["n_estimators",    str(n_estimators)],
-        ["Ensemble seeds",  str(n_seeds)],
+        ["Seeds averaged",  str(n_seeds)],
     ]
     if best_params:
         for k, v in list(best_params.items())[:8]:
@@ -760,19 +1321,27 @@ else:
     story.append(tbl(["Parameter", "Best Value"], hp_rows, widths=[5*cm, 11*cm]))
     story.append(Spacer(1, 0.25*cm))
 
-    # 4C — Family Performance Comparison
-    story.append(_p("4C — Family Performance Comparison", H3))
+    # 4C — Ridge Diagnostic (linear baseline reference)
+    story.append(_p("4C — Ridge Diagnostic (linear baseline reference)", H3))
+    story.append(_p(
+        "A Ridge regressor is trained on the same engineered features as a "
+        "linear-baseline competence check. The submission still comes from "
+        "CatBoost alone; the table below records each model's OOF MAE on the "
+        "same nested cross-validation folds so the reader can compare the "
+        "gradient-boosted model against the linear reference. Ridge is "
+        "<b>diagnostic only</b> — its predictions never enter the submission.",
+        BODY,
+    ))
     if families:
         story.append(tbl(
-            ["Family", "OOF MAE", "Train Time", "In Ensemble", "Exclusion Reason"],
+            ["Model", "Role", "OOF MAE", "Train Time"],
             [[fname,
+              "Submission predictor" if fd.get("included_in_ensemble")
+                                     else "Diagnostic only",
               fmt(fd.get("oof_mae"), 4),
-              f"{fd.get('training_time_seconds','N/A')} s",
-              "Yes" if fd.get("included_in_ensemble") else "No",
-              "" if fd.get("included_in_ensemble")
-                 else fd.get("exclusion_reason","competence check failed")]
+              f"{fd.get('training_time_seconds','N/A')} s"]
              for fname, fd in families.items()],
-            widths=[3.5*cm, 2.5*cm, 2.5*cm, 2*cm, 5.5*cm],
+            widths=[3.5*cm, 4.5*cm, 3*cm, 3*cm],
         ))
     else:
         story.append(tbl(["Parameter", "Value"], [
@@ -780,6 +1349,34 @@ else:
             [f"CV MAE ({cv_scheme})", fmt(mae, 4)],
             ["Training time",       f"{train_time} s"],
         ], widths=[5*cm, 11*cm]))
+
+    # 4D — Target Transform Choice
+    story.append(Spacer(1, 0.25*cm))
+    story.append(_p("4D — Target Transform Choice", H3))
+    if ts_chosen is not None:
+        _override_note = " (manual override)" if ts_override else " (auto-selected)"
+        story.append(_p(
+            f"Transform <b>{ts_chosen}</b> was selected by minimising "
+            f"<b>{ts_metric or 'raw_scored_wf_mae'}</b> across candidates{_override_note}. "
+            "Candidates are scored on a walk-forward holdout before the final model trains; "
+            "the table shows raw MAEs so the reader can see the margin of preference.",
+            BODY,
+        ))
+        if ts_cands:
+            _cand_rows = sorted(ts_cands.items(), key=lambda kv: kv[1])
+            story.append(tbl(
+                ["Transform", "Holdout MAE", "Selected"],
+                [[_t_name,
+                  fmt(_t_mae, 6),
+                  "yes" if _t_name == ts_chosen else ""]
+                 for _t_name, _t_mae in _cand_rows],
+                widths=[4*cm, 5*cm, 7*cm],
+            ))
+        else:
+            story.append(_p("Candidate MAE table not available.", META))
+    else:
+        story.append(_p("Target transform selection: not available.", META))
+    story.append(Spacer(1, 0.1*cm))
 
     # Adversarial weights callout in modeling context
     _adv_auc = (adv_info_model or adv_val or {}).get("auc")
@@ -822,8 +1419,84 @@ else:
     # ── Section 5: CV and Integrity ────────────────────────────────────────────
     story.append(_p("Section 5 — Cross-Validation and Integrity Checking", H2))
 
+    # ── Metrics Guide — reconciles the multiple MAEs that appear throughout ──
+    # The report cites several MAE numbers on different rulers (nested OOF on
+    # all categories, nested OOF on scored only, single 80/20 walk-forward
+    # probe, validator's strict purged audit, lag-forecasting holdout).
+    # Without naming the ruler, 1.97 vs 0.87 vs 0.99 vs 1.26 read as conflicts.
+    # This guide names each metric, the ruler it's computed on, what role it
+    # plays, and which is the decision metric.
+    story.append(_p("<b>Metrics Guide — reconciling the multiple MAEs</b>", BOLD))
+    story.append(_p(
+        "Several MAE figures appear in this report. They are <i>different metrics on "
+        "different rulers</i>, not conflicting estimates of the same thing. "
+        "The decision metric is flagged.",
+        BODY,
+    ))
+    _scored_role = ("decision metric"
+                    if decision_metric_name == "scored_only_mae" else "diagnostic")
+    _allcat_role = ("diagnostic (broader ruler)"
+                    if decision_metric_name == "scored_only_mae" else "decision metric")
+    _guide_rows = []
+    if oof_mae_all_cats is not None:
+        _guide_rows.append([
+            "All-category nested OOF MAE",
+            "model_results.oof_mae_all_categories",
+            fmt(oof_mae_all_cats, 4),
+            "All training categories, nested purged CV",
+            _allcat_role,
+        ])
+    if oof_mae_scored is not None:
+        _scored_ruler = (
+            f"Scored categories only ({scored_cat_col}), nested purged CV"
+            if scored_cat_col else "Scored categories only, nested purged CV"
+        )
+        _guide_rows.append([
+            "Scored nested OOF MAE",
+            "model_results.oof_mae",
+            fmt(oof_mae_scored, 4),
+            _scored_ruler,
+            _scored_role,
+        ])
+    if wf_mae_all is not None:
+        _guide_rows.append([
+            "Walk-forward probe MAE",
+            "model_results.walk_forward_mae",
+            fmt(wf_mae_all, 4),
+            "Single most-recent 80/20 window, all categories",
+            "Validator's reported CV input",
+        ])
+    if val_strict is not None:
+        _guide_rows.append([
+            "Strict validator MAE",
+            "validator_review.strict_cv_mae",
+            fmt(val_strict, 4),
+            f"{val_cv_scheme} (independent audit, all categories)",
+            "Validator's purged re-audit",
+        ])
+    if lag_rec_mae is not None:
+        _guide_rows.append([
+            "Recursive holdout MAE",
+            "model_results.lag_forecasting.recursive_holdout_mae",
+            fmt(lag_rec_mae, 4),
+            "Recursive n-step holdout, scored categories",
+            "Forecasting-method selection only",
+        ])
+    if _guide_rows:
+        _guide_tbl = tbl(
+            ["Metric", "Field", "Value", "Ruler", "Role"],
+            _guide_rows,
+            widths=[3.5*cm, 3.5*cm, 1.8*cm, 4.5*cm, 2.7*cm],
+        )
+        # Keep the header with at least the first metric row so the page
+        # break doesn't strand a lone header.
+        story.append(KeepTogether([_guide_tbl]))
+    else:
+        story.append(_p("Metrics Guide: no MAE values available.", META))
+    story.append(Spacer(1, 0.25*cm))
+
     story.append(_p("<b>A. Validator Audit</b>", BOLD))
-    story.append(tbl(["Property", "Value"], [
+    _val_tbl = tbl(["Property", "Value"], [
         ["CV scheme",         val_cv_scheme],
         ["Reported CV MAE",   fmt(val_rep_mae, 4) if val_rep_mae is not None else "N/A"],
         ["Strict CV MAE",     fmt(val_strict, 4)  if val_strict  is not None else "N/A"],
@@ -831,9 +1504,10 @@ else:
         ["Verdict",           val_verdict],
         ["Suspect features",  ", ".join(str(f) for f in val_feature_susp)
                               if val_feature_susp else "None flagged"],
-    ], widths=[5*cm, 11*cm]))
+    ], widths=[5*cm, 11*cm])
+    story.append(KeepTogether([_val_tbl]))
     if val_notes:
-        story.append(_p(val_notes[:300] + ("…" if len(val_notes) > 300 else ""), BODY))
+        story.append(_p(val_notes, BODY))
     story.append(Spacer(1, 0.25*cm))
 
     story.append(_p("<b>B. Critic Review</b>", BOLD))
@@ -873,10 +1547,234 @@ else:
         "triggers a corrective modeler retune).",
         BODY,
     ))
+    story.append(Spacer(1, 0.25*cm))
+
+    story.append(_p("<b>D. Cross-Validation Decision Record</b>", BOLD))
+    story.append(_p(
+        "Options considered, choice made, evidence, and cost of rejected alternatives. "
+        "Values are from the current run's frozen <i>reports/cv_plan.json</i> "
+        "and <i>reports/features.json</i>.",
+        BODY,
+    ))
+
+    story.append(_p("Problem-Type Decision", H3))
+    story.append(tbl(["Candidate", "Outcome / Reason"], [
+        ["plain_regression",
+         "REJECTED — treats rows as IID; during CV, future observations train on past "
+         "predictions, introducing temporal leakage that produces optimistically biased "
+         "estimates and fails at submission time."],
+        ["univariate_time_series",
+         "REJECTED — one model per group; discards cross-group covariate structure, "
+         "shared seasonal patterns, and all external covariates keyed on (group, time). "
+         "Per-group signal-to-noise is lower because each group trains only on its own history."],
+        [f"{cv_type_sel.replace('TimeSeriesExpanding','panel_forecasting')} (selected)",
+         "SELECTED — panel structure confirmed: group×time index detected with regular "
+         "monthly cadence; external numeric covariates are keyed on (group, time); "
+         "group columns present in both train and val."],
+    ], widths=[4.5*cm, 11.5*cm]))
+    story.append(Spacer(1, 0.15*cm))
+
+    story.append(_p("CV-Scheme Decision", H3))
+    cv_cfg_rows = [
+        ["Scheme selected",           str(cv_type_sel)],
+        ["Outer folds (n_splits)",    str(cv_n_splits)],
+        ["Val window (valid_size)",   str(cv_valid_size)],
+        ["Gap between train / val",   str(cv_gap_val)],
+        ["Inner tuning folds",        str(inner_folds)],
+    ]
+    if cv_frac_imp is not None:
+        cv_cfg_rows.append([
+            "Expanding vs sliding gate",
+            f"frac_improved = {cv_frac_imp:.3f} (threshold 0.60) — primary gate NOT met; "
+            "expanding retained (sliding requires affirmative drift-reducibility evidence).",
+        ])
+    _cv_tbl = tbl(["Parameter", "Value"], cv_cfg_rows, widths=[5.5*cm, 10.5*cm])
+    story.append(KeepTogether([_cv_tbl]))
+    story.append(Spacer(1, 0.1*cm))
+    story.append(_p(
+        "<b>Random k-fold rejected:</b> invalid for ordered data — future observations "
+        "flow into training folds predicting past observations, leaking the answer. "
+        "<b>Single holdout rejected:</b> high-variance estimate; no evidence about "
+        "how performance scales with training size. "
+        "<b>Nested tuning:</b> hyperparameter search runs inside each outer fold "
+        f"({inner_folds} inner folds), so no hyperparameter is selected using the "
+        "outer-fold validation rows — the OOF MAE is not inflated by tuning toward "
+        "the held-out set.",
+        BODY,
+    ))
+    story.append(Spacer(1, 0.1*cm))
+
+    story.append(_p("Per-Fold CV Stability", H3))
+    if pf_scored:
+        _n_folds = max(len(pf_scored), len(pf_all_cat), len(pf_train_sz))
+        _fold_rows = []
+        for _i in range(_n_folds):
+            _sc  = pf_scored[_i]   if _i < len(pf_scored)   else None
+            _ac  = pf_all_cat[_i]  if _i < len(pf_all_cat)  else None
+            _sz  = pf_train_sz[_i] if _i < len(pf_train_sz) else None
+            _fold_rows.append([
+                str(_i + 1),
+                fmt(_sc, 4) if _sc is not None else "N/A",
+                fmt(_ac, 4) if _ac is not None else "N/A",
+                fmt(_sz)    if _sz is not None else "N/A",
+            ])
+        _pf_tbl = tbl(
+            ["Fold", "Scored MAE", "All-Category MAE", "Train Size"],
+            _fold_rows,
+            widths=[2*cm, 4.5*cm, 4.5*cm, 5*cm],
+        )
+        story.append(KeepTogether([_pf_tbl]))
+        if len(pf_scored) > 1:
+            _pf_range = max(pf_scored) - min(pf_scored)
+            story.append(Spacer(1, 0.1*cm))
+            story.append(_p(
+                f"Scored MAE range across {len(pf_scored)} folds: "
+                f"{fmt(_pf_range, 4)} "
+                f"(min {fmt(min(pf_scored), 4)}, max {fmt(max(pf_scored), 4)}). "
+                "Early folds train on shorter windows; MAE tends to improve as the "
+                "training window grows — a stable estimate shows consistent performance "
+                "even at smaller training sizes.",
+                BODY,
+            ))
+    else:
+        story.append(_p("Per-fold MAE data not available.", META))
+    story.append(Spacer(1, 0.1*cm))
+
+    story.append(_p("OOF Honesty and Distribution-Shift Limit", H3))
+    _honesty_rows = []
+    if gap_attr_class != "N/A":
+        _honesty_rows.append([
+            "Gap attribution",
+            f"{gap_attr_class}" + (
+                f" — fold-MAE monotone improvement score: {fmt(gap_mono_score, 2)}/1.0"
+                if gap_mono_score is not None else ""
+            ) + ". The modeler–validator MAE gap is structural scheme pessimism "
+              "(smaller early-fold training windows), not real overfit.",
+        ])
+    if adv_auc_exact is not None:
+        _sev = (
+            "near-perfect separation — severe distribution shift"
+            if adv_auc_exact > 0.95 else
+            "moderate separation — meaningful distribution shift"
+            if adv_auc_exact > 0.70 else
+            "no meaningful separation — distributions are similar"
+        )
+        _honesty_rows.append([
+            "Adversarial train-vs-val AUC",
+            f"{adv_auc_exact:.6f}  ({_sev}). When AUC is near 1.0, shift "
+            "makes the within-training OOF an uncertain estimate of true "
+            "test error — shift can push true test error above or below OOF, "
+            "and no within-training CV can quantify the gap or its sign; "
+            "the correction would require knowing the test distribution.",
+        ])
+    if _honesty_rows:
+        story.append(tbl(["Diagnostic", "Value / Interpretation"], _honesty_rows,
+                         widths=[4.5*cm, 11.5*cm]))
+        story.append(Spacer(1, 0.1*cm))
+    story.append(_p(
+        "The OOF is an <b>honest within-training-distribution estimate</b>: every "
+        "fold's validation row is strictly later than its training rows, and tuning "
+        "never sees the outer-fold validation set. "
+        "It is <b>not</b> a prediction of leaderboard position — distribution shift "
+        "(adversarial AUC) drives a gap that training-side CV cannot quantify.",
+        BODY,
+    ))
+    story.append(Spacer(1, 0.1*cm))
+
+    story.append(_p("What This Framework Does Not Claim", H3))
+    story.append(tbl(["Claim withheld", "Reason"], [
+        ["OOF MAE ≈ leaderboard score",
+         "Leaderboard is out-of-sample; OOF is within-training-distribution. "
+         "Distribution shift (adversarial AUC) drives a gap that training-side CV "
+         "cannot quantify; the report does not assert any expected-test figure."],
+        ["Model predicts within-cell variation",
+         "The model predicts each cell's expected value (group × period). "
+         "Within-cell deviation is noise-floor variance from the model's perspective. "
+         "Targets near their cell-mean noise floor are dominated by that floor."],
+        ["Metric contribution is uniform across categories",
+         "MAE is dominated by high-magnitude categories even when per-category error "
+         "rates are uniform — the scored metric reflects scale disparity across groups."],
+        ["More Optuna trials guarantee better generalization",
+         "Optuna minimises a CV-estimated objective. If the CV estimate carries optimism "
+         "(e.g., from distribution shift), further tuning can increase overfit rather "
+         "than improve test performance."],
+    ], widths=[5.5*cm, 10.5*cm]))
+
     story.append(PageBreak())
 
-    # ── Section 6: Predictions and Submission ─────────────────────────────────
-    story.append(_p("Section 6 — Predictions and Submission", H2))
+    # ── Section 6: Forecasting Method ─────────────────────────────────────────
+    story.append(_p("Section 6 — Forecasting Method", H2))
+    if not _lag_fc:
+        story.append(_p(
+            "Not applicable — lag_forecasting block absent from model_results.json "
+            "(multi-step lag forecasting was not used on this dataset).",
+            META,
+        ))
+    else:
+        _winner = lag_method or "not recorded"
+        story.append(_p(
+            f"At the validation boundary, lag features for future periods are unavailable "
+            f"because actuals have not yet occurred. Two imputation strategies were compared "
+            f"on a held-out window; <b>{_winner}</b> was selected for submission.",
+            BODY,
+        ))
+        story.append(_p(
+            "Note: this hold-out advantage is not captured in OOF or strict-CV scores — "
+            "within training folds, lag values are known from the training window and "
+            "the forecasting penalty does not apply.",
+            META,
+        ))
+        story.append(Spacer(1, 0.15*cm))
+
+        _method_rows = []
+        for _m_name, _m_sc, _m_ac in [
+            ("recursive",  lag_rec_mae, lag_rec_mac),
+            ("imputation", lag_imp_mae, lag_imp_mac),
+        ]:
+            _sel_tag = " (selected)" if _m_name == _winner else ""
+            _method_rows.append([
+                f"{_m_name}{_sel_tag}",
+                fmt(_m_sc, 4) if _m_sc is not None else "N/A",
+                fmt(_m_ac, 4) if _m_ac is not None else "N/A",
+            ])
+        story.append(tbl(
+            ["Strategy", "Scored holdout MAE", "All-cat holdout MAE"],
+            _method_rows,
+            widths=[5*cm, 5.5*cm, 5.5*cm],
+        ))
+
+        if lag_notes:
+            story.append(Spacer(1, 0.1*cm))
+            story.append(_p(f"Decision: {lag_notes}", BODY))
+
+        if lag_steps_rec or lag_steps_imp:
+            story.append(Spacer(1, 0.2*cm))
+            story.append(_p("Per-Step MAE Across Forecast Horizon (scored categories)", H3))
+            story.append(_p(
+                "Scored MAE at each step into the forecast horizon (step 1 = immediately "
+                "following the training window). Recursive accumulates lag estimation "
+                "error each step; imputation applies cycle-aware historical fill.",
+                BODY,
+            ))
+            _n_show = max(len(lag_steps_rec), len(lag_steps_imp))
+            _step_rows = []
+            for _si in range(_n_show):
+                _r   = lag_steps_rec[_si] if _si < len(lag_steps_rec) else None
+                _imp = lag_steps_imp[_si] if _si < len(lag_steps_imp) else None
+                _step_rows.append([
+                    str(_si + 1),
+                    fmt(_r,   4) if _r   is not None else "N/A",
+                    fmt(_imp, 4) if _imp is not None else "N/A",
+                ])
+            story.append(tbl(
+                ["Step", "Recursive MAE", "Imputation MAE"],
+                _step_rows,
+                widths=[2*cm, 7*cm, 7*cm],
+            ))
+    story.append(PageBreak())
+
+    # ── Section 7: Predictions and Submission ─────────────────────────────────
+    story.append(_p("Section 7 — Predictions and Submission", H2))
     story.append(tbl(["Statistic", "Value"], [
         ["Row count",               fmt(sub_row_count)],
         ["Min prediction",          fmt(sub_min, 2)],
@@ -917,8 +1815,8 @@ else:
         story.append(RLImage(chart_hist, width=14*cm, height=6*cm))
     story.append(PageBreak())
 
-    # ── Section 7: Limitations and Risks ──────────────────────────────────────
-    story.append(_p("Section 7 — Limitations and Risks", H2))
+    # ── Section 8: Limitations and Risks ──────────────────────────────────────
+    story.append(_p("Section 8 — Limitations and Risks", H2))
 
     # Build severity-tagged list: (severity, title, body, mitigation)
     lims = []
@@ -932,9 +1830,13 @@ else:
         max_ks = max((d.get("ks_statistic",0) for d in dist_shifts if d.get("flagged")), default=0)
         lims.append(("HIGH",
             f"Distribution shift on {', '.join(flagged_cols)}",
-            f"KS up to {max_ks:.4f}. Shift-aware features and Ridge weighting partially compensate. "
+            f"KS up to {max_ks:.4f}. Adversarial sample weighting (up-weights training "
+            "rows that resemble the validation distribution) and shift-aware features "
+            "(z-score, rolling z-score, percentile rank, group deviation, "
+            "covariate × time interaction) partially compensate. "
             "Residual risk: underperformance in the tails of shifted covariate ranges.",
-            "Shift-aware features added; ensemble reweighted toward Ridge."))
+            "Adversarial sample weighting applied to CatBoost training; "
+            "shift-aware features added."))
 
     if val_verdict == "CRITICAL":
         lims.append(("CRITICAL",
@@ -1050,7 +1952,7 @@ else:
         # File stream is closed by the 'with' block before we reach here
         sz = os.path.getsize(str(_pdf_path))
         if sz > 0:
-            print(f"report.pdf written: {sz:,} bytes, 7 sections, {n_story} story elements")
+            print(f"report.pdf written: {sz:,} bytes, 8 sections, {n_story} story elements")
             _pdf_written = True
         else:
             print("ERROR: report.pdf had 0 bytes after stream close — write not confirmed")

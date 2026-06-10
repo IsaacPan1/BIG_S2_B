@@ -333,6 +333,12 @@ def main() -> None:
         "rows_checked": 0, "mismatches": -1,
         "status": "SKIP", "reason": "not run", "examples": [],
     }
+    final_audit: dict = {
+        "rows_checked": 0, "mismatches": -1,
+        "status": "SKIP", "reason": "not run", "examples": [],
+    }
+    final_path = REPO_ROOT / "submission_final.csv"
+    id_col_final = sample.columns[0]
     try:
         audit_result = _round_trip_audit(sub_path, pred_path, composite_key, target_col)
         print(
@@ -367,6 +373,95 @@ def main() -> None:
             json.dump(summary, f, indent=2)
         raise  # let the submission_writer agent handle fallback
 
+    # ── Write submission_final.csv (2-column Kaggle upload file) ──────────────
+    # Derived generically from sample_submission.csv: id col = first column of
+    # sample_submission; prediction col = target_col from profile.json.  Row
+    # ordering = sample_submission's order, sorted by id (the two coincide when
+    # sample is already id-sorted, but we sort explicitly so this generalises).
+    print(
+        f"Building submission_final.csv with id col '{id_col_final}' "
+        f"+ prediction col '{target_col}'"
+    )
+    submission_final = (
+        sample[[id_col_final]]
+        .merge(submission[[id_col_final, target_col]], on=id_col_final, how="left")
+        .sort_values(id_col_final, kind="stable")
+        .reset_index(drop=True)[[id_col_final, target_col]]
+    )
+    submission_final.to_csv(final_path, index=False)
+    print(
+        f"Written submission_final.csv to {final_path} "
+        f"({len(submission_final)} rows, {len(submission_final.columns)} cols)"
+    )
+
+    # Audit submission_final.csv: same row count as sample_submission, exactly
+    # 2 columns (id + target), id-sorted, and target values match submission.csv
+    # row-for-row after id-sorting submission.csv.
+    sub_sorted = (
+        pd.read_csv(sub_path)
+        .sort_values(id_col_final, kind="stable")
+        .reset_index(drop=True)
+    )
+    final_check = pd.read_csv(final_path)
+    if len(final_check) != len(sample):
+        final_audit = {
+            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
+            "reason": f"row count {len(final_check)} != sample_submission {len(sample)}",
+            "examples": [],
+        }
+    elif list(final_check.columns) != [id_col_final, target_col]:
+        final_audit = {
+            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
+            "reason": f"columns {list(final_check.columns)} != [{id_col_final}, {target_col}]",
+            "examples": [],
+        }
+    elif not (final_check[id_col_final].values == sub_sorted[id_col_final].values).all():
+        final_audit = {
+            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
+            "reason": "id ordering does not match id-sorted submission.csv",
+            "examples": [],
+        }
+    else:
+        diff = ~np.isclose(
+            final_check[target_col].values.astype(float),
+            sub_sorted[target_col].values.astype(float),
+            atol=1e-6, rtol=0,
+        )
+        n_mm = int(diff.sum())
+        if n_mm > 0:
+            final_audit = {
+                "rows_checked": len(final_check), "mismatches": n_mm, "status": "FAIL",
+                "reason": f"{n_mm} target values differ from id-sorted submission.csv",
+                "examples": [],
+            }
+        else:
+            final_audit = {
+                "rows_checked": len(final_check), "mismatches": 0, "status": "PASS",
+                "reason": "submission_final.csv matches id-sorted submission.csv",
+                "examples": [],
+            }
+    print(
+        f"submission_final audit: {final_audit['status']} — "
+        f"{final_audit['rows_checked']} rows checked, "
+        f"{final_audit['mismatches']} mismatches"
+    )
+    if final_audit["status"] != "PASS":
+        raise SubmissionValidationError(
+            f"submission_final.csv audit FAILED: {final_audit['reason']}"
+        )
+
+    print()
+    print("=" * 72)
+    print(
+        f"NOTE: submission_final.csv = Kaggle upload "
+        f"({id_col_final} + {target_col}, sorted by {id_col_final})"
+    )
+    print(
+        f"      submission.csv       = full diagnostic copy with all columns "
+        f"({list(submission.columns)})"
+    )
+    print("=" * 72)
+
     # ── Write summary and marker (only on audit PASS) ─────────────────────────
     stats = {
         "min":        float(submission[target_col].min()),
@@ -386,6 +481,13 @@ def main() -> None:
         "validation_checks_passed":     checks_passed,
         "warnings":                     warnings_list,
         "round_trip_audit":             audit_result,
+        "submission_final": {
+            "path":     str(final_path),
+            "id_col":   id_col_final,
+            "pred_col": target_col,
+            "row_count": len(submission_final),
+            "audit":     final_audit,
+        },
     }
     summary_path = REPORTS_DIR / "submission_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -405,6 +507,10 @@ def main() -> None:
         f.write(f"round_trip_audit_status: {audit_result['status']}\n")
         f.write(f"round_trip_audit_rows_checked: {audit_result['rows_checked']}\n")
         f.write(f"round_trip_audit_mismatches: {audit_result['mismatches']}\n")
+        f.write(f"submission_final_path: {final_path}\n")
+        f.write(f"submission_final_id_col: {id_col_final}\n")
+        f.write(f"submission_final_pred_col: {target_col}\n")
+        f.write(f"submission_final_audit_status: {final_audit['status']}\n")
     print("Written submission_writer_was_here.txt")
 
     # ── KG: observability — mark stage complete (best-effort) ─────────────────
