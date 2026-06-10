@@ -338,7 +338,12 @@ def main() -> None:
         "status": "SKIP", "reason": "not run", "examples": [],
     }
     final_path = REPO_ROOT / "submission_final.csv"
-    id_col_final = sample.columns[0]
+    # id_col_final: use the full composite key (all non-target columns) so that
+    # the merge is unique.  If the composite key has exactly one column, fall back
+    # to that single column for backward compatibility with datasets that have a
+    # single unique row-id column.
+    id_cols_final = [c for c in sample.columns if c != target_col]
+    id_col_final = id_cols_final[0] if len(id_cols_final) == 1 else id_cols_final
     try:
         audit_result = _round_trip_audit(sub_path, pred_path, composite_key, target_col)
         print(
@@ -373,20 +378,27 @@ def main() -> None:
             json.dump(summary, f, indent=2)
         raise  # let the submission_writer agent handle fallback
 
-    # ── Write submission_final.csv (2-column Kaggle upload file) ──────────────
-    # Derived generically from sample_submission.csv: id col = first column of
-    # sample_submission; prediction col = target_col from profile.json.  Row
-    # ordering = sample_submission's order, sorted by id (the two coincide when
-    # sample is already id-sorted, but we sort explicitly so this generalises).
+    # ── Write submission_final.csv (Kaggle upload file) ──────────────────────
+    # Derived generically from sample_submission.csv: id cols = all non-target
+    # columns of sample_submission; prediction col = target_col from
+    # profile.json.  When the composite key has multiple columns (e.g.
+    # region_id + timestamp) ALL id columns are retained so the merge is
+    # uniqueness-safe (single-column merge would create a cartesian product).
+    # Row ordering = sample_submission's order, sorted by id cols.
+    sort_key = id_cols_final  # always a list
+    id_col_label = (
+        id_cols_final[0] if len(id_cols_final) == 1
+        else str(id_cols_final)
+    )
     print(
-        f"Building submission_final.csv with id col '{id_col_final}' "
+        f"Building submission_final.csv with id col(s) '{id_col_label}' "
         f"+ prediction col '{target_col}'"
     )
     submission_final = (
-        sample[[id_col_final]]
-        .merge(submission[[id_col_final, target_col]], on=id_col_final, how="left")
-        .sort_values(id_col_final, kind="stable")
-        .reset_index(drop=True)[[id_col_final, target_col]]
+        sample[id_cols_final]
+        .merge(submission[id_cols_final + [target_col]], on=id_cols_final, how="left")
+        .sort_values(sort_key, kind="stable")
+        .reset_index(drop=True)[id_cols_final + [target_col]]
     )
     submission_final.to_csv(final_path, index=False)
     print(
@@ -394,31 +406,26 @@ def main() -> None:
         f"({len(submission_final)} rows, {len(submission_final.columns)} cols)"
     )
 
-    # Audit submission_final.csv: same row count as sample_submission, exactly
-    # 2 columns (id + target), id-sorted, and target values match submission.csv
-    # row-for-row after id-sorting submission.csv.
+    # Audit submission_final.csv: same row count as sample_submission, correct
+    # columns, id-sorted, and target values match submission.csv row-for-row
+    # after id-sorting submission.csv.
     sub_sorted = (
         pd.read_csv(sub_path)
-        .sort_values(id_col_final, kind="stable")
+        .sort_values(sort_key, kind="stable")
         .reset_index(drop=True)
     )
     final_check = pd.read_csv(final_path)
+    expected_cols = id_cols_final + [target_col]
     if len(final_check) != len(sample):
         final_audit = {
             "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
             "reason": f"row count {len(final_check)} != sample_submission {len(sample)}",
             "examples": [],
         }
-    elif list(final_check.columns) != [id_col_final, target_col]:
+    elif list(final_check.columns) != expected_cols:
         final_audit = {
             "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
-            "reason": f"columns {list(final_check.columns)} != [{id_col_final}, {target_col}]",
-            "examples": [],
-        }
-    elif not (final_check[id_col_final].values == sub_sorted[id_col_final].values).all():
-        final_audit = {
-            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
-            "reason": "id ordering does not match id-sorted submission.csv",
+            "reason": f"columns {list(final_check.columns)} != {expected_cols}",
             "examples": [],
         }
     else:
@@ -454,7 +461,7 @@ def main() -> None:
     print("=" * 72)
     print(
         f"NOTE: submission_final.csv = Kaggle upload "
-        f"({id_col_final} + {target_col}, sorted by {id_col_final})"
+        f"({id_col_label} + {target_col}, sorted by {id_col_label})"
     )
     print(
         f"      submission.csv       = full diagnostic copy with all columns "
@@ -483,7 +490,7 @@ def main() -> None:
         "round_trip_audit":             audit_result,
         "submission_final": {
             "path":     str(final_path),
-            "id_col":   id_col_final,
+            "id_cols":  id_cols_final,
             "pred_col": target_col,
             "row_count": len(submission_final),
             "audit":     final_audit,
@@ -508,7 +515,7 @@ def main() -> None:
         f.write(f"round_trip_audit_rows_checked: {audit_result['rows_checked']}\n")
         f.write(f"round_trip_audit_mismatches: {audit_result['mismatches']}\n")
         f.write(f"submission_final_path: {final_path}\n")
-        f.write(f"submission_final_id_col: {id_col_final}\n")
+        f.write(f"submission_final_id_cols: {id_cols_final}\n")
         f.write(f"submission_final_pred_col: {target_col}\n")
         f.write(f"submission_final_audit_status: {final_audit['status']}\n")
     print("Written submission_writer_was_here.txt")

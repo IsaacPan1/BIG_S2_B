@@ -109,6 +109,12 @@ if __name__ == "__main__":
     OUTER_FOLD_FINAL_SEEDS = (42,) if DEBUG else (42, 7, 123)
     TUNING_BUDGET_SECONDS  = 60  if DEBUG else 25 * 60
 
+    # ── Level correction (post-hoc shift-aware bias adjustment) ──────────────
+    MIN_GROUP_HOLDOUT         = 30    # min wf_val rows per group to use group-level estimate
+    BIAS_CORRECTION_LAMBDA    = 0.5   # shrinkage weight: lambda*group + (1-lambda)*global
+    BIAS_CORRECTION_REL_MARGIN = 0.015  # min weighted-MAE improvement as fraction of baseline
+    BIAS_CORRECTION_SCALE     = 1.0   # fraction of estimated bias actually applied
+
     start_time = time.time()
     pipeline_start_time = start_time
 
@@ -1174,7 +1180,7 @@ if __name__ == "__main__":
     }
 
     try:
-        _rf_ord_col = "period_id_ord"
+        _rf_ord_col = f"{time_col}_ord"
         _has_ord = (
             problem_type == "panel_forecasting"
             and group_cols
@@ -1409,6 +1415,123 @@ if __name__ == "__main__":
         _tb.print_exc()
         _lag_forecasting["notes"] = f"error: {str(_rf_exc)[:300]}"
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 12.5 — Post-hoc level correction (shift-aware, gated)
+    # Estimates systematic prediction bias using wf_val (true labels available)
+    # weighted by adversarial_weights (P(val-like)), applies a shrunk correction
+    # to ensemble_preds ONLY if weighted holdout MAE improves by > REL_MARGIN.
+    # Residuals come from _wf_probe_preds (out-of-sample: probe trained on
+    # wf_train only) to avoid the in-sample collapse from the production model.
+    # ─────────────────────────────────────────────────────────────────────────
+    _level_correction = {
+        "applied":                False,
+        "bias_hat_global":        None,
+        "bias_hat_per_group":     {},
+        "lambda":                 BIAS_CORRECTION_LAMBDA,
+        "scale":                  BIAS_CORRECTION_SCALE,
+        "min_group_holdout":      MIN_GROUP_HOLDOUT,
+        "rel_margin":             BIAS_CORRECTION_REL_MARGIN,
+        "wf_weighted_mae_before": None,
+        "wf_weighted_mae_after":  None,
+        "used_per_group":         False,
+        "notes":                  "not_attempted",
+    }
+    try:
+        # Out-of-sample residuals: probe trained on wf_train only.
+        _wf_resid = _wf_probe_preds - y_wf_val
+
+        # Adversarial weights: pull directly from wf_val column (safe regardless
+        # of whether train_df carries a clean RangeIndex).
+        _wf_adv_w = (
+            wf_val["adversarial_weights"].fillna(1.0).values
+            if "adversarial_weights" in wf_val.columns
+            else np.ones(len(wf_val))
+        )
+
+        # Global weighted bias estimate.
+        _bias_global = float(np.average(_wf_resid, weights=_wf_adv_w))
+
+        # Per-group shrinkage: group estimate when group has >= MIN_GROUP_HOLDOUT rows.
+        _wf_vr        = wf_val.reset_index(drop=True)
+        _val_vr       = val_df.reset_index(drop=True)
+        _bias_row_wf  = np.full(len(_wf_vr), _bias_global)
+        _bias_row_val = np.full(len(_val_vr), _bias_global)
+        _used_per_group = False
+        _bias_per_group = {}
+
+        if group_cols:
+            for _grp, _gidx_idx in _wf_vr.groupby(group_cols).groups.items():
+                _gidx    = np.array(list(_gidx_idx))
+                _grp_key = str(_grp)
+                if len(_gidx) >= MIN_GROUP_HOLDOUT:
+                    _g_raw    = float(np.average(_wf_resid[_gidx], weights=_wf_adv_w[_gidx]))
+                    _g_shrunk = (BIAS_CORRECTION_LAMBDA * _g_raw
+                                 + (1 - BIAS_CORRECTION_LAMBDA) * _bias_global)
+                    _bias_row_wf[_gidx] = _g_shrunk
+                    _bias_per_group[_grp_key] = {
+                        "raw": _g_raw, "shrunk": _g_shrunk, "n": len(_gidx),
+                    }
+                    _used_per_group = True
+                else:
+                    _bias_per_group[_grp_key] = {
+                        "raw": None, "shrunk": _bias_global,
+                        "n": len(_gidx), "fallback": "global",
+                    }
+            # Apply the same group map to val_df rows (no labels needed).
+            for _grp, _gidx_idx in _val_vr.groupby(group_cols).groups.items():
+                _gidx    = np.array(list(_gidx_idx))
+                _grp_key = str(_grp)
+                if (_grp_key in _bias_per_group
+                        and _bias_per_group[_grp_key].get("raw") is not None):
+                    _bias_row_val[_gidx] = _bias_per_group[_grp_key]["shrunk"]
+
+        # Gate: weighted MAE before and after. Gate and application use identical
+        # BIAS_CORRECTION_SCALE so the holdout result predicts the actual effect.
+        _wf_wmae_before = float(np.average(np.abs(_wf_resid), weights=_wf_adv_w))
+        _corrected_wf   = np.clip(
+            _wf_probe_preds - BIAS_CORRECTION_SCALE * _bias_row_wf, 0, None
+        )
+        _wf_wmae_after  = float(
+            np.average(np.abs(_corrected_wf - y_wf_val), weights=_wf_adv_w)
+        )
+        _improvement    = _wf_wmae_before - _wf_wmae_after
+        _rel_margin_abs = BIAS_CORRECTION_REL_MARGIN * _wf_wmae_before
+        _apply_lc       = _improvement > _rel_margin_abs
+
+        if _apply_lc:
+            ensemble_preds = np.clip(
+                ensemble_preds - BIAS_CORRECTION_SCALE * _bias_row_val, 0, None
+            )
+            print(
+                f"Level correction APPLIED: global_bias={_bias_global:.4f}  "
+                f"wf_wmae {_wf_wmae_before:.4f} → {_wf_wmae_after:.4f}  "
+                f"improvement={_improvement:.4f} (rel_margin={_rel_margin_abs:.4f})"
+            )
+        else:
+            print(
+                f"Level correction SKIPPED: improvement={_improvement:.4f} "
+                f"<= rel_margin={_rel_margin_abs:.4f} "
+                f"({BIAS_CORRECTION_REL_MARGIN:.1%} of {_wf_wmae_before:.4f})"
+            )
+
+        _level_correction.update({
+            "applied":                _apply_lc,
+            "bias_hat_global":        _bias_global,
+            "bias_hat_per_group":     _bias_per_group,
+            "used_per_group":         _used_per_group,
+            "wf_weighted_mae_before": _wf_wmae_before,
+            "wf_weighted_mae_after":  _wf_wmae_after,
+            "notes": (
+                f"improvement={_improvement:.4f}  "
+                f"rel_margin={_rel_margin_abs:.4f}  applied={_apply_lc}"
+            ),
+        })
+    except Exception as _lc_exc:
+        import traceback as _lc_tb
+        print(f"Level correction failed ({_lc_exc}) — skipping")
+        _lc_tb.print_exc()
+        _level_correction["notes"] = f"error: {str(_lc_exc)[:200]}"
+
     _postprocessing = {
         "ordinal_rounding_applied": False,
         "ordinal_raw_wf_mae":       None,
@@ -1560,6 +1683,7 @@ if __name__ == "__main__":
         },
         "postprocessing":    _postprocessing,
         "lag_forecasting":   _lag_forecasting,
+        "level_correction":  _level_correction,
         # OBSERVABILITY ONLY — pointer to per-seed OOF prediction arrays.
         # Not consumed by validator/critic/submission/report — diagnostic only.
         "oof_per_seed": {
