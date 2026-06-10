@@ -38,18 +38,76 @@ The pipeline needs Python 3.11+ and a handful of scientific packages. The most
 reliable setup is a dedicated virtual environment (avoids polluting a base
 environment and sidesteps conda/quota issues on shared clusters).
 
-### 2.1 Create and activate a venv
+### 2.1 (Shared clusters) Get an interactive allocation with enough RAM
+
+The pipeline's compute is RAM-bound, not CPU-bound — the modeler needs enough memory
+to hold the full feature matrix without swapping. On a SLURM cluster, request an
+interactive node *before* doing anything else (skip this section on a local machine
+with adequate free RAM):
 
 ```bash
-# create the environment (use any path you like)
-python3 -m venv /path/to/envs/award_b
-source /path/to/envs/award_b/bin/activate      # Linux/macOS
-#  .\path\to\envs\award_b\Scripts\Activate.ps1  # Windows PowerShell
+# request 32 GB RAM, 8 cores, 4-hour interactive session
+# (4 hours avoids a mid-run lease expiry killing a long autonomous run)
+srun --mem=32G --cpus-per-task=8 --time=4:00:00 --pty bash
+```
+
+This drops you into a shell **on the compute node**. Important:
+
+- Commands you paste *after* the `srun` line do not run on the compute node until the
+  new shell appears — type them into the new prompt once it returns.
+- An interactive `srun` session dies if your SSH connection drops. To survive
+  disconnects, start it inside `tmux` first:
+```bash
+  tmux new -s award_b        # on the login node
+  srun --mem=32G --cpus-per-task=8 --time=4:00:00 --pty bash
+  # reconnect later with:  tmux attach -t award_b
+```
+- Check a running allocation with `squeue -u <username>` (column `L` = time left).
+
+### 2.2 Create and activate the venv (with the *correct* base Python)
+
+On clusters where conda is installed, a `base` environment is often auto-activated and
+puts an old Python first on your PATH. Building a venv from that base can produce the
+wrong Python version. Get out of conda base first, then create the venv:
+
+```bash
+# leave any active conda environment so it can't shadow the venv
+conda deactivate 2>/dev/null
+conda deactivate 2>/dev/null            # run twice; base sometimes re-activates
+# (optional, permanent) stop conda auto-activating base on login:
+#   conda config --set auto_activate_base false
+
+# confirm the python3 you're about to build from is 3.11+
+python3 --version                        # must be 3.11+; if not, module-load a newer one
+
+# create the environment on a WORK/SCRATCH volume, not home (home is usually too small)
+python3 -m venv /work/<you>/envs/award_b
+source /work/<you>/envs/award_b/bin/activate      # Linux/macOS
+#  .\path\to\envs\award_b\Scripts\Activate.ps1     # Windows PowerShell
 
 python --version    # confirm 3.11+
 ```
 
-### 2.2 Install dependencies
+### 2.3 Make the venv the default `python3` for this shell
+
+Activation usually puts the venv first on PATH, but conda init can re-assert itself.
+Force the venv to win and clear cached lookups, then verify:
+
+```bash
+export PATH="/work/<you>/envs/award_b/bin:$PATH"
+hash -r                                  # clear bash's cached command paths
+
+# VERIFY — all three must point at the venv, not conda/home/system Python:
+which python3                            # -> /work/<you>/envs/award_b/bin/python3
+python3 --version                        # -> 3.11+  (NOT 3.6.x)
+```
+
+If `which python3` shows a conda (`.../anaconda/...`) or home (`/nas/.../home/...`)
+path instead of the venv, the environment is still shadowed — re-run `conda deactivate`
+and `hash -r` until it points at the venv. **Do not proceed until `which python3` is the
+venv**; otherwise downstream stages will pick up the wrong interpreter.
+
+### 2.4 Install dependencies
 
 If the repo's `pyproject.toml` dependency list is correct, the simplest install is:
 
@@ -57,10 +115,11 @@ If the repo's `pyproject.toml` dependency list is correct, the simplest install 
 pip install -e .
 ```
 
-Otherwise install the packages directly (this is the known-good set):
+Otherwise install the packages directly (this is the known-good set). On a cluster,
+point the pip cache at a work volume to avoid home-quota errors:
 
 ```bash
-pip install \
+pip install --cache-dir /work/<you>/.pip-cache \
   "pandas>=2.0" "numpy>=1.24" "scikit-learn>=1.3" "catboost>=1.2" \
   "optuna>=3.4" "matplotlib>=3.7" "reportlab>=4.0" "pydantic>=2.0" \
   pyarrow
@@ -69,23 +128,40 @@ pip install \
 > `pyarrow` is required for reading/writing the `.parquet` feature files even though
 > it is not always listed as a direct dependency — install it explicitly.
 
-### 2.3 Verify
+### 2.5 Verify the environment
 
 ```bash
 python -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportlab, pydantic, pyarrow; print('all imports OK')"
 ```
 
-### 2.4 Notes for shared clusters
+Run the same check against `python3` explicitly, since that is what the pipeline's
+stages invoke:
 
-- If `pip`/conda complain about **disk quota**, point caches and the environment at
-  a work/scratch volume rather than your home directory
-  (e.g. `pip install --cache-dir /work/<you>/.pip-cache ...`, and create the venv
-  under `/work/...`). Home directories on HPC systems are frequently too small.
-- Launch Claude Code from **inside** the activated venv so every stage uses the same
-  interpreter. If sub-stages can't find packages, ensure they invoke the venv's
-  Python explicitly rather than a system `python3`.
+```bash
+python3 -c "import catboost, optuna, pyarrow; print('python3 sees the deps')"
+```
 
----
+### 2.6 Launch so every stage uses the venv
+
+Launch Claude Code (or run the pipeline) **from the shell where `which python3` is the
+venv**, so every child stage inherits the correct interpreter. If sub-stages still
+fail to find packages (a sign they resolved a system `python3`), make the dispatch use
+an absolute interpreter path rather than a bare `python3` — e.g. export it once and
+have the orchestrator read it:
+
+```bash
+export AWARD_B_PY=/work/<you>/envs/award_b/bin/python
+```
+
+A quick way to confirm the *launching* shell is correct before you start a run — all
+three must succeed:
+
+```bash
+which python3 && python3 --version && python3 -c "import catboost; print('catboost ok')"
+```
+
+If any of the three fails, the pipeline will fail the same way mid-run; fix the shell
+(Sections 2.2–2.3) before launching.
 
 ## 3. Inputs and Outputs
 
