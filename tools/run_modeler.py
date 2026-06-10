@@ -149,10 +149,21 @@ if __name__ == "__main__":
     model_settings  = config.get("model_settings", {})
     cb_objective    = model_settings.get("objective", "MAE")
 
-    # CatBoost loss_function from config.model_settings.objective. Accept either a
-    # raw CatBoost loss name ("MAE", "RMSE", "Huber:delta=1.0") or "MAE"/"RMSE".
-    _cb_loss        = cb_objective
-    _cb_eval_metric = "MAE" if cb_objective.startswith("MAE") else cb_objective.split(":")[0]
+    _is_classification = problem_subtype in (
+        "binary_classification", "multiclass_classification"
+    )
+    _apply_inv_clip = not _is_classification
+    if problem_subtype == "binary_classification":
+        _cb_loss        = "Logloss"
+        _cb_eval_metric = "AUC"
+    elif problem_subtype == "multiclass_classification":
+        _cb_loss        = "MultiClass"
+        _cb_eval_metric = "Accuracy"
+    else:
+        # regression path: respect config objective (MAE default)
+        _cb_loss        = cb_objective
+        _cb_eval_metric = ("MAE" if cb_objective.startswith("MAE")
+                           else cb_objective.split(":")[0])
 
     # Runtime-inject the group_relational step when the flag is on. Candidates
     # are the panel group columns; the encoder's own data-driven detection rule
@@ -172,7 +183,7 @@ if __name__ == "__main__":
 
     print(f"Problem type: {problem_type} / {problem_subtype}")
     print(f"Target: {target_col}   Groups: {group_cols}   Time: {time_col}")
-    print(f"CatBoost loss: {_cb_loss}   eval_metric: {_cb_eval_metric}")
+    print(f"CatBoost loss: {_cb_loss}   eval_metric: {_cb_eval_metric}   is_classification={_is_classification}")
     print(f"Adaptive steps: {[s.get('name') for s in adaptive_steps]}")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -395,7 +406,10 @@ if __name__ == "__main__":
 
     candidates_mae: dict = {}
 
-    if TRANSFORM_REQUEST != "auto":
+    if _is_classification:
+        _transform_mode = "none"
+        print("Transform: classification subtype — using 'none' (no target transform for class labels).")
+    elif TRANSFORM_REQUEST != "auto":
         _transform_mode = TRANSFORM_REQUEST
         print(f"Transform: manual override --transform={TRANSFORM_REQUEST}; "
               f"A/B skipped.")
@@ -445,6 +459,7 @@ if __name__ == "__main__":
             _y_tr_ab = _fwd_for_mode(_cand, y_tr_raw_ab)
             _y_va_ab = _fwd_for_mode(_cand, y_va_raw_ab)
             try:
+                # classification subtypes never reach here — bypassed by _transform_mode = "none" guard above
                 _m = _cb_module_ab.CatBoostRegressor(**_ab_probe_params)
                 _m.fit(_X_tr_ab_t, _y_tr_ab, sample_weight=_sw_ab,
                        eval_set=(_X_va_ab_t, _y_va_ab), verbose=False)
@@ -603,6 +618,11 @@ if __name__ == "__main__":
     from sklearn.linear_model import Ridge
     import optuna
 
+    _CatBoostModel = (
+        _cb_module.CatBoostClassifier if _is_classification
+        else _cb_module.CatBoostRegressor
+    )
+
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
@@ -640,9 +660,13 @@ if __name__ == "__main__":
         }
         for s in seeds:
             params = {**base_params, "random_seed": s}
-            m = _cb_module.CatBoostRegressor(**params)
+            m = _CatBoostModel(**params)
             m.fit(X_tr_t, y_tr, sample_weight=sample_weight, verbose=False)
-            seed_preds.append(np.clip(inv(m.predict(X_va_t)), 0, None))
+            _raw = m.predict(X_va_t)
+            # CatBoostClassifier.predict() may return (n, 1) shape; flatten to 1D.
+            if isinstance(_raw, np.ndarray) and _raw.ndim > 1:
+                _raw = _raw.squeeze(axis=-1) if _raw.shape[-1] == 1 else _raw.flatten()
+            seed_preds.append(np.clip(inv(_raw), 0, None) if _apply_inv_clip else _raw)
             models.append(m)
         preds = _seed_agg(seed_preds, axis=0)
         return preds, seed_preds, models, bp
@@ -970,7 +994,7 @@ if __name__ == "__main__":
     _X_wf_tr_t = _probe_bp_cat.pipeline.transform(X_wf_train_df)
     _X_wf_va_t = _probe_bp_cat.pipeline.transform(X_wf_val_df)
     _cf_probe_idx = [_X_wf_tr_t.columns.get_loc(c) for c in cat_feature_cols if c in _X_wf_tr_t.columns]
-    probe = _cb_module.CatBoostRegressor(**{**probe_params, "cat_features": _cf_probe_idx})
+    probe = _CatBoostModel(**{**probe_params, "cat_features": _cf_probe_idx})
     probe.fit(
         _X_wf_tr_t, y_wf_train, sample_weight=_wf_sw,
         eval_set=(_X_wf_va_t, forward_transform(y_wf_val_raw)),
@@ -980,7 +1004,10 @@ if __name__ == "__main__":
     best_n_estimators = int(_best_iter * 1.1)
     if DEBUG:
         best_n_estimators = min(best_n_estimators, 200)
-    _wf_probe_preds = np.clip(inv(probe.predict(_X_wf_va_t)), 0, None)
+    _raw_probe = probe.predict(_X_wf_va_t)
+    if isinstance(_raw_probe, np.ndarray) and _raw_probe.ndim > 1:
+        _raw_probe = _raw_probe.squeeze(axis=-1) if _raw_probe.shape[-1] == 1 else _raw_probe.flatten()
+    _wf_probe_preds = np.clip(inv(_raw_probe), 0, None) if _apply_inv_clip else _raw_probe
     wf_mae          = float(mean_absolute_error(y_wf_val, _wf_probe_preds))
     _wf_val_scored_m = _scored_mask(wf_val, scored_filters)
     wf_mae_scored = _mae_scored(y_wf_val, _wf_probe_preds, _wf_val_scored_m)
@@ -1012,10 +1039,13 @@ if __name__ == "__main__":
     _cb_seed_preds = []
     for seed in FINAL_RETRAIN_SEEDS:
         params_s = {**final_params, "cat_features": _cf_prod_idx, "random_seed": seed}
-        m = _cb_module.CatBoostRegressor(**params_s)
+        m = _CatBoostModel(**params_s)
         m.fit(X_train_t, y_full, sample_weight=_adv_weights, verbose=False)
         _cb_trained_models.append(m)
-        _cb_seed_preds.append(np.clip(inv(m.predict(X_val_t)), 0, None))
+        _raw_final = m.predict(X_val_t)
+        if isinstance(_raw_final, np.ndarray) and _raw_final.ndim > 1:
+            _raw_final = _raw_final.squeeze(axis=-1) if _raw_final.shape[-1] == 1 else _raw_final.flatten()
+        _cb_seed_preds.append(np.clip(inv(_raw_final), 0, None) if _apply_inv_clip else _raw_final)
 
     cb_ensemble_preds = _seed_agg(_cb_seed_preds, axis=0)
     cb_training_time  = int(time.time() - _cb_t0)
@@ -1024,9 +1054,15 @@ if __name__ == "__main__":
           f"mean={cb_ensemble_preds.mean():.2f}  training_time={cb_training_time}s")
 
     # Write OOF predictions (one row per outer-fold val row)
-    _oof_ids = train_df.loc[_covered, group_cols + [time_col]].copy().reset_index(drop=True)
+    _oof_id_cols = list(group_cols) + ([time_col] if time_col else [])
+    _oof_ids = train_df.loc[_covered, _oof_id_cols].copy().reset_index(drop=True)
     _oof_ids["fold"]             = -1
-    _oof_ids["predicted_target"] = oof_preds[_covered]
+    # OOF CSV is observability-only (validator runs its own strict CV; it does not
+    # read this file for metrics), so rounding here is correct but not on the critical path.
+    _oof_ids["predicted_target"] = (
+        np.round(oof_preds[_covered]).astype(int) if _is_classification
+        else oof_preds[_covered]
+    )
     _oof_path = os.path.join(REPO_ROOT, "reports", "oof_predictions.csv")
     _oof_ids.to_csv(_oof_path, index=False, encoding="utf-8")
     print(f"Written OOF predictions: {_oof_path}  shape={_oof_ids.shape}")
@@ -1152,7 +1188,12 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────────────────
     # Step 11 — Final val predictions and ensemble metadata
     # ─────────────────────────────────────────────────────────────────────────
-    ensemble_preds = np.clip(cb_ensemble_preds, 0, None)
+    # TODO: use scipy.stats.mode for true majority-vote in multiclass; mean+round is
+    # correct when one class has >50% of seeds but can mis-tiebreak with 3+ classes
+    ensemble_preds = (
+        np.clip(cb_ensemble_preds, 0, None) if _apply_inv_clip
+        else np.round(cb_ensemble_preds).astype(int).astype(float)
+    )
     ensemble_blend = "single_catboost"
     _blend_weights_log = {"catboost": 1.0}
     _included_keys     = ["catboost"]
@@ -1434,9 +1475,10 @@ if __name__ == "__main__":
         "wf_weighted_mae_before": None,
         "wf_weighted_mae_after":  None,
         "used_per_group":         False,
-        "notes":                  "not_attempted",
+        "notes":                  "skipped_for_classification" if _is_classification else "not_attempted",
     }
-    try:
+    if not _is_classification:
+      try:
         # Out-of-sample residuals: probe trained on wf_train only.
         _wf_resid = _wf_probe_preds - y_wf_val
 
@@ -1526,7 +1568,7 @@ if __name__ == "__main__":
                 f"rel_margin={_rel_margin_abs:.4f}  applied={_apply_lc}"
             ),
         })
-    except Exception as _lc_exc:
+      except Exception as _lc_exc:
         import traceback as _lc_tb
         print(f"Level correction failed ({_lc_exc}) — skipping")
         _lc_tb.print_exc()

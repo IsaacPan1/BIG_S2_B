@@ -35,7 +35,7 @@ except Exception:
 import catboost as _cb_module
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, roc_auc_score, accuracy_score
 from sklearn.model_selection import GroupKFold
 
 warnings.filterwarnings("ignore")
@@ -77,20 +77,30 @@ def _fit_one_fold(
     hparams: dict,
     n_estimators: int,
     seed: int = 42,
-) -> tuple["_cb_module.CatBoostRegressor", np.ndarray]:
+    problem_subtype: str = "",
+) -> tuple[object, np.ndarray]:
     """Train one CatBoost fold and return (model, val_predictions)."""
+    _is_cls = problem_subtype in ("binary_classification", "multiclass_classification")
+    if problem_subtype == "binary_classification":
+        _loss, _metric = "Logloss", "AUC"
+    elif problem_subtype == "multiclass_classification":
+        _loss, _metric = "MultiClass", "Accuracy"
+    else:
+        _loss, _metric = "MAE", "MAE"
     params = {
         "iterations":    n_estimators,
-        "loss_function": "MAE",
-        "eval_metric":   "MAE",
+        "loss_function": _loss,
+        "eval_metric":   _metric,
         "verbose":       False,
         "allow_writing_files": False,
         "random_seed":   seed,
         **hparams,
     }
-    model = _cb_module.CatBoostRegressor(**params)
+    ModelClass = _cb_module.CatBoostClassifier if _is_cls else _cb_module.CatBoostRegressor
+    model = ModelClass(**params)
     model.fit(X_tr, y_tr, verbose=False)
-    preds = np.clip(model.predict(X_vl), 0, None)
+    raw = model.predict(X_vl)
+    preds = raw if _is_cls else np.clip(raw, 0, None)
     return model, preds
 
 
@@ -157,14 +167,16 @@ def compute_strict_cv(
     problem_type: str,
     hparams: dict,
     n_estimators: int,
-) -> tuple[float, str, list, list[float], list[int]]:
+    problem_subtype: str = "",
+) -> tuple[float, str, list, list[float], list[int], list[float]]:
     """
     Run strict CV and return
-    (mean_mae, scheme_description, fold_models, fold_maes, fold_train_sizes).
+    (mean_mae, scheme_description, fold_models, fold_maes, fold_train_sizes, fold_cls_metrics).
 
     fold_models are used downstream for importance averaging.
     fold_maes and fold_train_sizes are written to validator_review.json for
     gap_attribution.py to classify the OOF→strict gap.
+    fold_cls_metrics holds per-fold AUC (binary) or accuracy (multiclass); empty for regression.
     """
     if problem_type == "panel_forecasting" and time_col:
         splits = _panel_strict_splits(
@@ -187,9 +199,11 @@ def compute_strict_cv(
             splits = [(train_df.index[:cut], train_df.index[cut:])]
             scheme = "80/20 sequential split (no group column available)"
 
+    _is_cls = problem_subtype in ("binary_classification", "multiclass_classification")
     fold_maes: list[float] = []
     fold_models: list = []
     fold_train_sizes: list[int] = []
+    fold_cls_metrics: list[float] = []
 
     for tr_idx, vl_idx in splits:
         fold_tr = train_df.loc[tr_idx]
@@ -203,13 +217,21 @@ def compute_strict_cv(
         X_vl = fold_vl[feature_cols].fillna(fill).values
         y_vl = fold_vl[target_col].values
 
-        model, preds = _fit_one_fold(X_tr, y_tr, X_vl, hparams, n_estimators)
+        model, preds = _fit_one_fold(X_tr, y_tr, X_vl, hparams, n_estimators,
+                                     problem_subtype=problem_subtype)
         fold_mae = float(mean_absolute_error(y_vl, preds))
         fold_maes.append(fold_mae)
         fold_models.append(model)
+        if problem_subtype == "binary_classification":
+            try:
+                fold_cls_metrics.append(float(roc_auc_score(y_vl, preds)))
+            except Exception:
+                fold_cls_metrics.append(float("nan"))
+        elif problem_subtype == "multiclass_classification":
+            fold_cls_metrics.append(float(accuracy_score(y_vl, preds)))
 
     strict_mae = float(np.mean(fold_maes))
-    return strict_mae, scheme, fold_models, fold_maes, fold_train_sizes
+    return strict_mae, scheme, fold_models, fold_maes, fold_train_sizes, fold_cls_metrics
 
 
 # ── LEAVE-ONE-FEATURE-OUT CV ───────────────────────────────────────────────
@@ -225,6 +247,7 @@ def loo_strict_cv(
     n_estimators: int,
     base_strict_mae: float,
     candidate_features: list[str],
+    problem_subtype: str = "",
 ) -> dict[str, float]:
     """
     For each candidate feature, re-run strict CV without it.
@@ -238,9 +261,10 @@ def loo_strict_cv(
             results[feat] = 0.0
             continue
         try:
-            loo_mae, _, _, _, _ = compute_strict_cv(
+            loo_mae, _, _, _, _, _ = compute_strict_cv(
                 train_df, reduced, target_col, group_cols,
                 time_col, problem_type, hparams, n_estimators,
+                problem_subtype=problem_subtype,
             )
             results[feat] = float(loo_mae - base_strict_mae)
         except Exception as exc:
@@ -307,10 +331,14 @@ def compute_verdict(
     cv_gap_pct: float,
     has_two_signal_suspect: bool,
     max_importance_share: float,
+    is_classification: bool = False,
 ) -> tuple[str, dict[str, str]]:
     """Return (verdict, checks_dict)."""
-    # cv_integrity
-    if cv_gap_pct > CV_GAP_CRITICAL_PCT:
+    # cv_integrity — gap thresholds are calibrated for regression MAE;
+    # suppress for classification where the metric differs
+    if is_classification:
+        cv_check = "PASS"
+    elif cv_gap_pct > CV_GAP_CRITICAL_PCT:
         cv_check = "CRITICAL"
     elif cv_gap_pct > CV_GAP_WARNING_PCT:
         cv_check = "WARNING"
@@ -378,10 +406,12 @@ def main() -> None:
         schema_text = schema_path.read_text(encoding="utf-8")
 
     # ── Resolve schema fields ────────────────────────────────────────
-    problem_type = profile.get("problem_type", "tabular_regression")
-    target_col   = profile["target_col"]
-    group_cols   = profile.get("group_cols") or []
-    time_col     = profile.get("time_col")
+    problem_type    = profile.get("problem_type", "tabular_regression")
+    problem_subtype = profile.get("problem_subtype", "")
+    _is_cls         = problem_subtype in ("binary_classification", "multiclass_classification")
+    target_col      = profile["target_col"]
+    group_cols      = profile.get("group_cols") or []
+    time_col        = profile.get("time_col")
 
     hparams = model_results.get("best_params", {
         "learning_rate": 0.05,
@@ -413,10 +443,11 @@ def main() -> None:
 
     # ── Strict CV ────────────────────────────────────────────────────
     print("\n--- Computing strict CV ---")
-    strict_cv_mae, strict_cv_scheme, fold_models, _fold_maes, _fold_train_sizes = \
+    strict_cv_mae, strict_cv_scheme, fold_models, _fold_maes, _fold_train_sizes, _fold_cls_metrics = \
         compute_strict_cv(
             train_df, feature_cols, target_col, group_cols, time_col,
             problem_type, hparams, n_estimators,
+            problem_subtype=problem_subtype,
         )
     print(f"strict_cv_mae: {strict_cv_mae:.4f}")
     print(f"scheme: {strict_cv_scheme}")
@@ -442,6 +473,7 @@ def main() -> None:
         loo_deltas = loo_strict_cv(
             train_df, feature_cols, target_col, group_cols, time_col,
             problem_type, hparams, n_estimators, strict_cv_mae, candidates,
+            problem_subtype=problem_subtype,
         )
         for feat, delta in loo_deltas.items():
             print(f"  {feat}: delta={delta:.4f}")
@@ -479,29 +511,44 @@ def main() -> None:
     has_two_signal_suspect = any(r["suspect"] for r in feature_suspicion)
 
     # ── Verdict ──────────────────────────────────────────────────────
-    verdict, checks = compute_verdict(cv_gap_pct, has_two_signal_suspect, max_share)
+    verdict, checks = compute_verdict(cv_gap_pct, has_two_signal_suspect, max_share,
+                                      is_classification=_is_cls)
     print(f"\nVerdict: {verdict}")
     print(f"Checks: {checks}")
+
+    _cls_metric_val  = float(np.mean(_fold_cls_metrics)) if _fold_cls_metrics else None
+    _cls_metric_type = ("AUC" if problem_subtype == "binary_classification"
+                        else "accuracy" if problem_subtype == "multiclass_classification"
+                        else None)
 
     notes = _build_notes(
         verdict, reported_cv_mae, strict_cv_mae, cv_gap_pct,
         strict_cv_scheme, candidates, feature_suspicion, max_share,
     )
+    if _is_cls and _cls_metric_val is not None:
+        notes += (
+            f"\nClassification metric ({_cls_metric_type}) across strict CV folds: "
+            f"{_cls_metric_val:.4f}  "
+            f"(fold values: {[round(v, 4) for v in _fold_cls_metrics]}). "
+            f"CV gap thresholds suppressed (regression-calibrated)."
+        )
 
     # ── Write validator_review.json ──────────────────────────────────
     review = {
-        "verdict":           verdict,
-        "reported_cv_mae":   float(reported_cv_mae),
-        "strict_cv_mae":     float(strict_cv_mae),
-        "honest_cv_mae":     float(strict_cv_mae),
-        "cv_gap_abs":        float(cv_gap_abs),
-        "cv_gap_pct":        float(cv_gap_pct),
-        "strict_cv_scheme":  strict_cv_scheme,
-        "fold_maes":         [float(m) for m in _fold_maes],
-        "fold_train_sizes":  [int(s) for s in _fold_train_sizes],
-        "feature_suspicion": feature_suspicion,
-        "checks":            checks,
-        "notes":             notes,
+        "verdict":               verdict,
+        "reported_cv_mae":       float(reported_cv_mae),
+        "strict_cv_mae":         float(strict_cv_mae),
+        "honest_cv_mae":         float(strict_cv_mae),
+        "cv_gap_abs":            float(cv_gap_abs),
+        "cv_gap_pct":            float(cv_gap_pct),
+        "strict_cv_scheme":      strict_cv_scheme,
+        "fold_maes":             [float(m) for m in _fold_maes],
+        "fold_train_sizes":      [int(s) for s in _fold_train_sizes],
+        "strict_cv_metric":      _cls_metric_val,
+        "strict_cv_metric_type": _cls_metric_type,
+        "feature_suspicion":     feature_suspicion,
+        "checks":                checks,
+        "notes":                 notes,
     }
     out_path = reports / "validator_review.json"
     with open(out_path, "w", encoding="utf-8") as f:

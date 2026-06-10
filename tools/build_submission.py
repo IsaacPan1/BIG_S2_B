@@ -180,8 +180,10 @@ def main() -> None:
     with open(profile_path) as f:
         profile = json.load(f)
 
-    target_col    = profile.get("target_col", "predicted_target")
-    fp            = profile.get("file_paths", {})
+    target_col      = profile.get("target_col", "predicted_target")
+    problem_subtype = profile.get("problem_subtype", "")
+    _is_cls         = problem_subtype in ("binary_classification", "multiclass_classification")
+    fp              = profile.get("file_paths", {})
     composite_key = _get_composite_key(profile)
     print(f"Composite business key from profile.json: {composite_key}")
 
@@ -287,36 +289,53 @@ def main() -> None:
     else:
         print("NaN check OK: 0 NaN values")
 
-    n_negative = int((submission[target_col] < 0).sum())
-    if n_negative > 0:
-        msg = f"{n_negative} negative predictions clipped to 0"
-        print(f"WARNING: {msg}")
-        warnings_list.append(msg)
-        submission[target_col] = submission[target_col].clip(lower=0)
+    if _is_cls:
+        # Classification: verify predicted labels are within the training label set
+        try:
+            train_vals = _load_train_target(DATA_DIR, fp, target_col)
+            if train_vals is not None:
+                valid_labels = set(int(round(v)) for v in train_vals.dropna().unique())
+                pred_labels  = set(int(round(v)) for v in submission[target_col].dropna().unique())
+                invalid = pred_labels - valid_labels
+                if invalid:
+                    msg = f"Predicted labels not in training set: {sorted(invalid)}"
+                    print(f"WARNING: {msg}")
+                    warnings_list.append(msg)
+                else:
+                    print(f"Label check OK: all predicted labels in training set {sorted(valid_labels)}")
+        except Exception as exc:
+            warnings_list.append(f"Could not perform label check: {exc}")
     else:
-        print("Non-negative check OK: 0 negative values")
+        n_negative = int((submission[target_col] < 0).sum())
+        if n_negative > 0:
+            msg = f"{n_negative} negative predictions clipped to 0"
+            print(f"WARNING: {msg}")
+            warnings_list.append(msg)
+            submission[target_col] = submission[target_col].clip(lower=0)
+        else:
+            print("Non-negative check OK: 0 negative values")
 
-    try:
-        train_vals = _load_train_target(DATA_DIR, fp, target_col)
-        if train_vals is not None:
-            train_max = float(train_vals.max())
-            train_min = float(train_vals.min())
-            pred_max  = float(submission[target_col].max())
-            pred_min  = float(submission[target_col].min())
-            if pred_max > train_max * 10:
-                msg = f"Prediction max {pred_max:.2f} is >10x training max {train_max:.2f}"
-                warnings_list.append(msg)
-                print(f"WARNING: {msg}")
-            if train_min > 0 and pred_min < train_min / 10:
-                msg = f"Prediction min {pred_min:.2f} is <0.1x training min {train_min:.2f}"
-                warnings_list.append(msg)
-                print(f"WARNING: {msg}")
-            print(
-                f"Range check: train [{train_min:.2f}, {train_max:.2f}], "
-                f"pred [{pred_min:.2f}, {pred_max:.2f}]"
-            )
-    except Exception as exc:
-        warnings_list.append(f"Could not perform range check: {exc}")
+        try:
+            train_vals = _load_train_target(DATA_DIR, fp, target_col)
+            if train_vals is not None:
+                train_max = float(train_vals.max())
+                train_min = float(train_vals.min())
+                pred_max  = float(submission[target_col].max())
+                pred_min  = float(submission[target_col].min())
+                if pred_max > train_max * 10:
+                    msg = f"Prediction max {pred_max:.2f} is >10x training max {train_max:.2f}"
+                    warnings_list.append(msg)
+                    print(f"WARNING: {msg}")
+                if train_min > 0 and pred_min < train_min / 10:
+                    msg = f"Prediction min {pred_min:.2f} is <0.1x training min {train_min:.2f}"
+                    warnings_list.append(msg)
+                    print(f"WARNING: {msg}")
+                print(
+                    f"Range check: train [{train_min:.2f}, {train_max:.2f}], "
+                    f"pred [{pred_min:.2f}, {pred_max:.2f}]"
+                )
+        except Exception as exc:
+            warnings_list.append(f"Could not perform range check: {exc}")
 
     submission = submission[list(sample.columns)]
     print(f"Final submission columns: {list(submission.columns)}")

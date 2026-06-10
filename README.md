@@ -34,125 +34,58 @@ engineering, cross-validation, and modeling accordingly.
 
 ## 2. Environment Setup
 
-> **Cardinal rule (clusters):** every step below must run on a **compute node**, not a
-> login node. After `srun` gives you a shell, run `hostname` — it must show a compute
-> node (e.g. `c1234`), never `login`-anything. Launch Claude Code / the pipeline from
-> that **same shell** so every stage inherits the right environment.
+The pipeline needs Python 3.11+ and a handful of scientific packages. The most
+reliable setup is a dedicated virtual environment (avoids polluting a base
+environment and sidesteps conda/quota issues on shared clusters).
 
-You need Python 3.11+ and a few scientific packages in a dedicated virtual environment.
-Set your base path **once** as a variable and the rest is copy-paste.
-
-### 2.0 Set your base path (do this first)
-
-Pick the directory your venv and caches will live in. On a cluster use a `/work` or
-scratch volume, **not** your home directory (home quotas are usually too small). Replace
-the path with your real one:
+### 2.1 Create and activate a venv
 
 ```bash
-# cluster example — use YOUR work path:
-export AWARD_B_BASE=/work/users/x/y/yourid
-# local machine example:
-# export AWARD_B_BASE=$HOME
+# create the environment (use any path you like)
+python3 -m venv /path/to/envs/award_b
+source /path/to/envs/award_b/bin/activate      # Linux/macOS
+#  .\path\to\envs\award_b\Scripts\Activate.ps1  # Windows PowerShell
+
+python --version    # confirm 3.11+
 ```
 
-Everything below references `$AWARD_B_BASE`, so once this is set you can paste the rest
-verbatim.
+### 2.2 Install dependencies
 
-### 2.1 (Cluster) Get a compute node
-
-The modeler is RAM- and CPU-bound; more cores make it faster (8 cores ≈ a 30+ min
-modeler; 16 roughly halves that). Skip this on a local machine with enough free RAM.
+If the repo's `pyproject.toml` dependency list is correct, the simplest install is:
 
 ```bash
-# 32 GB RAM, 16 cores, 4-hour interactive session
-srun --mem=32G --cpus-per-task=16 --time=4:00:00 --pty bash
-hostname                      # MUST print a compute node (c####), NOT login*
+pip install -e .
 ```
 
-Notes:
-- Commands pasted *after* the `srun` line don't run until the new shell appears — wait
-  for the prompt, then continue.
-- An interactive `srun` dies if your SSH drops. If `tmux` is available, start it first
-  (`tmux new -s award_b`) so you can reconnect with `tmux attach -t award_b`.
-- Check a running job: `squeue -u $USER` (the `L` column is time left).
-
-### 2.2 Create the venv (escaping conda first)
-
-On conda-enabled clusters, a `base` environment is usually auto-activated and shadows
-your venv with an old Python — this is the #1 cause of setup failure. Escape it first:
+Otherwise install the packages directly (this is the known-good set):
 
 ```bash
-conda deactivate 2>/dev/null; conda deactivate 2>/dev/null   # twice; base re-activates
-python3 --version                          # MUST be 3.11+ before building the venv
-
-python3 -m venv $AWARD_B_BASE/envs/award_b
-source $AWARD_B_BASE/envs/award_b/bin/activate
-export PATH="$AWARD_B_BASE/envs/award_b/bin:$PATH"
-hash -r                                     # clear cached command lookups
-```
-
-(Windows PowerShell instead of the `source` line:
-`.\path\to\envs\award_b\Scripts\Activate.ps1`)
-
-### 2.3 Install dependencies
-
-```bash
-pip install --cache-dir $AWARD_B_BASE/.pip-cache \
+pip install \
   "pandas>=2.0" "numpy>=1.24" "scikit-learn>=1.3" "catboost>=1.2" \
-  "optuna>=3.4" "matplotlib>=3.7" "reportlab>=4.0" "pydantic>=2.0" pyarrow
+  "optuna>=3.4" "matplotlib>=3.7" "reportlab>=4.0" "pydantic>=2.0" \
+  pyarrow
 ```
 
-> `pyarrow` is required for the `.parquet` feature files and is often missing from
-> `pyproject.toml` — install it explicitly (it's included above).
+> `pyarrow` is required for reading/writing the `.parquet` feature files even though
+> it is not always listed as a direct dependency — install it explicitly.
 
-If the repo's `pyproject.toml` is correct you can instead use `pip install -e .`, but the
-explicit list above is the known-good set.
-
-### 2.4 Green-light check (run before launching anything)
-
-All three must succeed. This is the gate that prevents every mid-run failure:
+### 2.3 Verify
 
 ```bash
-hostname && which python3 && python3 -c "import catboost, optuna, pyarrow; print('READY')"
+python -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportlab, pydantic, pyarrow; print('all imports OK')"
 ```
 
-Expected:
-- `hostname` → a compute node (`c####`), not `login*`
-- `which python3` → `$AWARD_B_BASE/envs/award_b/bin/python3` (the venv — **not** a
-  conda `.../anaconda/...` or home `/nas/.../home/...` path)
-- prints `READY`
+### 2.4 Notes for shared clusters
 
-If `which python3` shows a conda/home path, conda re-shadowed the venv — re-run the
-`conda deactivate` / `export PATH` / `hash -r` lines from 2.2 until it points at the
-venv. **Do not launch until all three pass.**
+- If `pip`/conda complain about **disk quota**, point caches and the environment at
+  a work/scratch volume rather than your home directory
+  (e.g. `pip install --cache-dir /work/<you>/.pip-cache ...`, and create the venv
+  under `/work/...`). Home directories on HPC systems are frequently too small.
+- Launch Claude Code from **inside** the activated venv so every stage uses the same
+  interpreter. If sub-stages can't find packages, ensure they invoke the venv's
+  Python explicitly rather than a system `python3`.
 
-### 2.5 Launch and run
-
-From this same shell (where the green-light check passed), `cd` to the repo and start
-Claude Code. The compute-node shell starts in your home directory, so `cd` explicitly —
-it does **not** inherit the directory you were in on the login node:
-
-```bash
-cd /path/to/BIG_S2_B          # your repo location
-# launch Claude Code here, then trigger the pipeline ("Do the data analysis")
-```
-
-**Expected timing:** the modeler step takes ~15–40 min (fewer cores → longer). This is
-normal, not a hang. Verify progress any time with `ls -la reports/` — artifacts appear in
-stage order (`profile.json` → `features.json` → `model_results.json` → … → `report.pdf`).
-
-### 2.6 Troubleshooting (symptoms that look like bugs but aren't)
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Run "stuck" before the modeler | Stale artifacts from a previous run trip the handoff/freshness gates | Clear them for a fresh run: `rm -f data/features_*.parquet && find reports/ -type f ! -name '.gitkeep' -delete` (keeps raw input data + `sample_submission.csv`) |
-| `ps`/`squeue` shows nothing running | You're checking from a **login node**; the work is on the compute node | Run checks from the compute-node shell; confirm with `hostname` |
-| First commands very slow / "stuck importing pandas" | Repeated cold imports over networked `/work` storage | Normal — each fresh `python` process re-imports; wait it out |
-| Mid-run `ModuleNotFoundError` or a `capture_output`/Python-3.6 error | Conda re-shadowed the venv; a stage used the wrong `python3` | Redo 2.2–2.4; ensure `which python3` is the venv before launching |
-| Allocation/run died unexpectedly | SSH dropped (kills interactive `srun`) or the `--time` lease expired | Use `tmux` (2.1); request enough `--time` (4 h) for a full run |
-
-*Local / non-conda setup:* skip 2.1; in 2.2 you don't need the `conda deactivate` lines
-(just confirm `python3 --version` is 3.11+); everything else is identical.
+---
 
 ## 3. Inputs and Outputs
 
@@ -234,6 +167,14 @@ predictions never reach the submission. Cross-family ensembling was deliberately
 removed in favor of a leaner, leak-proof pipeline; variance reduction comes from the
 5-seed CatBoost ensemble and the recursive-vs-imputation method selection.
 
+The CatBoost class used is dataset-driven: continuous_regression, ordinal_regression,
+and panel_forecasting subtypes use CatBoostRegressor with MAE; binary_classification
+uses CatBoostClassifier with Logloss; multiclass_classification uses CatBoostClassifier
+with MultiClass loss. The validator and submission writer follow the same routing —
+metric thresholds suppress for classification (gap thresholds are MAE-calibrated), and
+the submission validator checks predicted class labels are valid members of the
+training label set.
+
 | Family | Role | In submission? |
 |--------|------|----------------|
 | CatBoost | Sole predictor | Yes |
@@ -297,8 +238,33 @@ unknown future lags:
 Both are scored on a walk-forward holdout; recursive is kept only if its holdout MAE
 ≤ static's. It reuses trained models (extra prediction passes, no extra training).
 **Note:** this benefit does *not* appear in OOF/strict-CV (those are on training
-periods with known lags) — only on genuinely unknown future values. Logged under
-`lag_forecasting`.
+periods with known lags) — only on genuinely unknown future values. The ordinal time
+column is derived from the dataset's time_col (`f"{time_col}_ord"`), so recursion
+engages on any panel dataset regardless of the time column's name — not only when
+that column happens to be called period_id. Logged under `lag_forecasting`.
+
+### 5.6 Post-Hoc Level Correction (Shift-Aware, Gated)
+
+After final val predictions are produced, an optional level correction estimates and
+applies a shift-aware bias adjustment. On the walk-forward holdout (where labels are
+available because it's a training slice), the modeler computes per-row residuals from
+the out-of-sample probe model and weights them by the adversarial-validation density
+ratio (P(val-like)) to estimate the global bias the model carries under the train→val
+covariate shift. A per-group bias estimate is computed for groups with at least
+MIN_GROUP_HOLDOUT rows and shrunk toward the global estimate (hierarchical pooling,
+weight LAMBDA).
+
+The correction is gated: it is applied to final predictions ONLY if it reduces the
+weighted holdout MAE by more than BIAS_CORRECTION_REL_MARGIN × wf_wmae_before. On
+datasets with minimal shift or no in-train-visible bias, the gate does not fire and
+the correction is a no-op. The correction is regression-only (skipped for
+classification subtypes) and uses the OOS probe model — never the in-sample
+production fit. Logged under model_results.json → level_correction with global bias,
+per-group bias, before/after holdout MAE, and the applied flag.
+
+Important limit: the correction can only catch bias that is visible on the in-train
+walk-forward holdout. Pure out-of-distribution shift that does not surface in-train is
+not honestly correctable from training data alone.
 
 ---
 
@@ -447,7 +413,11 @@ clean runs.
   containing the target with <50% nulls is train; an all-null target is the
   submission file), with filename keywords as fallback and a second-pass content swap
   to fix mislabeled splits. Case-insensitive. Logged under `profile.json →
-  file_role_log`.
+  file_role_log`. Sequential row-index columns (e.g. an 'id' covariate with 100%
+  unique values) are excluded from shift detection and adversarial weighting via a
+  uniqueness-ratio filter (ID_UNIQUENESS_THRESHOLD = 0.95 in the cross-sectional
+  path), preventing a meaningless KS=1.0 alarm and wasted shift-aware features on
+  row identifiers.
 - **Rail 3 — Time-granularity ambiguity fallback.** Cadence is flagged ambiguous only
   when both irregular *and* within 12 h of a classification boundary; then cycle-
   specific harmonics are replaced with a single granularity-agnostic relative-time

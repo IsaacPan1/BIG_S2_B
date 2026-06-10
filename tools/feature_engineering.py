@@ -48,6 +48,7 @@ REPORTS_DIR = REPO / "reports"
 # gate generalises across datasets. Tune CARD_MAX up if a legitimate high-card
 # discrete category (e.g. ZIP code) must be admitted.
 CARD_MAX = 50
+ID_UNIQUENESS_THRESHOLD = 0.95  # cols where n_unique/n_rows > this are row IDs, not covariates
 
 
 def extract_numeric_from_text(series: "pd.Series") -> "pd.Series | None":
@@ -609,6 +610,14 @@ if time_col is None:
     # sex is binary categorical; image_filename is an ID/linkage column
     true_numeric_covs = [c for c in cov_cols
                          if schema.get(c, {}).get("dtype", "") in ("int64", "float64")]
+    _id_like_excl = [
+        c for c in true_numeric_covs
+        if train[c].nunique() / max(len(train), 1) > ID_UNIQUENESS_THRESHOLD
+        and schema.get(c, {}).get("dtype", "") not in ("float64", "float32")
+    ]
+    if _id_like_excl:
+        print(f"ID-like columns excluded from shift detection: {_id_like_excl}")
+    true_numeric_covs = [c for c in true_numeric_covs if c not in _id_like_excl]
     true_binary_covs  = [c for c in group_cols
                          if schema.get(c, {}).get("n_unique", 999) == 2
                          and schema.get(c, {}).get("dtype", "") not in ("int64", "float64")]
