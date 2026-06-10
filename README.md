@@ -34,134 +34,125 @@ engineering, cross-validation, and modeling accordingly.
 
 ## 2. Environment Setup
 
-The pipeline needs Python 3.11+ and a handful of scientific packages. The most
-reliable setup is a dedicated virtual environment (avoids polluting a base
-environment and sidesteps conda/quota issues on shared clusters).
+> **Cardinal rule (clusters):** every step below must run on a **compute node**, not a
+> login node. After `srun` gives you a shell, run `hostname` — it must show a compute
+> node (e.g. `c1234`), never `login`-anything. Launch Claude Code / the pipeline from
+> that **same shell** so every stage inherits the right environment.
 
-### 2.1 (Shared clusters) Get an interactive allocation with enough RAM
+You need Python 3.11+ and a few scientific packages in a dedicated virtual environment.
+Set your base path **once** as a variable and the rest is copy-paste.
 
-The pipeline's compute is RAM-bound, not CPU-bound — the modeler needs enough memory
-to hold the full feature matrix without swapping. On a SLURM cluster, request an
-interactive node *before* doing anything else (skip this section on a local machine
-with adequate free RAM):
+### 2.0 Set your base path (do this first)
+
+Pick the directory your venv and caches will live in. On a cluster use a `/work` or
+scratch volume, **not** your home directory (home quotas are usually too small). Replace
+the path with your real one:
 
 ```bash
-# request 32 GB RAM, 8 cores, 4-hour interactive session
-# (4 hours avoids a mid-run lease expiry killing a long autonomous run)
-srun --mem=32G --cpus-per-task=8 --time=4:00:00 --pty bash
+# cluster example — use YOUR work path:
+export AWARD_B_BASE=/work/users/x/y/yourid
+# local machine example:
+# export AWARD_B_BASE=$HOME
 ```
 
-This drops you into a shell **on the compute node**. Important:
+Everything below references `$AWARD_B_BASE`, so once this is set you can paste the rest
+verbatim.
 
-- Commands you paste *after* the `srun` line do not run on the compute node until the
-  new shell appears — type them into the new prompt once it returns.
-- An interactive `srun` session dies if your SSH connection drops. To survive
-  disconnects, start it inside `tmux` first:
-```bash
-  tmux new -s award_b        # on the login node
-  srun --mem=32G --cpus-per-task=8 --time=4:00:00 --pty bash
-  # reconnect later with:  tmux attach -t award_b
-```
-- Check a running allocation with `squeue -u <username>` (column `L` = time left).
+### 2.1 (Cluster) Get a compute node
 
-### 2.2 Create and activate the venv (with the *correct* base Python)
-
-On clusters where conda is installed, a `base` environment is often auto-activated and
-puts an old Python first on your PATH. Building a venv from that base can produce the
-wrong Python version. Get out of conda base first, then create the venv:
+The modeler is RAM- and CPU-bound; more cores make it faster (8 cores ≈ a 30+ min
+modeler; 16 roughly halves that). Skip this on a local machine with enough free RAM.
 
 ```bash
-# leave any active conda environment so it can't shadow the venv
-conda deactivate 2>/dev/null
-conda deactivate 2>/dev/null            # run twice; base sometimes re-activates
-# (optional, permanent) stop conda auto-activating base on login:
-#   conda config --set auto_activate_base false
-
-# confirm the python3 you're about to build from is 3.11+
-python3 --version                        # must be 3.11+; if not, module-load a newer one
-
-# create the environment on a WORK/SCRATCH volume, not home (home is usually too small)
-python3 -m venv /work/<you>/envs/award_b
-source /work/<you>/envs/award_b/bin/activate      # Linux/macOS
-#  .\path\to\envs\award_b\Scripts\Activate.ps1     # Windows PowerShell
-
-python --version    # confirm 3.11+
+# 32 GB RAM, 16 cores, 4-hour interactive session
+srun --mem=32G --cpus-per-task=16 --time=4:00:00 --pty bash
+hostname                      # MUST print a compute node (c####), NOT login*
 ```
 
-### 2.3 Make the venv the default `python3` for this shell
+Notes:
+- Commands pasted *after* the `srun` line don't run until the new shell appears — wait
+  for the prompt, then continue.
+- An interactive `srun` dies if your SSH drops. If `tmux` is available, start it first
+  (`tmux new -s award_b`) so you can reconnect with `tmux attach -t award_b`.
+- Check a running job: `squeue -u $USER` (the `L` column is time left).
 
-Activation usually puts the venv first on PATH, but conda init can re-assert itself.
-Force the venv to win and clear cached lookups, then verify:
+### 2.2 Create the venv (escaping conda first)
+
+On conda-enabled clusters, a `base` environment is usually auto-activated and shadows
+your venv with an old Python — this is the #1 cause of setup failure. Escape it first:
 
 ```bash
-export PATH="/work/<you>/envs/award_b/bin:$PATH"
-hash -r                                  # clear bash's cached command paths
+conda deactivate 2>/dev/null; conda deactivate 2>/dev/null   # twice; base re-activates
+python3 --version                          # MUST be 3.11+ before building the venv
 
-# VERIFY — all three must point at the venv, not conda/home/system Python:
-which python3                            # -> /work/<you>/envs/award_b/bin/python3
-python3 --version                        # -> 3.11+  (NOT 3.6.x)
+python3 -m venv $AWARD_B_BASE/envs/award_b
+source $AWARD_B_BASE/envs/award_b/bin/activate
+export PATH="$AWARD_B_BASE/envs/award_b/bin:$PATH"
+hash -r                                     # clear cached command lookups
 ```
 
-If `which python3` shows a conda (`.../anaconda/...`) or home (`/nas/.../home/...`)
-path instead of the venv, the environment is still shadowed — re-run `conda deactivate`
-and `hash -r` until it points at the venv. **Do not proceed until `which python3` is the
-venv**; otherwise downstream stages will pick up the wrong interpreter.
+(Windows PowerShell instead of the `source` line:
+`.\path\to\envs\award_b\Scripts\Activate.ps1`)
 
-### 2.4 Install dependencies
-
-If the repo's `pyproject.toml` dependency list is correct, the simplest install is:
+### 2.3 Install dependencies
 
 ```bash
-pip install -e .
-```
-
-Otherwise install the packages directly (this is the known-good set). On a cluster,
-point the pip cache at a work volume to avoid home-quota errors:
-
-```bash
-pip install --cache-dir /work/<you>/.pip-cache \
+pip install --cache-dir $AWARD_B_BASE/.pip-cache \
   "pandas>=2.0" "numpy>=1.24" "scikit-learn>=1.3" "catboost>=1.2" \
-  "optuna>=3.4" "matplotlib>=3.7" "reportlab>=4.0" "pydantic>=2.0" \
-  pyarrow
+  "optuna>=3.4" "matplotlib>=3.7" "reportlab>=4.0" "pydantic>=2.0" pyarrow
 ```
 
-> `pyarrow` is required for reading/writing the `.parquet` feature files even though
-> it is not always listed as a direct dependency — install it explicitly.
+> `pyarrow` is required for the `.parquet` feature files and is often missing from
+> `pyproject.toml` — install it explicitly (it's included above).
 
-### 2.5 Verify the environment
+If the repo's `pyproject.toml` is correct you can instead use `pip install -e .`, but the
+explicit list above is the known-good set.
+
+### 2.4 Green-light check (run before launching anything)
+
+All three must succeed. This is the gate that prevents every mid-run failure:
 
 ```bash
-python -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportlab, pydantic, pyarrow; print('all imports OK')"
+hostname && which python3 && python3 -c "import catboost, optuna, pyarrow; print('READY')"
 ```
 
-Run the same check against `python3` explicitly, since that is what the pipeline's
-stages invoke:
+Expected:
+- `hostname` → a compute node (`c####`), not `login*`
+- `which python3` → `$AWARD_B_BASE/envs/award_b/bin/python3` (the venv — **not** a
+  conda `.../anaconda/...` or home `/nas/.../home/...` path)
+- prints `READY`
+
+If `which python3` shows a conda/home path, conda re-shadowed the venv — re-run the
+`conda deactivate` / `export PATH` / `hash -r` lines from 2.2 until it points at the
+venv. **Do not launch until all three pass.**
+
+### 2.5 Launch and run
+
+From this same shell (where the green-light check passed), `cd` to the repo and start
+Claude Code. The compute-node shell starts in your home directory, so `cd` explicitly —
+it does **not** inherit the directory you were in on the login node:
 
 ```bash
-python3 -c "import catboost, optuna, pyarrow; print('python3 sees the deps')"
+cd /path/to/BIG_S2_B          # your repo location
+# launch Claude Code here, then trigger the pipeline ("Do the data analysis")
 ```
 
-### 2.6 Launch so every stage uses the venv
+**Expected timing:** the modeler step takes ~15–40 min (fewer cores → longer). This is
+normal, not a hang. Verify progress any time with `ls -la reports/` — artifacts appear in
+stage order (`profile.json` → `features.json` → `model_results.json` → … → `report.pdf`).
 
-Launch Claude Code (or run the pipeline) **from the shell where `which python3` is the
-venv**, so every child stage inherits the correct interpreter. If sub-stages still
-fail to find packages (a sign they resolved a system `python3`), make the dispatch use
-an absolute interpreter path rather than a bare `python3` — e.g. export it once and
-have the orchestrator read it:
+### 2.6 Troubleshooting (symptoms that look like bugs but aren't)
 
-```bash
-export AWARD_B_PY=/work/<you>/envs/award_b/bin/python
-```
+| Symptom | Cause | Fix |
+|---|---|---|
+| Run "stuck" before the modeler | Stale artifacts from a previous run trip the handoff/freshness gates | Clear them for a fresh run: `rm -f data/features_*.parquet && find reports/ -type f ! -name '.gitkeep' -delete` (keeps raw input data + `sample_submission.csv`) |
+| `ps`/`squeue` shows nothing running | You're checking from a **login node**; the work is on the compute node | Run checks from the compute-node shell; confirm with `hostname` |
+| First commands very slow / "stuck importing pandas" | Repeated cold imports over networked `/work` storage | Normal — each fresh `python` process re-imports; wait it out |
+| Mid-run `ModuleNotFoundError` or a `capture_output`/Python-3.6 error | Conda re-shadowed the venv; a stage used the wrong `python3` | Redo 2.2–2.4; ensure `which python3` is the venv before launching |
+| Allocation/run died unexpectedly | SSH dropped (kills interactive `srun`) or the `--time` lease expired | Use `tmux` (2.1); request enough `--time` (4 h) for a full run |
 
-A quick way to confirm the *launching* shell is correct before you start a run — all
-three must succeed:
-
-```bash
-which python3 && python3 --version && python3 -c "import catboost; print('catboost ok')"
-```
-
-If any of the three fails, the pipeline will fail the same way mid-run; fix the shell
-(Sections 2.2–2.3) before launching.
+*Local / non-conda setup:* skip 2.1; in 2.2 you don't need the `conda deactivate` lines
+(just confirm `python3 --version` is 3.11+); everything else is identical.
 
 ## 3. Inputs and Outputs
 

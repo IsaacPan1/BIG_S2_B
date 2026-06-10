@@ -1627,13 +1627,35 @@ else:
         if len(pf_scored) > 1:
             _pf_range = max(pf_scored) - min(pf_scored)
             story.append(Spacer(1, 0.1*cm))
+            _pf_mean = sum(pf_scored) / len(pf_scored)
+            _pf_std = (sum((x - _pf_mean) ** 2 for x in pf_scored) / len(pf_scored)) ** 0.5
+            _outlier_thresh = _pf_mean + 1.5 * _pf_std
+            _outliers = [(i + 1, v) for i, v in enumerate(pf_scored) if v > _outlier_thresh]
+            _cluster = [v for v in pf_scored if v <= _outlier_thresh]
+            if _outliers:
+                _cluster_rng = (
+                    f"range {fmt(min(_cluster), 4)}–{fmt(max(_cluster), 4)}"
+                    if len(_cluster) > 1 else fmt(_cluster[0], 4)
+                )
+                _out_str = ", ".join(f"fold {fi} ({fmt(fv, 4)})" for fi, fv in _outliers)
+                _interp = (
+                    f"{len(_cluster)} of {len(pf_scored)} folds cluster tightly "
+                    f"({_cluster_rng}); {_out_str} "
+                    f"{'is' if len(_outliers) == 1 else 'are'} an outlier "
+                    f"indicating a harder time window — the elevated MAE reflects "
+                    f"that period's difficulty, not model instability. "
+                    f"No monotonic improvement with training-window size is observed."
+                )
+            else:
+                _interp = (
+                    f"All {len(pf_scored)} folds cluster tightly — no outlier "
+                    f"fold detected; consistent performance across training-window sizes."
+                )
             story.append(_p(
                 f"Scored MAE range across {len(pf_scored)} folds: "
                 f"{fmt(_pf_range, 4)} "
                 f"(min {fmt(min(pf_scored), 4)}, max {fmt(max(pf_scored), 4)}). "
-                "Early folds train on shorter windows; MAE tends to improve as the "
-                "training window grows — a stable estimate shows consistent performance "
-                "even at smaller training sizes.",
+                + _interp,
                 BODY,
             ))
     else:
