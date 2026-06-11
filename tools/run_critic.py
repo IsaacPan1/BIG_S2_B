@@ -46,7 +46,7 @@ except Exception as e:
     predictions = pd.DataFrame({"predicted_target": []})
 
 try:
-    train_df     = pd.read_parquet("data/features_train.parquet", engine="fastparquet")
+    train_df     = pd.read_parquet("data/features_train.parquet")
     target_col   = features_meta.get("target_col") or profile.get("target_col", "")
     train_target = train_df[target_col].dropna() if target_col in train_df.columns else pd.Series(dtype=float)
     train_mean   = float(train_target.mean()) if len(train_target) > 0 else 0.0
@@ -207,7 +207,7 @@ if not second_cycle:
     try:
         abl = subprocess.run(
             [sys.executable, "tools/family_ablation.py", "--repo-root", "."],
-            capture_output=True, text=True, timeout=300,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
         )
         out_tail = abl.stdout[-4000:] if len(abl.stdout) > 4000 else abl.stdout
         print("[ablation stdout]:", out_tail)

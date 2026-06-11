@@ -561,7 +561,7 @@ def main() -> None:
         _gap_result = _subprocess.run(
             [sys.executable, str(root / "tools" / "gap_attribution.py"),
              "--repo-root", str(root)],
-            capture_output=True, text=True, timeout=60,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
         )
         print(_gap_result.stdout)
         if _gap_result.returncode != 0:

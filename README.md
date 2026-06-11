@@ -45,9 +45,17 @@ This is intentional — see [Section 5](#5-pipeline-stages) for why.
 Python 3.11+ required. A dedicated virtual environment avoids polluting a base
 environment and sidesteps conda/quota issues on shared clusters.
 
+> **Required before running.** The pipeline must be launched from inside an
+> activated Python 3.11+ venv. Launching Claude Code without activation causes
+> agents' `python` calls to resolve to the system Python, which may be an
+> older version — the pipeline's preflight gate will catch this and refuse to
+> run, but the fix is always the same: activate first.
+
 ```bash
 python3 -m venv /path/to/envs/award_b
 source /path/to/envs/award_b/bin/activate   # Linux/macOS
+
+python --version   # confirm 3.11+
 
 pip install \
   "pandas>=2.0" "numpy>=1.24" "scikit-learn>=1.3" "catboost>=1.2" \
@@ -64,8 +72,9 @@ python -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportla
 
 **Shared clusters.** If pip complains about disk quota, point caches and the venv
 at a work/scratch volume (`pip install --cache-dir /work/<you>/.pip-cache ...`).
-Launch Claude Code from inside the activated venv so every stage uses the same
-interpreter.
+**Launch Claude Code from inside the activated venv** so every stage uses the
+same interpreter. If sub-stages can't find packages, ensure they invoke the
+venv's Python explicitly rather than a system `python3`.
 
 ---
 

@@ -196,11 +196,34 @@ permitted; if a downstream stage cannot find its required artifacts, it must
 FAIL its own gate and not invent fallbacks based on the subagent's narrative
 report.
 
-### Step 0 — initialize `reports/pipeline_run.json` (ALWAYS first concrete action)
+### Step 0 — preflight check + initialize `reports/pipeline_run.json` (ALWAYS first concrete action)
 
-Before invoking ANY sub-agent — even schema_analyst — the orchestrator
-creates a fresh `reports/pipeline_run.json` per the schema in "Stage handoff
-contracts → Pipeline run state".
+#### Step 0a — interpreter preflight (HARD STOP on failure)
+
+Before any other action, verify that bare `python` — the same invocation
+agents use — resolves to Python 3.11+. Run this via the Bash tool:
+
+```bash
+python tools/preflight_check.py
+```
+
+**If exit code is non-zero: HARD STOP immediately.** Do not create
+`pipeline_run.json`. Do not invoke any sub-agent. Do not attempt a
+degraded run or fallback submission. Print the script's error message to
+the user and stop — the tools cannot import cleanly under the detected
+interpreter, and any submission produced would be invalid. The fix is to
+activate the Python 3.11 venv per README Section 3 and relaunch.
+
+**Why bare `python` and not the orchestrator's own interpreter.** The
+orchestrator's `sys.version_info` can be 3.11 while agents' Bash calls
+resolve `python` to a different interpreter via PATH. All agent Bash
+subprocesses share the same session PATH as this Step 0 Bash call, so a
+single preflight check here covers all downstream stages.
+
+#### Step 0b — initialize `reports/pipeline_run.json`
+
+After the preflight passes, create a fresh `reports/pipeline_run.json`
+per the schema in "Stage handoff contracts → Pipeline run state".
 
 ```python
 import json, datetime, pathlib
@@ -224,8 +247,8 @@ stale-state hole — it would silently validate prior-run completion records
 as fresh. There is no recovery / resume path off a prior pipeline_run.json;
 each pipeline run starts clean.
 
-Step 0 has no marker file and no sub-agent — it's a one-liner the
-orchestrator does itself.
+Step 0 has no marker file and no sub-agent — it's two orchestrator-inline
+actions (preflight Bash call + pipeline_run.json write).
 
 ### Step 1 — schema_analyst (ALWAYS first sub-agent)
 
