@@ -610,10 +610,18 @@ if time_col is None:
     # sex is binary categorical; image_filename is an ID/linkage column
     true_numeric_covs = [c for c in cov_cols
                          if schema.get(c, {}).get("dtype", "") in ("int64", "float64")]
+    def _is_int_id_like_xs(s: pd.Series, n: int) -> bool:
+        # Float columns are never row IDs — integer gate short-circuits first.
+        if not pd.api.types.is_integer_dtype(s):
+            return False
+        uniq = sorted(s.dropna().unique())
+        if len(uniq) >= 2 and (uniq[-1] - uniq[0] + 1) == len(uniq):
+            return True   # contiguous integer run (e.g. 0..N-1)
+        return len(uniq) / max(n, 1) >= ID_UNIQUENESS_THRESHOLD
+
     _id_like_excl = [
         c for c in true_numeric_covs
-        if train[c].nunique() / max(len(train), 1) > ID_UNIQUENESS_THRESHOLD
-        and schema.get(c, {}).get("dtype", "") not in ("float64", "float32")
+        if _is_int_id_like_xs(train[c], len(train))
     ]
     if _id_like_excl:
         print(f"ID-like columns excluded from shift detection: {_id_like_excl}")

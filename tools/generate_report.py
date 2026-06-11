@@ -902,7 +902,7 @@ else:
             f"(selected by minimising {ts_metric or 'walk-forward MAE'} across candidates)."
         )
 
-    if lag_method:
+    if lag_method and cv_plan.get("time_column"):
         dec_lines.append(
             f"Lag-feature strategy at validation boundary: "
             f"<b>{lag_method}</b> (Section 6 records the holdout comparison)."
@@ -1557,21 +1557,58 @@ else:
         BODY,
     ))
 
+    # ── CV justification helpers — derived from profile/cv_plan, never hardcoded ──
+    _has_time   = bool(cv_plan.get("time_column"))
+    _has_group  = bool(cv_plan.get("group_columns"))
+    _tgt_sch    = schema.get(target_col) or {}
+    _n_uniq     = _tgt_sch.get("n_unique")
+    _tgt_mean   = _tgt_sch.get("mean")
+    _pos_pct    = f"{_tgt_mean * 100:.1f}%" if _tgt_mean is not None else "unknown"
+    _is_classif = "classification" in (problem_subtype or "").lower()
+
     story.append(_p("Problem-Type Decision", H3))
-    story.append(tbl(["Candidate", "Outcome / Reason"], [
-        ["plain_regression",
-         "REJECTED — treats rows as IID; during CV, future observations train on past "
-         "predictions, introducing temporal leakage that produces optimistically biased "
-         "estimates and fails at submission time."],
-        ["univariate_time_series",
-         "REJECTED — one model per group; discards cross-group covariate structure, "
-         "shared seasonal patterns, and all external covariates keyed on (group, time). "
-         "Per-group signal-to-noise is lower because each group trains only on its own history."],
-        [f"{cv_type_sel.replace('TimeSeriesExpanding','panel_forecasting')} (selected)",
-         "SELECTED — panel structure confirmed: group×time index detected with regular "
-         "monthly cadence; external numeric covariates are keyed on (group, time); "
-         "group columns present in both train and val."],
-    ], widths=[4.5*cm, 11.5*cm]))
+    if _is_classif and not _has_time and not _has_group:
+        _pt_table_rows = [
+            ["random_kfold",
+             f"REJECTED — StratifiedKFold guarantees at least one positive example per "
+             f"fold; plain random k-fold can produce empty-positive folds on an "
+             f"imbalanced target ({_pos_pct} positive rate), inflating fold-to-fold "
+             f"variance."],
+            ["plain_holdout",
+             "REJECTED — single split gives a high-variance estimate with no evidence "
+             "about how performance scales with training size."],
+            [f"{cv_type_sel} (selected)",
+             f"SELECTED — tabular IID data: no time column, no group columns. "
+             f"Binary target ({_n_uniq} unique values, {_pos_pct} positive rate). "
+             f"Stratification preserves class balance across all {cv_n_splits} folds."],
+        ]
+    elif _has_time or _has_group:
+        # NOTE: rejection-reason prose for the panel branch (rows 1–2) is still
+        # hardcoded — correct for panel datasets but not yet derived from profile
+        # fields. Derive from cv_plan/profile when next validated on actual panel
+        # data (follow-up commit; do not touch in this classification-only fix).
+        _grp_str  = ", ".join(cv_plan.get("group_columns") or []) or "none"
+        _time_str = cv_plan.get("time_column") or "absent"
+        _pt_table_rows = [
+            ["plain_regression",
+             "REJECTED — treats rows as IID; during CV, future observations leak into "
+             "training folds, producing optimistically biased estimates."],
+            ["univariate_time_series",
+             "REJECTED — one model per group; discards cross-group covariate structure "
+             "and shared patterns. Per-group signal-to-noise is lower because each "
+             "group trains only on its own history."],
+            [f"{cv_type_sel.replace('TimeSeriesExpanding', 'panel_forecasting')} (selected)",
+             f"SELECTED — panel structure detected: time column: {_time_str}; "
+             f"group columns: {_grp_str}."],
+        ]
+    else:
+        _pt_table_rows = [
+            [f"{cv_type_sel} (selected)",
+             f"SELECTED — {cv_rule_branch}. Problem type: {problem_type}"
+             + (f", subtype: {problem_subtype}" if problem_subtype else "") + "."],
+        ]
+    story.append(tbl(["Candidate", "Outcome / Reason"], _pt_table_rows,
+                     widths=[4.5*cm, 11.5*cm]))
     story.append(Spacer(1, 0.15*cm))
 
     story.append(_p("CV-Scheme Decision", H3))
@@ -1591,10 +1628,20 @@ else:
     _cv_tbl = tbl(["Parameter", "Value"], cv_cfg_rows, widths=[5.5*cm, 10.5*cm])
     story.append(KeepTogether([_cv_tbl]))
     story.append(Spacer(1, 0.1*cm))
+    _rkf_sentence = (
+        "<b>Random k-fold rejected:</b> invalid for ordered data — future "
+        "observations flow into training folds predicting past observations, "
+        "leaking the answer. "
+        if (_has_time or _has_group)
+        else
+        f"<b>Random k-fold rejected:</b> StratifiedKFold is preferred for "
+        f"classification tasks — stratification preserves class balance across "
+        f"folds (target positive rate: {_pos_pct}), reducing fold-to-fold "
+        f"variance on imbalanced data. "
+    )
     story.append(_p(
-        "<b>Random k-fold rejected:</b> invalid for ordered data — future observations "
-        "flow into training folds predicting past observations, leaking the answer. "
-        "<b>Single holdout rejected:</b> high-variance estimate; no evidence about "
+        _rkf_sentence
+        + "<b>Single holdout rejected:</b> high-variance estimate; no evidence about "
         "how performance scales with training size. "
         "<b>Nested tuning:</b> hyperparameter search runs inside each outer fold "
         f"({inner_folds} inner folds), so no hyperparameter is selected using the "
@@ -1724,76 +1771,77 @@ else:
 
     story.append(PageBreak())
 
-    # ── Section 6: Forecasting Method ─────────────────────────────────────────
-    story.append(_p("Section 6 — Forecasting Method", H2))
-    if not _lag_fc:
-        story.append(_p(
-            "Not applicable — lag_forecasting block absent from model_results.json "
-            "(multi-step lag forecasting was not used on this dataset).",
-            META,
-        ))
-    else:
-        _winner = lag_method or "not recorded"
-        story.append(_p(
-            f"At the validation boundary, lag features for future periods are unavailable "
-            f"because actuals have not yet occurred. Two imputation strategies were compared "
-            f"on a held-out window; <b>{_winner}</b> was selected for submission.",
-            BODY,
-        ))
-        story.append(_p(
-            "Note: this hold-out advantage is not captured in OOF or strict-CV scores — "
-            "within training folds, lag values are known from the training window and "
-            "the forecasting penalty does not apply.",
-            META,
-        ))
-        story.append(Spacer(1, 0.15*cm))
-
-        _method_rows = []
-        for _m_name, _m_sc, _m_ac in [
-            ("recursive",  lag_rec_mae, lag_rec_mac),
-            ("imputation", lag_imp_mae, lag_imp_mac),
-        ]:
-            _sel_tag = " (selected)" if _m_name == _winner else ""
-            _method_rows.append([
-                f"{_m_name}{_sel_tag}",
-                fmt(_m_sc, 4) if _m_sc is not None else "N/A",
-                fmt(_m_ac, 4) if _m_ac is not None else "N/A",
-            ])
-        story.append(tbl(
-            ["Strategy", "Scored holdout MAE", "All-cat holdout MAE"],
-            _method_rows,
-            widths=[5*cm, 5.5*cm, 5.5*cm],
-        ))
-
-        if lag_notes:
-            story.append(Spacer(1, 0.1*cm))
-            story.append(_p(f"Decision: {lag_notes}", BODY))
-
-        if lag_steps_rec or lag_steps_imp:
-            story.append(Spacer(1, 0.2*cm))
-            story.append(_p("Per-Step MAE Across Forecast Horizon (scored categories)", H3))
+    if _has_time:
+        # ── Section 6: Forecasting Method — rendered only when a time axis is present ──
+        story.append(_p("Section 6 — Forecasting Method", H2))
+        if not _lag_fc:
             story.append(_p(
-                "Scored MAE at each step into the forecast horizon (step 1 = immediately "
-                "following the training window). Recursive accumulates lag estimation "
-                "error each step; imputation applies cycle-aware historical fill.",
+                "Not applicable — lag_forecasting block absent from model_results.json "
+                "(multi-step lag forecasting was not used on this dataset).",
+                META,
+            ))
+        else:
+            _winner = lag_method or "not recorded"
+            story.append(_p(
+                f"At the validation boundary, lag features for future periods are unavailable "
+                f"because actuals have not yet occurred. Two imputation strategies were compared "
+                f"on a held-out window; <b>{_winner}</b> was selected for submission.",
                 BODY,
             ))
-            _n_show = max(len(lag_steps_rec), len(lag_steps_imp))
-            _step_rows = []
-            for _si in range(_n_show):
-                _r   = lag_steps_rec[_si] if _si < len(lag_steps_rec) else None
-                _imp = lag_steps_imp[_si] if _si < len(lag_steps_imp) else None
-                _step_rows.append([
-                    str(_si + 1),
-                    fmt(_r,   4) if _r   is not None else "N/A",
-                    fmt(_imp, 4) if _imp is not None else "N/A",
+            story.append(_p(
+                "Note: this hold-out advantage is not captured in OOF or strict-CV scores — "
+                "within training folds, lag values are known from the training window and "
+                "the forecasting penalty does not apply.",
+                META,
+            ))
+            story.append(Spacer(1, 0.15*cm))
+
+            _method_rows = []
+            for _m_name, _m_sc, _m_ac in [
+                ("recursive",  lag_rec_mae, lag_rec_mac),
+                ("imputation", lag_imp_mae, lag_imp_mac),
+            ]:
+                _sel_tag = " (selected)" if _m_name == _winner else ""
+                _method_rows.append([
+                    f"{_m_name}{_sel_tag}",
+                    fmt(_m_sc, 4) if _m_sc is not None else "N/A",
+                    fmt(_m_ac, 4) if _m_ac is not None else "N/A",
                 ])
             story.append(tbl(
-                ["Step", "Recursive MAE", "Imputation MAE"],
-                _step_rows,
-                widths=[2*cm, 7*cm, 7*cm],
+                ["Strategy", "Scored holdout MAE", "All-cat holdout MAE"],
+                _method_rows,
+                widths=[5*cm, 5.5*cm, 5.5*cm],
             ))
-    story.append(PageBreak())
+
+            if lag_notes:
+                story.append(Spacer(1, 0.1*cm))
+                story.append(_p(f"Decision: {lag_notes}", BODY))
+
+            if lag_steps_rec or lag_steps_imp:
+                story.append(Spacer(1, 0.2*cm))
+                story.append(_p("Per-Step MAE Across Forecast Horizon (scored categories)", H3))
+                story.append(_p(
+                    "Scored MAE at each step into the forecast horizon (step 1 = immediately "
+                    "following the training window). Recursive accumulates lag estimation "
+                    "error each step; imputation applies cycle-aware historical fill.",
+                    BODY,
+                ))
+                _n_show = max(len(lag_steps_rec), len(lag_steps_imp))
+                _step_rows = []
+                for _si in range(_n_show):
+                    _r   = lag_steps_rec[_si] if _si < len(lag_steps_rec) else None
+                    _imp = lag_steps_imp[_si] if _si < len(lag_steps_imp) else None
+                    _step_rows.append([
+                        str(_si + 1),
+                        fmt(_r,   4) if _r   is not None else "N/A",
+                        fmt(_imp, 4) if _imp is not None else "N/A",
+                    ])
+                story.append(tbl(
+                    ["Step", "Recursive MAE", "Imputation MAE"],
+                    _step_rows,
+                    widths=[2*cm, 7*cm, 7*cm],
+                ))
+        story.append(PageBreak())
 
     # ── Section 7: Predictions and Submission ─────────────────────────────────
     story.append(_p("Section 7 — Predictions and Submission", H2))

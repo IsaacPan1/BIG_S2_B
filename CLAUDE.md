@@ -675,25 +675,22 @@ side:
 5. **Scored-deliverable check on `submission.csv` itself — do NOT trust the
    completion record alone:**
    - File at the repo root exists, parses as CSV.
-   - Column names AND order exactly equal those of
-     `data/sample_submission.csv`.
+   - Exactly two columns: `["row_id", <target_col>]` where `<target_col>`
+     is `profile.json["target_col"]`. Any other column set is a gate fail.
    - Row count equals `len(data/sample_submission.csv)`.
-   - The target column (the non-id column of `sample_submission.csv`) has
-     no NaN values.
+   - The target column has no NaN values.
 6. **Freshness:** `submission_writer_completion.json["modeler_run_id"] ==
    pipeline_run.json["current_modeler_run_id"]`. Mismatch → gate fails.
 
 Only on full pass: dispatch Step 5.
 
 **Gate-fail action — build a fallback `submission.csv` with the CORRECT
-schema.** The prior fallback ("copy `reports/predictions.csv` to
-`submission.csv`") produced a file whose columns did NOT match
-`sample_submission.csv` — the evaluator would reject the schema. The new
-fallback always produces a schema-correct file; values may be wrong, but
-the submission is well-formed:
+schema.** The graded file must be exactly `[row_id, <target_col>]` — two
+columns, nothing else. The fallback always produces a schema-correct file;
+values may be wrong, but the submission is well-formed:
 
-1. Start from `data/sample_submission.csv`'s row layout so columns and row
-   IDs match the evaluator's expectations.
+1. Build a two-column DataFrame `[row_id, <target_col>]` using the
+   `row_id` values from `data/sample_submission.csv`.
 2. Fill the target column. Preferred source: a composite-key join of
    `reports/predictions.csv` onto `sample_submission.csv` (composite
    business key from `profile.json`'s `group_cols + time_col` — same join

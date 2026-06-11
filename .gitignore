@@ -61,7 +61,7 @@ recent_vs_full_adv.py
 recent_vs_full_dist.py
 scored_mae
 drugs_diagnostics
-
+data_classificatier/
 .claude/*.lock
 
 
@@ -71,4 +71,4 @@ tests/
 _archive_features/
 _tmp_mi_data/
 unused_main_arch/
-EOF
+EOFpipeline_config.json

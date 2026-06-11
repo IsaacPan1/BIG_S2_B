@@ -540,6 +540,9 @@ _GROUP_ENTITY_KEYWORDS = (
 # row-id sidecar (image_filename, hash, etc.) and must not be a group key.
 _GROUP_UNIQUENESS_MAX = 0.5
 
+# Min-class fraction below this → target flagged as imbalanced.
+IMBALANCE_THRESHOLD = 0.10
+
 # Substrings in a column name that mark it as a file-path / filename column.
 # Underscore-anchored entries are deliberate: bare "uri" matches "jurisdiction",
 # bare "url" / "path" would catch any column whose name happens to contain those
@@ -615,22 +618,39 @@ def find_id_col(
     time_col: str | None,
     target_col: str | None,
 ) -> str | None:
-    """Detect an explicit row-ID column (near-unique, often named *_id or row_id)."""
+    """Detect an explicit row-ID column.
+
+    Phase 1 (authoritative): scan ALL non-excluded columns for an exact name match
+    before any uniqueness check runs.  Order-independent; wins over everything.
+
+    Phase 2 (fallback, integer-gated): only if Phase 1 found nothing, scan for
+    near-unique integer columns.  Float columns are explicitly rejected — same
+    integer-dtype gate as the committed _is_int_id_like fix (ce8ee6e).
+    """
     n_rows = len(df)
     exclude = {c for c in [time_col, target_col] if c}
 
+    # Phase 1 — complete pass: exact name match wins regardless of column position.
+    for col in df.columns:
+        if col in exclude:
+            continue
+        if col.lower() in {"row_id", "id", "rowid", "record_id", "index"}:
+            return col
+
+    # Phase 2 — fallback: near-unique integers only (floats never qualify).
     for col in df.columns:
         if col in exclude:
             continue
         col_lower = col.lower()
-        n_unique = df[col].nunique()
-
-        # Explicitly named row_id
-        if col_lower in {"row_id", "id", "rowid", "record_id", "index"}:
-            return col
-
-        # Near-unique (≥ 99 % of rows) — but not if it looks like a time column
-        if n_unique >= 0.99 * n_rows and not any(kw in col_lower for kw in _TIME_KEYWORDS):
+        if any(kw in col_lower for kw in _TIME_KEYWORDS):
+            continue
+        s = df[col]
+        if not pd.api.types.is_integer_dtype(s):   # float gate — mirrors _is_int_id_like
+            continue
+        n_unique = s.nunique()
+        uniq = sorted(s.dropna().unique())
+        is_contiguous = len(uniq) >= 2 and (uniq[-1] - uniq[0] + 1) == len(uniq)
+        if is_contiguous or n_unique >= 0.99 * n_rows:
             return col
 
     return None
@@ -867,12 +887,36 @@ def classify_problem_subtype(
     if n_unique == 2:
         target_chars["is_consecutive_integers"] = False
         target_chars["data_description_hints"] = []
+        _class_counts = series.value_counts(dropna=True).to_dict()
+        _n_total = int(series.notna().sum())
+        _min_class_frac = float(min(_class_counts.values()) / _n_total)
+        _is_imbalanced = bool(_min_class_frac < IMBALANCE_THRESHOLD)
+        target_chars["class_counts"] = {str(k): int(v) for k, v in _class_counts.items()}
+        target_chars["min_class_fraction"] = round(_min_class_frac, 4)
+        target_chars["is_imbalanced"] = _is_imbalanced
+        target_chars["imbalance_threshold"] = IMBALANCE_THRESHOLD
+        if _is_imbalanced:
+            print(f"WARNING: imbalanced binary target detected — min class fraction "
+                  f"{_min_class_frac:.3f} < threshold {IMBALANCE_THRESHOLD}. Class weights "
+                  f"and threshold tuning are recommended (stage 2 will apply class weights).")
         return "binary_classification", f"n_unique=2 → binary classification.", target_chars
 
     # Non-numeric → classification
     if not is_numeric:
         target_chars["is_consecutive_integers"] = False
         target_chars["data_description_hints"] = []
+        _class_counts = series.value_counts(dropna=True).to_dict()
+        _n_total = int(series.notna().sum())
+        _min_class_frac = float(min(_class_counts.values()) / _n_total)
+        _is_imbalanced = bool(_min_class_frac < IMBALANCE_THRESHOLD)
+        target_chars["class_counts"] = {str(k): int(v) for k, v in _class_counts.items()}
+        target_chars["min_class_fraction"] = round(_min_class_frac, 4)
+        target_chars["is_imbalanced"] = _is_imbalanced
+        target_chars["imbalance_threshold"] = IMBALANCE_THRESHOLD
+        if _is_imbalanced:
+            print(f"WARNING: imbalanced multiclass target detected — min class fraction "
+                  f"{_min_class_frac:.3f} < threshold {IMBALANCE_THRESHOLD}. Class weights "
+                  f"and threshold tuning are recommended (stage 2 will apply class weights).")
         subtype = "multiclass_classification"
         return subtype, f"Non-numeric target, {n_unique} unique values → multiclass classification.", target_chars
 
@@ -925,6 +969,18 @@ def classify_problem_subtype(
 
     if found_categ and not found_ordinal:
         reasons.append(f"Categorical keywords in description: {found_categ}.")
+        _class_counts = series.value_counts(dropna=True).to_dict()
+        _n_total = int(series.notna().sum())
+        _min_class_frac = float(min(_class_counts.values()) / _n_total)
+        _is_imbalanced = bool(_min_class_frac < IMBALANCE_THRESHOLD)
+        target_chars["class_counts"] = {str(k): int(v) for k, v in _class_counts.items()}
+        target_chars["min_class_fraction"] = round(_min_class_frac, 4)
+        target_chars["is_imbalanced"] = _is_imbalanced
+        target_chars["imbalance_threshold"] = IMBALANCE_THRESHOLD
+        if _is_imbalanced:
+            print(f"WARNING: imbalanced multiclass target detected — min class fraction "
+                  f"{_min_class_frac:.3f} < threshold {IMBALANCE_THRESHOLD}. Class weights "
+                  f"and threshold tuning are recommended (stage 2 will apply class weights).")
         return "multiclass_classification", " ".join(reasons), target_chars
 
     # Both or neither keyword — use structural heuristic
@@ -937,6 +993,18 @@ def classify_problem_subtype(
         return "ordinal_regression", " ".join(reasons), target_chars
 
     reasons.append("Non-consecutive integers → multiclass classification.")
+    _class_counts = series.value_counts(dropna=True).to_dict()
+    _n_total = int(series.notna().sum())
+    _min_class_frac = float(min(_class_counts.values()) / _n_total)
+    _is_imbalanced = bool(_min_class_frac < IMBALANCE_THRESHOLD)
+    target_chars["class_counts"] = {str(k): int(v) for k, v in _class_counts.items()}
+    target_chars["min_class_fraction"] = round(_min_class_frac, 4)
+    target_chars["is_imbalanced"] = _is_imbalanced
+    target_chars["imbalance_threshold"] = IMBALANCE_THRESHOLD
+    if _is_imbalanced:
+        print(f"WARNING: imbalanced multiclass target detected — min class fraction "
+              f"{_min_class_frac:.3f} < threshold {IMBALANCE_THRESHOLD}. Class weights "
+              f"and threshold tuning are recommended (stage 2 will apply class weights).")
     return "multiclass_classification", " ".join(reasons), target_chars
 
 
@@ -1705,6 +1773,18 @@ def main() -> None:
     problem_subtype, subtype_reasoning, target_chars = classify_problem_subtype(
         train_df, target_col, problem_type, _desc_text
     )
+
+    # Reconcile: subtype classifier has n_unique check that classify_problem lacks.
+    # When subtype identifies binary/multiclass but problem_type is "tabular_regression"
+    # (numeric target, no time col), defer to the subtype decision.
+    if (problem_type == "tabular_regression"
+            and problem_subtype in ("binary_classification", "multiclass_classification")):
+        problem_type = "tabular_classification"
+        confidence   = "high"
+        reasoning    = (reasoning
+                        + f" Overridden to tabular_classification: subtype classifier"
+                        f" found n_unique={target_chars.get('n_unique', '?')} unique values"
+                        f" → {problem_subtype}.")
 
     # 9. Horizon detection
     horizon_info: dict = {}

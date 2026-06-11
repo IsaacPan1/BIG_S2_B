@@ -110,10 +110,26 @@ def _round_trip_audit(
             "examples": [],
         }
 
-    # Left-join submission onto predictions on composite key
-    merged = sub[composite_key + [target_col]].merge(
-        pred_compare[composite_key + [target_col]],
-        on=composite_key,
+    # When composite_key is empty (no group_cols or time_col in profile), fall
+    # back to row_id as the join key — same logic as the main join path.
+    audit_key = composite_key
+    if not audit_key:
+        if "row_id" in sub.columns and "row_id" in pred_compare.columns and len(sub) == len(pred_compare):
+            audit_key = ["row_id"]
+        else:
+            # Cannot audit without a join key; treat as SKIP
+            return {
+                "rows_checked": 0,
+                "mismatches": -1,
+                "status": "SKIP",
+                "reason": "composite key is empty and row_id fallback unavailable; audit skipped",
+                "examples": [],
+            }
+
+    # Left-join submission onto predictions on the resolved audit key
+    merged = sub[audit_key + [target_col]].merge(
+        pred_compare[audit_key + [target_col]],
+        on=audit_key,
         how="left",
         suffixes=("_submitted", "_predicted"),
     )
@@ -122,17 +138,17 @@ def _round_trip_audit(
     predicted_col = f"{target_col}_predicted"
     rows_checked  = len(merged)
 
-    # Coverage check: NaN in predicted_col means no matching composite key in predictions.csv
+    # Coverage check: NaN in predicted_col means no matching key in predictions.csv
     n_no_match = int(merged[predicted_col].isna().sum())
     if n_no_match > 0:
         examples = (
-            merged[merged[predicted_col].isna()][composite_key]
+            merged[merged[predicted_col].isna()][audit_key]
             .head(3)
             .to_dict("records")
         )
         raise SubmissionValidationError(
             f"Round-trip audit FAIL: {n_no_match}/{rows_checked} submission rows have no "
-            f"matching composite key in predictions.csv. "
+            f"matching key in predictions.csv. "
             f"First 3 unmatched keys: {examples}"
         )
 
@@ -146,10 +162,10 @@ def _round_trip_audit(
     n_mismatch = int((~close).sum())
 
     if n_mismatch > 0:
-        bad = merged[~close][[*composite_key, submitted_col, predicted_col]].head(3)
+        bad = merged[~close][[*audit_key, submitted_col, predicted_col]].head(3)
         examples = [
             {
-                "key":       {k: row[k] for k in composite_key},
+                "key":       {k: row[k] for k in audit_key},
                 "submitted": float(row[submitted_col]),
                 "predicted": float(row[predicted_col]),
             }
@@ -157,7 +173,7 @@ def _round_trip_audit(
         ]
         raise SubmissionValidationError(
             f"Round-trip audit FAIL: {n_mismatch}/{rows_checked} submitted values differ "
-            f"from predictions.csv on composite key. Examples: {examples}"
+            f"from predictions.csv on key. Examples: {examples}"
         )
 
     return {
@@ -180,7 +196,13 @@ def main() -> None:
     with open(profile_path) as f:
         profile = json.load(f)
 
-    target_col      = profile.get("target_col", "predicted_target")
+    target_col      = profile.get("target_col") or None
+    if not target_col:
+        sys.exit(
+            "ERROR: profile.json has target_col=null — schema_analyst could not detect "
+            "the target column name. submission.csv cannot be written with a correct header. "
+            "Check reports/profile.json['target_col'] and data/DATA_DESCRIPTION.md."
+        )
     problem_subtype = profile.get("problem_subtype", "")
     _is_cls         = problem_subtype in ("binary_classification", "multiclass_classification")
     fp              = profile.get("file_paths", {})
@@ -200,6 +222,13 @@ def main() -> None:
         sys.exit(f"ERROR: {sample_path} not found")
     sample = pd.read_csv(sample_path)
     print(f"Loaded sample_submission: {sample.shape}, columns: {list(sample.columns)}")
+
+    if "row_id" not in sample.columns:
+        sys.exit(
+            f"ERROR: sample_submission.csv does not contain a 'row_id' column. "
+            f"The grader requires submission.csv to be exactly [row_id, <target_col>]. "
+            f"sample_submission.csv columns: {list(sample.columns)}"
+        )
 
     # Derive id_cols from sample_submission (everything except the target column)
     id_cols = [c for c in sample.columns if c != target_col]
@@ -338,16 +367,16 @@ def main() -> None:
             warnings_list.append(f"Could not perform range check: {exc}")
 
     submission = submission[list(sample.columns)]
-    print(f"Final submission columns: {list(submission.columns)}")
+    print(f"Full submission columns: {list(submission.columns)}")
 
-    sub_path = REPO_ROOT / "submission.csv"
-    submission.to_csv(sub_path, index=False)
-    print(f"Written submission.csv to {sub_path} ({len(submission)} rows)")
+    cov_path = REPO_ROOT / "submission_with_cov.csv"
+    submission.to_csv(cov_path, index=False)
+    print(f"Written submission_with_cov.csv to {cov_path} ({len(submission)} rows)")
 
     # ── Non-skippable round-trip audit ────────────────────────────────────────
-    # Re-read the written file and verify every cell matches predictions.csv on
-    # the composite business key.  This is an I/O integrity check only — it
-    # performs no optimisation and touches no model.
+    # Audit the full-column file (submission_with_cov.csv) — it retains all
+    # composite key columns so the audit always yields PASS/FAIL, never SKIP.
+    # The graded 2-column submission.csv is sliced from this after a clean audit.
     audit_result: dict = {
         "rows_checked": 0, "mismatches": -1,
         "status": "SKIP", "reason": "not run", "examples": [],
@@ -356,15 +385,9 @@ def main() -> None:
         "rows_checked": 0, "mismatches": -1,
         "status": "SKIP", "reason": "not run", "examples": [],
     }
-    final_path = REPO_ROOT / "submission_final.csv"
-    # id_col_final: use the full composite key (all non-target columns) so that
-    # the merge is unique.  If the composite key has exactly one column, fall back
-    # to that single column for backward compatibility with datasets that have a
-    # single unique row-id column.
-    id_cols_final = [c for c in sample.columns if c != target_col]
-    id_col_final = id_cols_final[0] if len(id_cols_final) == 1 else id_cols_final
+    sub_path = REPO_ROOT / "submission.csv"
     try:
-        audit_result = _round_trip_audit(sub_path, pred_path, composite_key, target_col)
+        audit_result = _round_trip_audit(cov_path, pred_path, composite_key, target_col)
         print(
             f"Round-trip audit: {audit_result['status']} — "
             f"{audit_result['rows_checked']} rows checked, "
@@ -397,96 +420,79 @@ def main() -> None:
             json.dump(summary, f, indent=2)
         raise  # let the submission_writer agent handle fallback
 
-    # ── Write submission_final.csv (Kaggle upload file) ──────────────────────
-    # Derived generically from sample_submission.csv: id cols = all non-target
-    # columns of sample_submission; prediction col = target_col from
-    # profile.json.  When the composite key has multiple columns (e.g.
-    # region_id + timestamp) ALL id columns are retained so the merge is
-    # uniqueness-safe (single-column merge would create a cartesian product).
-    # Row ordering = sample_submission's order, sorted by id cols.
-    sort_key = id_cols_final  # always a list
-    id_col_label = (
-        id_cols_final[0] if len(id_cols_final) == 1
-        else str(id_cols_final)
-    )
-    print(
-        f"Building submission_final.csv with id col(s) '{id_col_label}' "
-        f"+ prediction col '{target_col}'"
-    )
-    submission_final = (
-        sample[id_cols_final]
-        .merge(submission[id_cols_final + [target_col]], on=id_cols_final, how="left")
-        .sort_values(sort_key, kind="stable")
-        .reset_index(drop=True)[id_cols_final + [target_col]]
-    )
-    submission_final.to_csv(final_path, index=False)
-    print(
-        f"Written submission_final.csv to {final_path} "
-        f"({len(submission_final)} rows, {len(submission_final.columns)} cols)"
-    )
-
-    # Audit submission_final.csv: same row count as sample_submission, correct
-    # columns, id-sorted, and target values match submission.csv row-for-row
-    # after id-sorting submission.csv.
-    sub_sorted = (
-        pd.read_csv(sub_path)
-        .sort_values(sort_key, kind="stable")
+    # ── Write submission.csv (graded 2-column file) ───────────────────────────
+    # Exactly [row_id, target_col], sorted by row_id. Nothing else.
+    graded = (
+        submission[["row_id", target_col]]
+        .sort_values("row_id", kind="stable")
         .reset_index(drop=True)
     )
-    final_check = pd.read_csv(final_path)
-    expected_cols = id_cols_final + [target_col]
-    if len(final_check) != len(sample):
+    graded.to_csv(sub_path, index=False)
+    print(
+        f"Written submission.csv to {sub_path} "
+        f"({len(graded)} rows, columns={list(graded.columns)})"
+    )
+    print()
+    print("=" * 72)
+    print(
+        f"NOTE: submission.csv          = graded file (row_id + {target_col}, sorted by row_id)"
+    )
+    print(
+        f"      submission_with_cov.csv = full diagnostic copy "
+        f"({list(submission.columns)})"
+    )
+    print("=" * 72)
+
+    # ── Integrity check: re-read submission.csv, verify schema + values ───────
+    # Both graded_check and cov_sorted are sorted by row_id and reset_index,
+    # so the positional comparison is valid.
+    graded_check = pd.read_csv(sub_path)
+    cov_sorted = (
+        pd.read_csv(cov_path)
+        .sort_values("row_id", kind="stable")
+        .reset_index(drop=True)
+    )
+    expected_cols = ["row_id", target_col]
+    if list(graded_check.columns) != expected_cols:
         final_audit = {
-            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
-            "reason": f"row count {len(final_check)} != sample_submission {len(sample)}",
+            "rows_checked": len(graded_check), "mismatches": -1, "status": "FAIL",
+            "reason": f"columns {list(graded_check.columns)} != {expected_cols}",
             "examples": [],
         }
-    elif list(final_check.columns) != expected_cols:
+    elif len(graded_check) != len(sample):
         final_audit = {
-            "rows_checked": len(final_check), "mismatches": -1, "status": "FAIL",
-            "reason": f"columns {list(final_check.columns)} != {expected_cols}",
+            "rows_checked": len(graded_check), "mismatches": -1, "status": "FAIL",
+            "reason": f"row count {len(graded_check)} != sample_submission {len(sample)}",
             "examples": [],
         }
     else:
         diff = ~np.isclose(
-            final_check[target_col].values.astype(float),
-            sub_sorted[target_col].values.astype(float),
+            graded_check[target_col].values.astype(float),
+            cov_sorted[target_col].values.astype(float),
             atol=1e-6, rtol=0,
         )
         n_mm = int(diff.sum())
         if n_mm > 0:
             final_audit = {
-                "rows_checked": len(final_check), "mismatches": n_mm, "status": "FAIL",
-                "reason": f"{n_mm} target values differ from id-sorted submission.csv",
+                "rows_checked": len(graded_check), "mismatches": n_mm, "status": "FAIL",
+                "reason": f"{n_mm} target values differ from submission_with_cov.csv after row_id sort",
                 "examples": [],
             }
         else:
             final_audit = {
-                "rows_checked": len(final_check), "mismatches": 0, "status": "PASS",
-                "reason": "submission_final.csv matches id-sorted submission.csv",
+                "rows_checked": len(graded_check), "mismatches": 0, "status": "PASS",
+                "reason": "submission.csv matches submission_with_cov.csv after row_id sort",
                 "examples": [],
             }
     print(
-        f"submission_final audit: {final_audit['status']} — "
+        f"submission.csv integrity: {final_audit['status']} — "
         f"{final_audit['rows_checked']} rows checked, "
         f"{final_audit['mismatches']} mismatches"
     )
     if final_audit["status"] != "PASS":
         raise SubmissionValidationError(
-            f"submission_final.csv audit FAILED: {final_audit['reason']}"
+            f"submission.csv integrity check FAILED: {final_audit['reason']}"
         )
-
-    print()
-    print("=" * 72)
-    print(
-        f"NOTE: submission_final.csv = Kaggle upload "
-        f"({id_col_label} + {target_col}, sorted by {id_col_label})"
-    )
-    print(
-        f"      submission.csv       = full diagnostic copy with all columns "
-        f"({list(submission.columns)})"
-    )
-    print("=" * 72)
 
     # ── Write summary and marker (only on audit PASS) ─────────────────────────
     stats = {
@@ -498,8 +504,8 @@ def main() -> None:
         "n_negative": int((submission[target_col] < 0).sum()),
     }
     summary = {
-        "row_count":                    len(submission),
-        "columns":                      list(submission.columns),
+        "row_count":                    len(graded),
+        "columns":                      list(graded.columns),
         "target_column":                target_col,
         "join_key_used":                join_cols,
         "composite_key_from_profile":   composite_key,
@@ -507,11 +513,11 @@ def main() -> None:
         "validation_checks_passed":     checks_passed,
         "warnings":                     warnings_list,
         "round_trip_audit":             audit_result,
-        "submission_final": {
-            "path":     str(final_path),
-            "id_cols":  id_cols_final,
-            "pred_col": target_col,
-            "row_count": len(submission_final),
+        "submission_with_cov": {
+            "path":      str(cov_path),
+            "id_cols":   [c for c in sample.columns if c != target_col],
+            "pred_col":  target_col,
+            "row_count": len(submission),
             "audit":     final_audit,
         },
     }
@@ -533,10 +539,9 @@ def main() -> None:
         f.write(f"round_trip_audit_status: {audit_result['status']}\n")
         f.write(f"round_trip_audit_rows_checked: {audit_result['rows_checked']}\n")
         f.write(f"round_trip_audit_mismatches: {audit_result['mismatches']}\n")
-        f.write(f"submission_final_path: {final_path}\n")
-        f.write(f"submission_final_id_cols: {id_cols_final}\n")
-        f.write(f"submission_final_pred_col: {target_col}\n")
-        f.write(f"submission_final_audit_status: {final_audit['status']}\n")
+        f.write(f"submission_with_cov_path: {cov_path}\n")
+        f.write(f"submission_graded_columns: ['row_id', '{target_col}']\n")
+        f.write(f"submission_graded_audit_status: {final_audit['status']}\n")
     print("Written submission_writer_was_here.txt")
 
     # ── KG: observability — mark stage complete (best-effort) ─────────────────

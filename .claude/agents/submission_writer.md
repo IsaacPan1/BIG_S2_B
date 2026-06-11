@@ -75,7 +75,7 @@ scored deliverable — "non-empty" is not enough.
 
 | Path | Required content |
 |---|---|
-| `submission.csv` (repo root) | Parses as CSV. Column names AND order match `data/sample_submission.csv` exactly. Row count equals `len(data/sample_submission.csv)`. Target column has no NaN. |
+| `submission.csv` (repo root) | Parses as CSV. Exactly two columns: `["row_id", <target_col>]` where `<target_col>` is `profile.json["target_col"]`. Row count equals `len(data/sample_submission.csv)`. Target column has no NaN. |
 | `reports/submission_summary.json` | Parses as JSON. Contains `round_trip_audit` with `status == "PASS"`. Other analytic fields (`row_count`, `target_column`, `join_key_used`, `prediction_stats`, etc.) checked SOFT — log if missing, don't fail the gate on them. |
 | `reports/submission_writer_was_here.txt` | Completion marker. Mtime must be strictly newer than `dispatch_time`. |
 | `reports/submission_writer_completion.json` | Completion record — schema below, identical to the modeler/validator record shape. You write this; `tools/build_submission.py` does not. |
@@ -184,10 +184,10 @@ Verify ALL of:
 
 - exit_code == 0,
 - `submission.csv` at repo root exists, parses as CSV,
-- column names AND order of `submission.csv` exactly equal those of
-  `data/sample_submission.csv`,
+- exactly two columns: `["row_id", <target_col>]` where `<target_col>` is
+  `profile.json["target_col"]` (not the full schema of `sample_submission.csv`),
 - `len(submission.csv) == len(data/sample_submission.csv)` exactly,
-- the target column in `submission.csv` (whatever its name) has no NaN values,
+- the target column in `submission.csv` has no NaN values,
 - `reports/submission_summary.json` exists, parses, has `round_trip_audit`
   with `status == "PASS"` (presence of `round_trip_audit` is a HARD check;
   other analytic keys are SOFT — log if missing, do not fail the gate on them

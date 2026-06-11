@@ -46,7 +46,7 @@ except Exception as e:
     predictions = pd.DataFrame({"predicted_target": []})
 
 try:
-    train_df     = pd.read_parquet("data/features_train.parquet")
+    train_df     = pd.read_parquet("data/features_train.parquet", engine="fastparquet")
     target_col   = features_meta.get("target_col") or profile.get("target_col", "")
     train_target = train_df[target_col].dropna() if target_col in train_df.columns else pd.Series(dtype=float)
     train_mean   = float(train_target.mean()) if len(train_target) > 0 else 0.0
@@ -98,22 +98,56 @@ c1_details = (
 checks.append({"name": "validator_concordance", "status": c1_status, "details": c1_details})
 
 # CHECK 2: Prediction distribution match
+problem_subtype = profile.get("problem_subtype", "") or model_results.get("problem_subtype", "")
+_CLASSIFICATION_SUBTYPES = {"binary_classification", "multiclass_classification"}
+
 pred_stats = model_results.get("val_prediction_stats", {})
 pred_mean  = float(pred_stats.get("mean", predictions["predicted_target"].mean() if len(predictions) > 0 else 0.0))
 pred_std   = float(pred_stats.get("std",  predictions["predicted_target"].std()  if len(predictions) > 0 else 0.0))
 mean_bias  = abs(pred_mean - train_mean) if train_mean != 0.0 else 0.0
 bias_pct   = (pred_mean - train_mean) / abs(train_mean) * 100 if train_mean != 0.0 else 0.0
 std_ratio  = pred_std / train_std if train_std > 0.0 else 1.0
-c2_status  = "PASS"
-c2_details = (f"pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (delta {bias_pct:+.1f}%); "
-              f"pred_std={pred_std:.3f} vs train_std={train_std:.3f} (ratio {std_ratio:.3f})")
-if train_mean != 0.0 and mean_bias > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
-    c2_status = "CRITICAL"
-elif train_std > 0.0 and pred_std < PRED_STD_CRITICAL * train_std:
-    c2_status = "CRITICAL"
-elif train_std > 0.0 and pred_std < PRED_STD_WARNING * train_std:
-    c2_status = "WARNING"
+
+if problem_subtype in _CLASSIFICATION_SUBTYPES:
+    c2_status  = "PASS"
+    c2_details = (
+        "skipped: regression-calibrated threshold not applicable to classification; "
+        "class weights and threshold tuning intentionally shift predicted positive rate "
+        f"from train base rate (problem_subtype={problem_subtype})"
+    )
+else:
+    c2_status  = "PASS"
+    c2_details = (f"pred_mean={pred_mean:.3f} vs train_mean={train_mean:.3f} (delta {bias_pct:+.1f}%); "
+                  f"pred_std={pred_std:.3f} vs train_std={train_std:.3f} (ratio {std_ratio:.3f})")
+    if train_mean != 0.0 and mean_bias > PRED_MEAN_BIAS_CRITICAL * abs(train_mean):
+        c2_status = "CRITICAL"
+    elif train_std > 0.0 and pred_std < PRED_STD_CRITICAL * train_std:
+        c2_status = "CRITICAL"
+    elif train_std > 0.0 and pred_std < PRED_STD_WARNING * train_std:
+        c2_status = "WARNING"
 checks.append({"name": "prediction_distribution", "status": c2_status, "details": c2_details})
+
+# CHECK 2b: Classification single-class collapse guard
+# Entirely separate from CHECK 2's base-rate comparison (which stays suppressed above).
+# Targets LITERAL single-class collapse: len(unique(preds)) == 1.
+# This fully covers binary classification. Multiclass partial-collapse (model predicts a
+# subset of classes but more than one) is NOT covered here — known follow-up if needed.
+# A merely-shifted positive rate still has both values present and must NOT trigger this.
+if problem_subtype in _CLASSIFICATION_SUBTYPES and len(predictions) > 0 and "predicted_target" in predictions.columns:
+    _collapse_vals = predictions["predicted_target"].dropna().unique()
+    if len(_collapse_vals) == 1:
+        _cv = _collapse_vals[0]
+        c2b_status  = "WARNING"
+        c2b_details = (
+            f"DEGENERATE SINGLE-CLASS OUTPUT: all {len(predictions)} predictions collapsed to a "
+            f"single value ({str(_cv)}). The model predicts only one class — any class not equal "
+            f"to {str(_cv)} will score F1~0 on the minority class. Check threshold calibration, "
+            f"class-weight application, and training convergence."
+        )
+    else:
+        c2b_status  = "PASS"
+        c2b_details = f"no single-class collapse: {len(_collapse_vals)} unique prediction values present"
+    checks.append({"name": "prediction_collapse", "status": c2b_status, "details": c2b_details})
 
 # CHECK 3: Walk-forward MAE plausibility
 wf_mae     = float(model_results.get("walk_forward_mae") or model_results.get("oof_mae", 0.0) or 0.0)

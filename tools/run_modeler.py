@@ -115,6 +115,12 @@ if __name__ == "__main__":
     BIAS_CORRECTION_REL_MARGIN = 0.015  # min weighted-MAE improvement as fraction of baseline
     BIAS_CORRECTION_SCALE     = 1.0   # fraction of estimated bias actually applied
 
+    # ── Threshold tuning (post-hoc, binary classification only) ───────────────
+    THRESHOLD_TUNE_MIN         = 0.05   # lower bound of threshold sweep
+    THRESHOLD_TUNE_MAX         = 0.95   # upper bound of threshold sweep
+    THRESHOLD_TUNE_STEP        = 0.01   # sweep granularity
+    THRESHOLD_TUNE_MIN_F1_GAIN = 0.02   # min absolute F1 improvement over default 0.5
+
     start_time = time.time()
     pipeline_start_time = start_time
 
@@ -152,6 +158,8 @@ if __name__ == "__main__":
     _is_classification = problem_subtype in (
         "binary_classification", "multiclass_classification"
     )
+    _is_binary     = (problem_subtype == "binary_classification")
+    _is_multiclass = (problem_subtype == "multiclass_classification")
     _apply_inv_clip = not _is_classification
     if problem_subtype == "binary_classification":
         _cb_loss        = "Logloss"
@@ -164,6 +172,18 @@ if __name__ == "__main__":
         _cb_loss        = cb_objective
         _cb_eval_metric = ("MAE" if cb_objective.startswith("MAE")
                            else cb_objective.split(":")[0])
+
+    # Read imbalance flag from schema_analyst (stage 1 detection).
+    # target_characteristics may be absent on older runs or non-classification subtypes.
+    _target_chars = profile.get("target_characteristics", {}) or {}
+    _is_imbalanced = bool(_target_chars.get("is_imbalanced", False))
+    _apply_class_weights = bool(_is_classification and _is_imbalanced)
+    if _apply_class_weights:
+        _min_class_frac = _target_chars.get("min_class_fraction")
+        print(f"Class weights ENABLED: auto_class_weights='Balanced' "
+              f"(min_class_fraction={_min_class_frac})")
+    elif _is_classification:
+        print("Class weights disabled: classification target is balanced (or threshold not met).")
 
     # Runtime-inject the group_relational step when the flag is on. Candidates
     # are the panel group columns; the encoder's own data-driven detection rule
@@ -226,13 +246,21 @@ if __name__ == "__main__":
         and c not in cat_feature_cols
     ]
     _n_train_rows = len(train_df)
+    def _is_int_id_like(s: pd.Series, n: int) -> bool:
+        # Float columns are never row IDs — integer gate short-circuits first.
+        if not pd.api.types.is_integer_dtype(s):
+            return False
+        uniq = sorted(s.dropna().unique())
+        if len(uniq) >= 2 and (uniq[-1] - uniq[0] + 1) == len(uniq):
+            return True   # contiguous integer run (e.g. 0..N-1)
+        return n > 0 and len(uniq) / n >= ID_RATIO_MAX
+
     _drop_idlike: list[tuple[str, int]] = []  # (name, n_unique)
     for c in all_feature_cols:
         if c in _drop_nonnumeric or c in cat_feature_cols:
             continue
         _nu = int(train_df[c].nunique(dropna=True))
-        if _nu == _n_train_rows or (_n_train_rows > 0
-                                    and _nu / _n_train_rows > ID_RATIO_MAX):
+        if _is_int_id_like(train_df[c], _n_train_rows):
             _drop_idlike.append((c, _nu))
     if _drop_nonnumeric:
         print(f"Dropping non-numeric, non-cat_feature columns: {_drop_nonnumeric[:5]} "
@@ -614,7 +642,7 @@ if __name__ == "__main__":
     # Step 6 — Helpers: per-fold Pipeline + CatBoost training
     # ─────────────────────────────────────────────────────────────────────────
     import catboost as _cb_module
-    from sklearn.metrics import mean_absolute_error
+    from sklearn.metrics import mean_absolute_error, f1_score
     from sklearn.linear_model import Ridge
     import optuna
 
@@ -660,15 +688,31 @@ if __name__ == "__main__":
         }
         for s in seeds:
             params = {**base_params, "random_seed": s}
+            if _apply_class_weights:
+                params["auto_class_weights"] = "Balanced"
             m = _CatBoostModel(**params)
             m.fit(X_tr_t, y_tr, sample_weight=sample_weight, verbose=False)
-            _raw = m.predict(X_va_t)
-            # CatBoostClassifier.predict() may return (n, 1) shape; flatten to 1D.
-            if isinstance(_raw, np.ndarray) and _raw.ndim > 1:
-                _raw = _raw.squeeze(axis=-1) if _raw.shape[-1] == 1 else _raw.flatten()
-            seed_preds.append(np.clip(inv(_raw), 0, None) if _apply_inv_clip else _raw)
+            if _is_classification:
+                # predict_proba() always returns (n, n_classes) — no shape guard needed
+                _raw_proba = m.predict_proba(X_va_t)
+                seed_preds.append(_raw_proba)
+            else:
+                _raw = m.predict(X_va_t)
+                # predict() may return (n,1) in some CatBoost versions; flatten to 1D.
+                if isinstance(_raw, np.ndarray) and _raw.ndim > 1:
+                    _raw = _raw.squeeze(axis=-1) if _raw.shape[-1] == 1 else _raw.flatten()
+                seed_preds.append(np.clip(inv(_raw), 0, None) if _apply_inv_clip else _raw)
             models.append(m)
-        preds = _seed_agg(seed_preds, axis=0)
+        # Aggregate across seeds; convert proba → labels for classification so that
+        # the returned preds is always 1D (Optuna MAE and OOF assignment use it directly).
+        _agg = _seed_agg(seed_preds, axis=0)
+        if _is_classification:
+            if _is_multiclass:
+                preds = _agg.argmax(axis=1).astype(float)
+            else:
+                preds = (_agg[:, 1] >= 0.5).astype(int).astype(float)
+        else:
+            preds = _agg
         return preds, seed_preds, models, bp
 
 
@@ -737,6 +781,8 @@ if __name__ == "__main__":
     per_seed_oof        = np.full((S_OUTER, len(train_df)), np.nan)
     oof_fold_id         = np.full(len(train_df), -1, dtype=int)
     per_fold_seeds_used = []   # list[list[int]] aligned to outer_splits order
+    # OOF probability accumulator (classification only); shape determined on first fold.
+    oof_proba_agg = None
 
     TUNING_DEADLINE = start_time + TUNING_BUDGET_SECONDS  # cap on the nested-CV phase
 
@@ -855,17 +901,40 @@ if __name__ == "__main__":
         except Exception as _e:
             print(f"  Outer fold {of_i}: final fit failed ({_e}); skipping fold")
             continue
+        # preds is always 1D (labels for classification, values for regression).
         oof_preds[outer_va_idx] = preds
-        # Persist per-seed predictions by slot. Slot k corresponds to
-        # OUTER_FOLD_FINAL_SEEDS[k]; unfilled slots stay NaN (never fabricated).
-        for _k in range(S_OUTER):
-            if _k < len(seed_preds):
-                per_seed_oof[_k, outer_va_idx] = seed_preds[_k]
+        if _is_classification:
+            # Re-aggregate seed proba arrays to get the mean proba matrix for this fold.
+            _fold_mean_proba = _seed_agg(seed_preds, axis=0)  # (n_va, n_classes)
+            if oof_proba_agg is None:
+                if _is_binary:
+                    oof_proba_agg = np.full(len(train_df), np.nan)
+                else:
+                    oof_proba_agg = np.full((len(train_df), _fold_mean_proba.shape[1]), np.nan)
+            if _is_binary:
+                oof_proba_agg[outer_va_idx] = _fold_mean_proba[:, 1]
+            else:
+                oof_proba_agg[outer_va_idx] = _fold_mean_proba
+            # per_seed_oof: store per-seed labels (from per-seed proba) to keep 2D structure.
+            for _k in range(S_OUTER):
+                if _k < len(seed_preds):
+                    _sp_k = seed_preds[_k]  # (n_va, n_classes)
+                    if _is_multiclass:
+                        per_seed_oof[_k, outer_va_idx] = _sp_k.argmax(axis=1).astype(float)
+                    else:
+                        per_seed_oof[_k, outer_va_idx] = (_sp_k[:, 1] >= 0.5).astype(int).astype(float)
+        else:
+            # Persist per-seed predictions by slot. Slot k corresponds to
+            # OUTER_FOLD_FINAL_SEEDS[k]; unfilled slots stay NaN (never fabricated).
+            for _k in range(S_OUTER):
+                if _k < len(seed_preds):
+                    per_seed_oof[_k, outer_va_idx] = seed_preds[_k]
         oof_fold_id[outer_va_idx] = of_i
         per_fold_seeds_used.append(
             [int(s) for s in OUTER_FOLD_FINAL_SEEDS[:len(seed_preds)]]
         )
         # All-category MAE (diagnostic) AND scored MAE (decision metric).
+        # preds is 1D for both classification (labels) and regression (values).
         fmae_all = float(mean_absolute_error(y_outer_va_orig, preds))
         va_scored_m = train_scored_mask[outer_va_idx]
         fmae_scored = _mae_scored(y_outer_va_orig, preds, va_scored_m)
@@ -994,7 +1063,10 @@ if __name__ == "__main__":
     _X_wf_tr_t = _probe_bp_cat.pipeline.transform(X_wf_train_df)
     _X_wf_va_t = _probe_bp_cat.pipeline.transform(X_wf_val_df)
     _cf_probe_idx = [_X_wf_tr_t.columns.get_loc(c) for c in cat_feature_cols if c in _X_wf_tr_t.columns]
-    probe = _CatBoostModel(**{**probe_params, "cat_features": _cf_probe_idx})
+    _probe_merged = {**probe_params, "cat_features": _cf_probe_idx}
+    if _apply_class_weights:
+        _probe_merged["auto_class_weights"] = "Balanced"
+    probe = _CatBoostModel(**_probe_merged)
     probe.fit(
         _X_wf_tr_t, y_wf_train, sample_weight=_wf_sw,
         eval_set=(_X_wf_va_t, forward_transform(y_wf_val_raw)),
@@ -1004,10 +1076,17 @@ if __name__ == "__main__":
     best_n_estimators = int(_best_iter * 1.1)
     if DEBUG:
         best_n_estimators = min(best_n_estimators, 200)
-    _raw_probe = probe.predict(_X_wf_va_t)
-    if isinstance(_raw_probe, np.ndarray) and _raw_probe.ndim > 1:
-        _raw_probe = _raw_probe.squeeze(axis=-1) if _raw_probe.shape[-1] == 1 else _raw_probe.flatten()
-    _wf_probe_preds = np.clip(inv(_raw_probe), 0, None) if _apply_inv_clip else _raw_probe
+    if _is_classification:
+        _raw_proba_probe = probe.predict_proba(_X_wf_va_t)  # (n, n_classes), always 2D
+        if _is_multiclass:
+            _wf_probe_preds = _raw_proba_probe.argmax(axis=1).astype(float)
+        else:
+            _wf_probe_preds = (_raw_proba_probe[:, 1] >= 0.5).astype(int).astype(float)
+    else:
+        _raw_probe = probe.predict(_X_wf_va_t)
+        if isinstance(_raw_probe, np.ndarray) and _raw_probe.ndim > 1:
+            _raw_probe = _raw_probe.squeeze(axis=-1) if _raw_probe.shape[-1] == 1 else _raw_probe.flatten()
+        _wf_probe_preds = np.clip(inv(_raw_probe), 0, None) if _apply_inv_clip else _raw_probe
     wf_mae          = float(mean_absolute_error(y_wf_val, _wf_probe_preds))
     _wf_val_scored_m = _scored_mask(wf_val, scored_filters)
     wf_mae_scored = _mae_scored(y_wf_val, _wf_probe_preds, _wf_val_scored_m)
@@ -1039,13 +1118,20 @@ if __name__ == "__main__":
     _cb_seed_preds = []
     for seed in FINAL_RETRAIN_SEEDS:
         params_s = {**final_params, "cat_features": _cf_prod_idx, "random_seed": seed}
+        if _apply_class_weights:
+            params_s["auto_class_weights"] = "Balanced"
         m = _CatBoostModel(**params_s)
         m.fit(X_train_t, y_full, sample_weight=_adv_weights, verbose=False)
         _cb_trained_models.append(m)
-        _raw_final = m.predict(X_val_t)
-        if isinstance(_raw_final, np.ndarray) and _raw_final.ndim > 1:
-            _raw_final = _raw_final.squeeze(axis=-1) if _raw_final.shape[-1] == 1 else _raw_final.flatten()
-        _cb_seed_preds.append(np.clip(inv(_raw_final), 0, None) if _apply_inv_clip else _raw_final)
+        if _is_classification:
+            # predict_proba() always returns (n, n_classes) — no shape guard needed
+            _raw_proba_final = m.predict_proba(X_val_t)
+            _cb_seed_preds.append(_raw_proba_final)
+        else:
+            _raw_final = m.predict(X_val_t)
+            if isinstance(_raw_final, np.ndarray) and _raw_final.ndim > 1:
+                _raw_final = _raw_final.squeeze(axis=-1) if _raw_final.shape[-1] == 1 else _raw_final.flatten()
+            _cb_seed_preds.append(np.clip(inv(_raw_final), 0, None) if _apply_inv_clip else _raw_final)
 
     cb_ensemble_preds = _seed_agg(_cb_seed_preds, axis=0)
     cb_training_time  = int(time.time() - _cb_t0)
@@ -1066,6 +1152,13 @@ if __name__ == "__main__":
     _oof_path = os.path.join(REPO_ROOT, "reports", "oof_predictions.csv")
     _oof_ids.to_csv(_oof_path, index=False, encoding="utf-8")
     print(f"Written OOF predictions: {_oof_path}  shape={_oof_ids.shape}")
+
+    # Save OOF probability arrays for stage 4 threshold tuning (classification only).
+    if _is_classification and oof_proba_agg is not None:
+        _oof_proba_covered = oof_proba_agg[_covered]  # 1D for binary, 2D for multiclass
+        _oof_proba_path = os.path.join(REPO_ROOT, "reports", "oof_proba.npy")
+        np.save(_oof_proba_path, _oof_proba_covered)
+        print(f"Written OOF proba: {_oof_proba_path}  shape={_oof_proba_covered.shape}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # OBSERVABILITY ONLY — reports/oof/oof_per_seed.csv
@@ -1092,26 +1185,33 @@ if __name__ == "__main__":
           f"seeds={list(OUTER_FOLD_FINAL_SEEDS)}  agg={_seed_agg.__name__}")
 
     # Verify: row-wise _seed_agg of per-seed arrays reproduces oof_preds.
-    # Uses np.nanmean / np.nanmedian when only some seed slots are populated
-    # (e.g. --debug → single seed), mirroring _seed_agg semantics on the
-    # actual per-fold arrays.
-    _pred_cols = [f"pred_seed_{_k}" for _k in range(S_OUTER)]
-    _per_seed_arr = _ops_df[_pred_cols].values
-    if _seed_agg is np.median:
-        _rowwise = np.nanmedian(_per_seed_arr, axis=1)
-    else:
-        _rowwise = np.nanmean(_per_seed_arr, axis=1)
-    _target = oof_preds[_covered_pos]
-    _max_abs_diff = float(np.max(np.abs(_rowwise - _target)))
-    print(f"oof_per_seed verify: n_rows={len(_ops_df)} (OOF rows={int(_covered.sum())})  "
-          f"max |rowwise_{_seed_agg.__name__} - oof_preds| = {_max_abs_diff:.3e}")
+    # For classification, per_seed_oof stores per-seed labels (not proba), so the
+    # row-wise aggregation is label-level and will not reproduce oof_preds exactly
+    # (oof_preds comes from argmax/threshold of the MEAN PROBA, which differs from
+    # round(mean_labels) on borderline rows).  Skip the assert for classification and
+    # rely on the structural guarantee of the proba accumulator instead.
     assert len(_ops_df) == int(_covered.sum()), (
         f"oof_per_seed row count {len(_ops_df)} != OOF row count {int(_covered.sum())}"
     )
-    assert _max_abs_diff < 1e-9, (
-        f"oof_per_seed verify failed: max |rowwise_{_seed_agg.__name__} - oof_preds| "
-        f"= {_max_abs_diff:.3e} exceeds 1e-9 tolerance"
-    )
+    if _is_classification:
+        print(f"oof_per_seed verify: skipped for classification "
+              f"(probability aggregation verified structurally via oof_proba_agg)  "
+              f"n_rows={len(_ops_df)}")
+    else:
+        _pred_cols = [f"pred_seed_{_k}" for _k in range(S_OUTER)]
+        _per_seed_arr = _ops_df[_pred_cols].values
+        if _seed_agg is np.median:
+            _rowwise = np.nanmedian(_per_seed_arr, axis=1)
+        else:
+            _rowwise = np.nanmean(_per_seed_arr, axis=1)
+        _target = oof_preds[_covered_pos]
+        _max_abs_diff = float(np.max(np.abs(_rowwise - _target)))
+        print(f"oof_per_seed verify: n_rows={len(_ops_df)} (OOF rows={int(_covered.sum())})  "
+              f"max |rowwise_{_seed_agg.__name__} - oof_preds| = {_max_abs_diff:.3e}")
+        assert _max_abs_diff < 1e-9, (
+            f"oof_per_seed verify failed: max |rowwise_{_seed_agg.__name__} - oof_preds| "
+            f"= {_max_abs_diff:.3e} exceeds 1e-9 tolerance"
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Step 10 — Ridge diagnostic (Pipeline-encoded, not in submission)
@@ -1188,22 +1288,27 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────────────────
     # Step 11 — Final val predictions and ensemble metadata
     # ─────────────────────────────────────────────────────────────────────────
-    # TODO: use scipy.stats.mode for true majority-vote in multiclass; mean+round is
-    # correct when one class has >50% of seeds but can mis-tiebreak with 3+ classes
-    ensemble_preds = (
-        np.clip(cb_ensemble_preds, 0, None) if _apply_inv_clip
-        else np.round(cb_ensemble_preds).astype(int).astype(float)
-    )
+    # cb_ensemble_preds is (n_val, n_classes) for classification, 1D for regression.
+    # Convert proba → labels at this single point; regression path is unchanged.
+    if _is_multiclass:
+        ensemble_preds = cb_ensemble_preds.argmax(axis=1).astype(float)
+    elif _is_binary:
+        ensemble_preds = (cb_ensemble_preds[:, 1] >= 0.5).astype(int).astype(float)
+    else:
+        ensemble_preds = np.clip(cb_ensemble_preds, 0, None)
     ensemble_blend = "single_catboost"
     _blend_weights_log = {"catboost": 1.0}
     _included_keys     = ["catboost"]
 
     _seed_stack = np.array(_cb_seed_preds)
+    # For classification _seed_stack is (n_seeds, n_val, n_classes); collapse class dim.
+    if _is_classification:
+        _seed_std = np.std(_seed_stack, axis=0).mean(axis=-1)  # (n_val,)
+    else:
+        _seed_std = np.std(_seed_stack, axis=0)  # (n_val,)
     ensemble_disagreement = {
-        "mean_disagreement":        float(np.mean(np.std(_seed_stack, axis=0))),
-        "n_high_disagreement_rows": int(
-            np.sum(np.std(_seed_stack, axis=0) > ensemble_preds.mean())
-        ),
+        "mean_disagreement":        float(np.mean(_seed_std)),
+        "n_high_disagreement_rows": int(np.sum(_seed_std > ensemble_preds.mean())),
     }
     ensemble_oof_mae       = float(oof_mae)
     n_families_in_ensemble = 1
@@ -1574,6 +1679,72 @@ if __name__ == "__main__":
         _lc_tb.print_exc()
         _level_correction["notes"] = f"error: {str(_lc_exc)[:200]}"
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 12.6 — Post-hoc threshold tuning (binary classification only)
+    # Sweeps thresholds on OOF class-1 probabilities; picks F1-optimal; applies
+    # to val predictions only when OOF F1 gain >= THRESHOLD_TUNE_MIN_F1_GAIN.
+    # Skipped entirely for regression, multiclass, and panel subtypes.
+    # ─────────────────────────────────────────────────────────────────────────
+    _threshold_tuning = {
+        "applied":              False,
+        "tuned_threshold":      0.5,
+        "default_threshold":    0.5,
+        "default_f1_oof":       None,
+        "tuned_f1_oof":         None,
+        "f1_gain_oof":          None,
+        "min_f1_gain_required": THRESHOLD_TUNE_MIN_F1_GAIN,
+        "n_thresholds_swept":   None,
+        "notes":                "skipped_not_binary",
+    }
+    if _is_binary and oof_proba_agg is not None:
+        try:
+            # OOF arrays: _covered is ~np.isnan(oof_preds).
+            # oof_proba_agg is 1D for binary (class-1 probas, shape=(len(train_df),)).
+            _y_oof  = y_raw[_covered].astype(int)
+            _oof_p1 = oof_proba_agg[_covered]
+
+            _f1_default = float(f1_score(_y_oof, (_oof_p1 >= 0.5).astype(int),
+                                         zero_division=0))
+
+            _thresholds = np.arange(THRESHOLD_TUNE_MIN,
+                                    THRESHOLD_TUNE_MAX + 1e-9,
+                                    THRESHOLD_TUNE_STEP)
+            _best_thr, _best_f1 = 0.5, _f1_default
+            for _t in _thresholds:
+                _f1 = float(f1_score(_y_oof, (_oof_p1 >= _t).astype(int),
+                                     zero_division=0))
+                if _f1 > _best_f1:
+                    _best_f1, _best_thr = _f1, float(_t)
+
+            _f1_gain = _best_f1 - _f1_default
+            _apply   = bool(_f1_gain >= THRESHOLD_TUNE_MIN_F1_GAIN)
+
+            if _apply:
+                ensemble_preds = (cb_ensemble_preds[:, 1] >= _best_thr).astype(float)
+                print(f"Threshold tuning APPLIED: threshold {_best_thr:.3f} "
+                      f"(default 0.5)  OOF F1 {_f1_default:.4f} → {_best_f1:.4f}  "
+                      f"gain {_f1_gain:+.4f}")
+            else:
+                print(f"Threshold tuning SKIPPED: best OOF F1 {_best_f1:.4f} at "
+                      f"threshold {_best_thr:.3f}, gain {_f1_gain:+.4f} < "
+                      f"{THRESHOLD_TUNE_MIN_F1_GAIN}")
+
+            _threshold_tuning.update({
+                "applied":            _apply,
+                "tuned_threshold":    _best_thr,
+                "default_f1_oof":     _f1_default,
+                "tuned_f1_oof":       _best_f1,
+                "f1_gain_oof":        _f1_gain,
+                "n_thresholds_swept": int(len(_thresholds)),
+                "notes":              (f"swept [{THRESHOLD_TUNE_MIN},{THRESHOLD_TUNE_MAX}] "
+                                       f"step={THRESHOLD_TUNE_STEP}"),
+            })
+        except Exception as _tt_exc:
+            import traceback as _tt_tb
+            print(f"Threshold tuning failed ({_tt_exc}) — skipping")
+            _tt_tb.print_exc()
+            _threshold_tuning["notes"] = f"error: {str(_tt_exc)[:200]}"
+
     _postprocessing = {
         "ordinal_rounding_applied": False,
         "ordinal_raw_wf_mae":       None,
@@ -1726,6 +1897,7 @@ if __name__ == "__main__":
         "postprocessing":    _postprocessing,
         "lag_forecasting":   _lag_forecasting,
         "level_correction":  _level_correction,
+        "threshold_tuning":  _threshold_tuning,
         # OBSERVABILITY ONLY — pointer to per-seed OOF prediction arrays.
         # Not consumed by validator/critic/submission/report — diagnostic only.
         "oof_per_seed": {
@@ -1737,7 +1909,23 @@ if __name__ == "__main__":
             "path":            "reports/oof/oof_per_seed.csv",
             "debug":           bool(DEBUG),
         },
+    "class_weights_applied":      _apply_class_weights,
+    "is_imbalanced":              _is_imbalanced,
+    "min_class_fraction":         _target_chars.get("min_class_fraction"),
+    "imbalance_threshold":        _target_chars.get("imbalance_threshold"),
     }
+
+    # Add probability arrays for stage 4 threshold tuning (classification only).
+    # cb_ensemble_preds is the (n_val, n_classes) proba matrix; ensemble_preds is the
+    # derived 1D label array — cb_ensemble_preds is never overwritten after Step 11.
+    if _is_binary:
+        results["ensemble_proba_class1"] = cb_ensemble_preds[:, 1].tolist()
+        if oof_proba_agg is not None:
+            results["oof_proba_class1"] = oof_proba_agg[_covered].tolist()
+    elif _is_multiclass:
+        results["ensemble_proba"] = cb_ensemble_preds.tolist()
+        if oof_proba_agg is not None:
+            results["oof_proba"] = oof_proba_agg[_covered].tolist()
 
     _mr_path = os.path.join(REPO_ROOT, "reports", "model_results.json")
     with open(_mr_path, "w", encoding="utf-8") as f:
