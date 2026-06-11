@@ -566,6 +566,20 @@ def main() -> None:
         print(_gap_result.stdout)
         if _gap_result.returncode != 0:
             print(f"[gap_attribution] WARNING: {_gap_result.stderr[:400]}", file=sys.stderr)
+            try:
+                with open(out_path, encoding="utf-8") as _f:
+                    _rev = json.load(_f)
+                _rev["gap_attribution"] = {
+                    "classification": (
+                        f"ATTRIBUTION_FAILED (rc={_gap_result.returncode}): "
+                        + _gap_result.stderr[:200]
+                    ),
+                    "monotone_score": None,
+                }
+                with open(out_path, "w", encoding="utf-8") as _f:
+                    json.dump(_rev, _f, indent=2)
+            except Exception as _upd_e:
+                print(f"[gap_attribution] could not update review: {_upd_e}", file=sys.stderr)
     except Exception as _gap_e:
         print(f"[gap_attribution] non-fatal: {_gap_e}", file=sys.stderr)
 

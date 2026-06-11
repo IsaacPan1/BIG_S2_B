@@ -213,6 +213,10 @@ if not second_cycle:
         print("[ablation stdout]:", out_tail)
         if abl.returncode != 0:
             print(f"[ablation stderr]: {abl.stderr[-500:]}")
+            warnings_for_report.append(
+                f"Family ablation subprocess failed (returncode={abl.returncode}): "
+                + abl.stderr[:400]
+            )
         if os.path.exists("reports/family_ablation.json"):
             with open("reports/family_ablation.json") as f:
                 family_ablation = json.load(f)

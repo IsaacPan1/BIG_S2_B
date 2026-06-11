@@ -1717,8 +1717,11 @@ else:
             f"{gap_attr_class}" + (
                 f" — fold-MAE monotone improvement score: {fmt(gap_mono_score, 2)}/1.0"
                 if gap_mono_score is not None else ""
-            ) + ". The modeler–validator MAE gap is structural scheme pessimism "
-              "(smaller early-fold training windows), not real overfit.",
+            ) + (
+                ". The modeler–validator MAE gap is structural scheme pessimism "
+                "(smaller early-fold training windows), not real overfit."
+                if gap_attr_class == "CV_SCHEME" else ""
+            ),
         ])
     if adv_auc_exact is not None:
         _sev = (
