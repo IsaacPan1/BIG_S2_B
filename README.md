@@ -11,40 +11,40 @@ prompt.
 
 The pipeline is driven by a Claude Code session (the orchestrator) that sequences
 six sub-agents plus one direct subprocess. Each stage writes a marker file
-(`reports/{stage}_was_here.txt`) — the authoritative completion signal. All
+(`reports/{stage}_was_here.txt`) - the authoritative completion signal. All
 inter-stage communication is through files; no sub-agent calls another directly.
 
 The modeler (Step 3) is the exception to sub-agent dispatch: it runs as a **direct
 blocking subprocess** (`python tools/run_modeler.py`), not through the Task tool.
-This is intentional — see [Section 5](#5-pipeline-stages) for why.
+This is intentional - see [Section 5](#5-pipeline-stages) for why.
 
 ---
 
 ## 2. Quick Start
 
-1. Set up the environment — see [Section 3](#3-environment-setup).
-2. Place the dataset in `data/` — see [Section 4](#4-required-data-structure).
+1. Set up the environment - see [Section 3](#3-environment-setup).
+2. Place the dataset in `data/` - see [Section 4](#4-required-data-structure).
 3. Launch Claude Code from the repo root:
    ```bash
    claude --dangerously-skip-permissions
    ```
 4. Prompt: `Do the data analysis.`
-5. Wait. A full run is roughly 60–80 minutes end to end; the modeler is the long
-   pole at ~46–58 min. The 2-hour wall-clock budget is a hard ceiling, not the
+5. Wait. A full run is roughly 60-80 minutes end to end; the modeler is the long
+   pole at ~46-58 min. The 2-hour wall-clock budget is a hard ceiling, not the
    expected runtime.
 6. Collect `submission.csv` and `report.pdf` at the repo root.
 
 > **Memory note.** The modeler is memory-bound. On machines with limited free RAM
-> it will swap and slow dramatically — runs are several times slower under memory
+> it will swap and slow dramatically - runs are several times slower under memory
 > pressure. Run with several GB of free RAM for best performance.
 
 ---
 
 ## 3. Environment Setup
 
-Python 3.11 required (specifically 3.11.x — the pipeline invokes the `python3.11`
+Python 3.11 required (specifically 3.11.x - the pipeline invokes the `python3.11`
 binary; a 3.12-only system has no `python3.11` in PATH). The venv **must be created
-from a Python 3.11 executable** so that `python3.11` exists in the venv's `bin/` —
+from a Python 3.11 executable** so that `python3.11` exists in the venv's `bin/` -
 all pipeline tools are invoked via `python3.11` explicitly (not bare `python`).
 
 > **Required before running.** The pipeline's preflight gate calls
@@ -74,7 +74,7 @@ python3.11 -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, repo
 **Shared clusters.** If pip complains about disk quota, point caches and the venv
 at a work/scratch volume (`pip install --cache-dir /work/<you>/.pip-cache ...`).
 **Launch Claude Code from inside the activated venv** so every stage uses the
-same interpreter. All pipeline tools invoke `python3.11` explicitly — activation
+same interpreter. All pipeline tools invoke `python3.11` explicitly - activation
 alone is sufficient as long as the venv was created from Python 3.11.
 
 ---
@@ -117,7 +117,7 @@ fallback only.
 3. Heuristic scan of column names and dtype.
 
 If target detection fails inside `profile_data.py`, the profiler defaults the
-problem subtype to `continuous_regression` and continues — it does **not** abort
+problem subtype to `continuous_regression` and continues - it does **not** abort
 or write a fallback submission. The fatal-failure branch (baseline submission +
 minimal report + stop) fires only if `schema_analyst` cannot produce a valid
 `profile.json` at all; that path is handled by the orchestrator per the CLAUDE.md
@@ -127,15 +127,15 @@ minimal report + stop) fires only if `schema_analyst` cannot produce a valid
 
 ## 5. Pipeline Stages
 
-The orchestrator runs Steps 0–5 in order. **Absence of a marker file while the
-process is still alive is NOT a failure** — it means the stage is in progress.
+The orchestrator runs Steps 0-5 in order. **Absence of a marker file while the
+process is still alive is NOT a failure** - it means the stage is in progress.
 
 | Step | Stage | Invocation | Marker |
 |------|-------|------------|--------|
-| 0 | Initialize `pipeline_run.json` | Orchestrator inline (Python) | — |
+| 0 | Initialize `pipeline_run.json` | Orchestrator inline (Python) | - |
 | 1 | `schema_analyst` | Task sub-agent | `reports/schema_analyst_was_here.txt` |
 | 2 | `feature_engineer` | Task sub-agent | `reports/feature_engineer_was_here.txt` |
-| 3 | Modeler — `tools/run_modeler.py` | **Direct blocking subprocess** | `reports/modeler_was_here.txt` |
+| 3 | Modeler - `tools/run_modeler.py` | **Direct blocking subprocess** | `reports/modeler_was_here.txt` |
 | 3.5 | `validator` | Task sub-agent | `reports/validator_was_here.txt` |
 | 3.6 | `critic` | Task sub-agent | `reports/critic_was_here.txt` |
 | 4 | `submission_writer` | Task sub-agent | `reports/submission_writer_was_here.txt` |
@@ -146,7 +146,7 @@ dispatches for the modeler failed in two characteristic ways: (a) the sub-agent
 returned before `run_modeler.py` finished, so the verify gate fired against
 half-written artifacts; (b) the sub-agent backgrounded the training script and
 exited, leaving an orphaned Python worker consuming CPU outside the orchestrator's
-process tree for up to an hour. Both failures share the same root cause — the
+process tree for up to an hour. Both failures share the same root cause - the
 orchestrator was not the direct parent and had no synchronous wait on the child's
 exit. The direct-subprocess contract fixes this: the orchestrator's Bash tool call
 is the direct parent and blocks until the child exits, so when control returns to
@@ -159,7 +159,7 @@ direct-subprocess contract), validator, and critic before continuing to Step 4.
 
 **Step 0** initializes a fresh `pipeline_run.json` at the start of every run,
 overwriting any leftover record from a prior run. This file tracks session start
-time, budget, modeler run ID, and critic cycle count — it is the orchestrator's
+time, budget, modeler run ID, and critic cycle count - it is the orchestrator's
 authoritative run-state record.
 
 ---
@@ -241,25 +241,25 @@ not optimistic.
 
 When the minority class fraction falls below 10% (`IMBALANCE_THRESHOLD = 0.10` in
 `tools/profile_data.py`), the pipeline activates a four-stage handling sequence.
-Stages 1–3 (detection, class weights, and probability averaging) apply to both binary
-and multiclass classification. Stage 4 (threshold tuning) is binary-only — multiclass
+Stages 1-3 (detection, class weights, and probability averaging) apply to both binary
+and multiclass classification. Stage 4 (threshold tuning) is binary-only - multiclass
 uses argmax on the averaged probability arrays directly and receives no threshold sweep.
 
-**Stage 1 — Detection** (`1acf5e2`). `profile_data.py` computes `min_class_fraction`
+**Stage 1 -� Detection** (`1acf5e2`). `profile_data.py` computes `min_class_fraction`
 across all target classes and sets `is_imbalanced = True` in `profile.json["target_chars"]`.
-No model changes at this stage — detection only.
+No model changes at this stage - detection only.
 
-**Stage 2 — Class weights** (`09daf31`). The modeler reads `is_imbalanced` from
+**Stage 2 -� Class weights** (`09daf31`). The modeler reads `is_imbalanced` from
 `profile.json`. When true and the subtype is classification, `auto_class_weights = "Balanced"`
 is set on every CatBoost fit: training folds, Optuna inner folds, walk-forward probe,
 and the seed ensemble production pass.
 
-**Stage 3 — Probability averaging** (`d453055`). For classification subtypes, the
+**Stage 3 -� Probability averaging** (`d453055`). For classification subtypes, the
 seed ensemble averages class probability arrays (`predict_proba`) across seeds before
 taking argmax, rather than majority-voting hard labels. This preserves probability
 calibration and reduces per-seed variance before the argmax step.
 
-**Stage 4 — Threshold tuning** (`1e7f9af`). For binary classification, the modeler
+**Stage 4 -� Threshold tuning** (`1e7f9af`). For binary classification, the modeler
 sweeps thresholds on OOF class-1 probabilities and selects the F1-optimal threshold.
 The tuned threshold is applied to validation predictions **only** if the OOF F1 gain
 meets a minimum floor (`THRESHOLD_TUNE_MIN_F1_GAIN = 0.02` absolute F1 improvement
@@ -268,7 +268,7 @@ threshold is kept. Threshold tuning is binary-only; multiclass uses argmax direc
 
 **Safety check** (`253a692`). The critic includes a `prediction_collapse` check: if
 all validation predictions degenerate to a single class label, it emits a WARNING
-(non-blocking — submission proceeds). The critic's `prediction_distribution` check
+(non-blocking - submission proceeds). The critic's `prediction_distribution` check
 (`bdc92a7`) is suppressed for classification subtypes because its gap threshold is
 calibrated for regression MAE distributions and is not meaningful for class-label
 or probability outputs.
@@ -281,8 +281,8 @@ or probability outputs.
 |------------|-------|--------|
 | Wall-clock budget | 2 hours | CLAUDE.md hard constraints table |
 | Token budget | 1,000,000 input + output combined, all agents | CLAUDE.md hard constraints table |
-| GPU | Not available — CPU only | CLAUDE.md hard constraints table |
-| External data | None — no downloads, no web search, no API calls, no pretrained weights | CLAUDE.md network policy |
+| GPU | Not available - CPU only | CLAUDE.md hard constraints table |
+| External data | None - no downloads, no web search, no API calls, no pretrained weights | CLAUDE.md network policy |
 | Retune cap | 1 retune cycle maximum per pipeline run | CLAUDE.md; `pipeline_run.json["retune_cap"] = 1` |
 | Submission | Must always be written, even on failure | CLAUDE.md hard constraints table |
 
@@ -292,7 +292,7 @@ or probability outputs.
 |-------|---------|-------|
 | `schema_analyst` | 5 min | Non-negotiable |
 | `feature_engineer` | 15 min | |
-| Modeler | 90 min | Subprocess hard kill ceiling; measured typical run ~46–58 min |
+| Modeler | 90 min | Subprocess hard kill ceiling; measured typical run ~46-58 min |
 | `validator` | 10 min | Diagnostic; never blocks |
 | `critic` | 5 min | Advisory; never blocks |
 | `submission_writer` | 10 min | |
@@ -305,7 +305,7 @@ or probability outputs.
 
 | File | Location | Description |
 |------|----------|-------------|
-| `submission.csv` | repo root | Graded deliverable: exactly two columns — `row_id` and the target column. Row count matches `sample_submission.csv`. |
+| `submission.csv` | repo root | Graded deliverable: exactly two columns - `row_id` and the target column. Row count matches `sample_submission.csv`. |
 | `submission_with_cov.csv` | repo root | Full diagnostic copy: all columns from `sample_submission.csv` plus the target. Same predictions as `submission.csv`, not scored. |
 | `report.pdf` | repo root | Methodology report with feature importance, prediction diagnostics, limitations |
 | `reports/profile.json` | `reports/` | Problem type, column roles, imbalance flags, KS shift results |
@@ -337,13 +337,13 @@ Failure behavior per CLAUDE.md:
 | Modeler | Non-fatal | Compute group-mean predictions from training target; write to `reports/predictions.csv`; continue to `submission_writer` |
 | `report_writer` | Non-fatal | Write minimal one-page `report.pdf` directly via reportlab; if reportlab unavailable, write `report.txt` and log the degradation |
 
-The validator and critic are diagnostic-only — their failure or an adverse verdict
+The validator and critic are diagnostic-only - their failure or an adverse verdict
 never blocks submission.
 
 > **Note.** The `schema_analyst` fatal path fires only when the agent cannot produce
 > a valid `profile.json` at all. If `profile_data.py` encounters a target-detection
 > failure internally, it defaults to `continuous_regression` and continues writing a
-> complete `profile.json` — the fatal orchestrator path does not fire (see §4.3).
+> complete `profile.json` - the fatal orchestrator path does not fire (see §4.3).
 
 ### Code-level defensive rails
 
@@ -380,55 +380,55 @@ before writing. NaN predictions fall back to training mean with a logged warning
 Commits from the `custom-cv` branch head (newest first). Hashes from
 `git log --oneline origin/custom-cv..HEAD`.
 
-**Imbalanced classification — 4-stage implementation**
+**Imbalanced classification - 4-stage implementation**
 `1acf5e2` `09daf31` `d453055` `1e7f9af`
 
 End-to-end handling for class-imbalanced datasets. Detection at the 10% minority-
 class-fraction threshold; `auto_class_weights = "Balanced"` applied to all CatBoost
 fits; seed ensemble averages probabilities before argmax; OOF-optimized threshold
-applied to binary predictions only when F1 gain ≥ 0.02.
+applied to binary predictions only when F1 gain >= 0.02.
 
-`253a692` — **Critic: single-class collapse guard.** Adds a `prediction_collapse`
+`253a692` - **Critic: single-class collapse guard.** Adds a `prediction_collapse`
 WARNING check (non-blocking) when all classification predictions degenerate to one
 class label.
 
-`bdc92a7` — **Critic: suppress regression-calibrated distribution check for
+`bdc92a7` - **Critic: suppress regression-calibrated distribution check for
 classification.** The `prediction_distribution` gap threshold is calibrated for MAE
 distributions; suppressed for classification subtypes where it is not meaningful.
 
-`38ba55d` — **Full classification routing.** `CatBoostClassifier` with Logloss /
+`38ba55d` - **Full classification routing.** `CatBoostClassifier` with Logloss /
 MultiClass loss selection, F1/accuracy metric reporting, and label-set validation in
 the submission writer.
 
-`e4bf090` — **Profiler: two-phase id_col detection.** Exact name-match before
+`e4bf090` - **Profiler: two-phase id_col detection.** Exact name-match before
 dtype-gated near-unique scan; prevents false-positive ID classification.
 
-`bee6414` — **Profiler: reconcile `problem_type` with subtype classifier.** Ensures
+`bee6414` - **Profiler: reconcile `problem_type` with subtype classifier.** Ensures
 the top-level `problem_type` field is consistent with the subtype classifier for
 numeric binary targets (a `{0,1}` integer target is classified as
 `binary_classification`, not `ordinal_regression`).
 
-`ce8ee6e` — **dtype-gate: guard ID-like integer columns before CatBoost encoding.**
+`ce8ee6e` - **dtype-gate: guard ID-like integer columns before CatBoost encoding.**
 Prevents encoding errors on high-cardinality integer columns that reach the
 categorical pipeline.
 
-`a49dee4` — **Submission: handle empty composite key in round-trip audit.** When no
+`a49dee4` - **Submission: handle empty composite key in round-trip audit.** When no
 group or time columns form the composite key, falls back to row-index matching with
 an explicit log instead of silently skipping the audit.
 
-`8190bde` — **Report: derive CV-decision narrative from profile structure.** The CV
+`8190bde` - **Report: derive CV-decision narrative from profile structure.** The CV
 narrative in `report.pdf` is generated at report time from `profile.json` and
 `cv_plan.json` rather than from hardcoded panel text that became stale across runs.
 
-`e5e3b27` — **Report: suppress forecasting section when no time axis present.**
+`e5e3b27` - **Report: suppress forecasting section when no time axis present.**
 Prevents misleading forecasting diagnostics in reports for non-temporal datasets.
 
-`3cae09b` — **Shift-aware post-hoc level correction.** Optional bias adjustment
+`3cae09b` - **Shift-aware post-hoc level correction.** Optional bias adjustment
 weighted by adversarial validation density ratio; applied to regression predictions
 only if it reduces weighted holdout MAE beyond a relative margin gate.
 
-`7281b7e` — **Revert IS density ratio sharpening.** Reverts `f33ff71` (tempered IS
-density ratio for adversarial weighting) — introduced instability on low-shift
+`7281b7e` - **Revert IS density ratio sharpening.** Reverts `f33ff71` (tempered IS
+density ratio for adversarial weighting) - introduced instability on low-shift
 datasets with marginal benefit.
 
 ---
@@ -455,7 +455,7 @@ file structures fall back to heuristics that may misclassify train vs validation
 classification only. Multiclass uses argmax directly on averaged probabilities.
 
 **Image features.** When image sidecars are present, 23 hand-crafted spatial
-statistics are computed via PIL/numpy — not deep-learning embeddings. Semantic
+statistics are computed via PIL/numpy - not deep-learning embeddings. Semantic
 content (object recognition) requires CNN weights and a GPU, which are out of scope.
 
 **Retune cap.** At most one critic-triggered retune cycle per pipeline run. A
