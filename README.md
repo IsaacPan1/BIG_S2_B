@@ -551,6 +551,14 @@ test error can exceed these by an amount no within-training CV can quantify.
 Shift-aware weighting and level correction partially compensate but are bounded
 heuristics.
 
+**Synchronous covariate leakage.** Covariate-derived features respect a temporal
+gap (lags and rolling windows use shift(1)), but the raw contemporaneous covariate
+is passed through under the assumption that provided covariates are known at
+prediction time. A covariate observable only AFTER the target period (a synchronous
+leak with an innocent name) is not flagged by the named-leakage gate, which requires
+a structural name signal. Such a leak would surface indirectly as CV optimism in the
+validator's strict re-audit rather than as a named suspect feature.
+
 **Single model family.** No cross-family ensembling; variance reduction comes
 from the 5-seed CatBoost ensemble, target-transform selection, and
 recursive-vs-imputation method selection.
