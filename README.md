@@ -349,8 +349,8 @@ never blocks submission.
 
 **Memory / feature-budget gate.** Before building large covariate families,
 `feature_engineering.py` estimates column/cell counts and free RAM (via `psutil`).
-If over 2×10⁹ cells, 1,000 extra columns, or under 2 GB free, those families are
-skipped and only base features are computed. Logged under `features.json → feature_budget`.
+If over 2�10? cells, 1,000 extra columns, or under 2 GB free, those families are
+skipped and only base features are computed. Logged under `features.json ? feature_budget`.
 
 **Two-phase ID column detection** (`e4bf090`). Exact name-match for common ID column
 names runs before the dtype-gated near-unique scan. Prevents false-positive ID
@@ -361,7 +361,7 @@ blocked before reaching CatBoost's categorical encoder, preventing encoding erro
 on columns that look like row identifiers.
 
 **Content-first file routing.** A CSV with the target column and <50% nulls is
-classified as train; all-null target → submission template. Filename keywords are
+classified as train; all-null target ? submission template. Filename keywords are
 fallback only. A second-pass content swap corrects mislabeled splits.
 
 **Forecasting-section suppression** (`e5e3b27`). The report omits the forecasting
