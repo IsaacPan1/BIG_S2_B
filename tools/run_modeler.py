@@ -783,6 +783,10 @@ if __name__ == "__main__":
     per_fold_seeds_used = []   # list[list[int]] aligned to outer_splits order
     # OOF probability accumulator (classification only); shape determined on first fold.
     oof_proba_agg = None
+    # Master class list for multiclass OOF proba alignment (sorted ascending, matches
+    # CatBoost's internal .classes_ order).  Built once from all training labels so every
+    # fold's proba matrix is zero-padded to the same K columns even when a fold lacks a class.
+    _mc_master_classes = np.sort(np.unique(y_full.astype(int))) if _is_multiclass else None
 
     TUNING_DEADLINE = start_time + TUNING_BUDGET_SECONDS  # cap on the nested-CV phase
 
@@ -895,7 +899,7 @@ if __name__ == "__main__":
 
         # Train final outer-fold model with best params (or defaults); predict on outer-val
         try:
-            preds, seed_preds, _, _ = _train_catboost_fold(
+            preds, seed_preds, fold_models, _ = _train_catboost_fold(
                 X_outer_tr_df, y_outer_tr, X_outer_va_df, y_outer_va_orig,
                 best_params, sample_weight=sw_outer_tr, seeds=OUTER_FOLD_FINAL_SEEDS)
         except Exception as _e:
@@ -910,11 +914,28 @@ if __name__ == "__main__":
                 if _is_binary:
                     oof_proba_agg = np.full(len(train_df), np.nan)
                 else:
-                    oof_proba_agg = np.full((len(train_df), _fold_mean_proba.shape[1]), np.nan)
+                    oof_proba_agg = np.full((len(train_df), len(_mc_master_classes)), np.nan)
             if _is_binary:
                 oof_proba_agg[outer_va_idx] = _fold_mean_proba[:, 1]
             else:
-                oof_proba_agg[outer_va_idx] = _fold_mean_proba
+                # Align this fold's proba columns to the master class list.
+                # CatBoost sorts .classes_ ascending; master list is also sorted ascending,
+                # so all-classes-present folds are an identity copy (no reordering overhead).
+                # Folds missing a class get 0.0 in the absent class column.
+                _fold_needs_align = (
+                    fold_models and
+                    len(fold_models[0].classes_) != len(_mc_master_classes)
+                )
+                if _fold_needs_align:
+                    _fold_classes = np.asarray(fold_models[0].classes_)
+                    _aligned = np.zeros((len(outer_va_idx), len(_mc_master_classes)))
+                    for _ci, _cls in enumerate(_fold_classes):
+                        _mi = int(np.searchsorted(_mc_master_classes, _cls))
+                        if _mi < len(_mc_master_classes) and _mc_master_classes[_mi] == _cls:
+                            _aligned[:, _mi] = _fold_mean_proba[:, _ci]
+                    oof_proba_agg[outer_va_idx] = _aligned
+                else:
+                    oof_proba_agg[outer_va_idx] = _fold_mean_proba
             # per_seed_oof: store per-seed labels (from per-seed proba) to keep 2D structure.
             for _k in range(S_OUTER):
                 if _k < len(seed_preds):
