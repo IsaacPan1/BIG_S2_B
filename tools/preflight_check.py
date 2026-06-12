@@ -5,12 +5,13 @@ import sys
 v = sys.version_info
 if v < (3, 11):
     sys.stderr.write(
-        "PREFLIGHT FAILED: Python 3.11+ required, detected "
+        "PREFLIGHT FAILED: Python 3.11 required (3.11.x), detected "
         + str(v.major) + "." + str(v.minor) + "." + str(v.micro)
-        + " via bare `python`.\n"
-        "Fix: activate the project venv before launching Claude Code:\n"
-        "  source /path/to/envs/award_b/bin/activate   # Linux/macOS\n"
-        "  python --version   # must show 3.11+\n"
+        + " via `python3.11`.\n"
+        "Fix: ensure python3.11 is available (create your venv from Python 3.11):\n"
+        "  python3.11 -m venv /path/to/envs/my_env\n"
+        "  source /path/to/envs/my_env/bin/activate   # Linux/macOS\n"
+        "  python3.11 --version   # must show 3.11.x\n"
         "See README Section 3 for full setup instructions.\n"
     )
     sys.exit(1)

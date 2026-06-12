@@ -111,11 +111,11 @@ Orchestrator-owned mutable state record. Sub-agents READ; only the orchestrator 
 
 #### Step 0a — interpreter preflight (HARD STOP on failure)
 
-Before any other action, verify that bare `python` — the same invocation
-agents use — resolves to Python 3.11+. Run this via the Bash tool:
+Before any other action, verify that `python3.11` — the same invocation
+all pipeline tools use — resolves to Python 3.11 (any 3.11.x patch). Run this via the Bash tool:
 
 ```bash
-python tools/preflight_check.py
+python3.11 tools/preflight_check.py
 ```
 
 **If exit code is non-zero: HARD STOP immediately.** Do not create
@@ -123,13 +123,15 @@ python tools/preflight_check.py
 degraded run or fallback submission. Print the script's error message to
 the user and stop — the tools cannot import cleanly under the detected
 interpreter, and any submission produced would be invalid. The fix is to
-activate the Python 3.11 venv per README Section 3 and relaunch.
+ensure `python3.11` is in PATH per README Section 3 and relaunch.
 
-**Why bare `python` and not the orchestrator's own interpreter.** The
-orchestrator's `sys.version_info` can be 3.11 while agents' Bash calls
-resolve `python` to a different interpreter via PATH. All agent Bash
-subprocesses share the same session PATH as this Step 0 Bash call, so a
-single preflight check here covers all downstream stages.
+**Why `python3.11` and not bare `python`.** Claude Code's Bash tool does not
+inherit the launch-environment PATH, so bare `python` resolves to the system
+interpreter (potentially an older version) even when Claude Code is launched
+from inside an activated 3.11 venv. All pipeline tools are invoked via
+`python3.11` explicitly, so the preflight checks the same versioned binary they
+use. If `python3.11` is absent ("command not found"), Bash exits with code 127
+before the script runs — the HARD STOP fires regardless.
 
 #### Step 0b — initialize `reports/pipeline_run.json`
 
@@ -168,7 +170,7 @@ Use the schema_analyst sub-agent on the data in data/.
 ```
 
 - Reads: `data/DATA_DESCRIPTION.md`, all CSVs in `data/`
-- Runs: `python tools/profile_data.py --data-dir data/ --output reports/profile.json`
+- Runs: `python3.11 tools/profile_data.py --data-dir data/ --output reports/profile.json`
 - Writes: `reports/profile.json`, `reports/schema_analysis.md`
 - Budget: **5 minutes**
 
@@ -264,7 +266,7 @@ tail = "\n".join(
 ```
 
 If invoked through the Bash tool rather than `subprocess.run`, the
-equivalent command is a plain `python tools/run_modeler.py` line WITHOUT
+equivalent command is a plain `python3.11 tools/run_modeler.py` line WITHOUT
 `run_in_background=true` set on the tool call. The Bash tool's default
 foreground semantics already block until exit and propagate the exit
 code; the only failure mode is enabling backgrounding, so do not.

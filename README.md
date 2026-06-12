@@ -42,20 +42,21 @@ This is intentional — see [Section 5](#5-pipeline-stages) for why.
 
 ## 3. Environment Setup
 
-Python 3.11+ required. A dedicated virtual environment avoids polluting a base
-environment and sidesteps conda/quota issues on shared clusters.
+Python 3.11 required (specifically 3.11.x — the pipeline invokes the `python3.11`
+binary; a 3.12-only system has no `python3.11` in PATH). The venv **must be created
+from a Python 3.11 executable** so that `python3.11` exists in the venv's `bin/` —
+all pipeline tools are invoked via `python3.11` explicitly (not bare `python`).
 
-> **Required before running.** The pipeline must be launched from inside an
-> activated Python 3.11+ venv. Launching Claude Code without activation causes
-> agents' `python` calls to resolve to the system Python, which may be an
-> older version — the pipeline's preflight gate will catch this and refuse to
-> run, but the fix is always the same: activate first.
+> **Required before running.** The pipeline's preflight gate calls
+> `python3.11 tools/preflight_check.py`. If `python3.11` is absent or resolves
+> to a version below 3.11, the pipeline hard-stops before any stage runs.
+> The fix is always: create your venv from Python 3.11 (step below).
 
 ```bash
-python3 -m venv /path/to/envs/award_b
+python3.11 -m venv /path/to/envs/award_b
 source /path/to/envs/award_b/bin/activate   # Linux/macOS
 
-python --version   # confirm 3.11+
+python3.11 --version   # confirm 3.11.x
 
 pip install \
   "pandas>=2.0" "numpy>=1.24" "scikit-learn>=1.3" "catboost>=1.2" \
@@ -67,14 +68,14 @@ Or, if `pyproject.toml` is in sync: `pip install -e .`
 
 Verify the install:
 ```bash
-python -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportlab, pydantic, pyarrow; print('all imports OK')"
+python3.11 -c "import pandas, numpy, sklearn, catboost, optuna, matplotlib, reportlab, pydantic, pyarrow; print('all imports OK')"
 ```
 
 **Shared clusters.** If pip complains about disk quota, point caches and the venv
 at a work/scratch volume (`pip install --cache-dir /work/<you>/.pip-cache ...`).
 **Launch Claude Code from inside the activated venv** so every stage uses the
-same interpreter. If sub-stages can't find packages, ensure they invoke the
-venv's Python explicitly rather than a system `python3`.
+same interpreter. All pipeline tools invoke `python3.11` explicitly — activation
+alone is sufficient as long as the venv was created from Python 3.11.
 
 ---
 
