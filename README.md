@@ -186,6 +186,57 @@ a diagnostic only (logged in `model_results.json`) and never appears in
 
 ---
 
+## 6.5 Cross-Validation Scheme
+
+`scheme_analysis.py` is the sole authority for the CV plan: it classifies the
+problem, selects a scheme, enumerates leakage risks, and writes a **frozen**
+`reports/cv_plan.json`. The plan is marked immutable (`frozen: true`) and no
+downstream stage may modify it — `load_cv_plan` asserts the freeze on every read.
+
+**Scheme selection by structure** (not by problem-type label):
+
+| Structure | Scheme |
+|---|---|
+| Time column + group columns | `TimeSeriesExpanding` (panel forecasting) |
+| Time column only | `TimeSeriesExpanding` |
+| Group columns, no time | `GroupKFold` |
+| =2 unique target values | `StratifiedKFold` |
+| =50 unique integer values | `StratifiedKFold` |
+| Otherwise | `KFold` |
+
+**Recent-vs-full drift gate (expanding vs sliding).** The default for any
+time-series problem is an expanding window (all history). The pipeline switches
+to a sliding window *only* when restricting training to recent periods
+measurably reduces the train?validation gap.
+
+The diagnostic deliberately avoids the naive approach (triggering sliding on high
+KS or adversarial-classifier AUC). On a forecasting holdout, validation is a
+future window, so those signals saturate — they read "large shift" by
+construction whether or not recency would help, and would pick sliding almost
+always, discarding history for no gain. Instead, the gate computes a
+**standardized mean shift** (an effect size that does not saturate) per numeric
+covariate, comparing full-train-vs-val against recent-train-vs-val, and measures
+whether the recent window actually narrows the distance.
+
+Sliding is selected **only when all three conditions hold**:
+- `frac_improved = 0.60` — share of features whose gap shrinks with recency (primary gate)
+- `rel = 0.25` — relative mean improvement (secondary gate)
+- `n_features_scanned = 12` — evidence-breadth floor
+
+Any failure — including a non-runnable diagnostic, too few periods, or no time
+axis — falls back to expanding. Sliding is never the default; it must be
+affirmatively justified. (Seasonality and time-index features are excluded from
+the scan, since they separate train from val by construction rather than by drift.)
+
+**Leakage controls.** The plan enumerates and mitigates leakage risks: future
+timestamps (validator enforces `max(train_time)+gap = min(valid_time)`), group
+overlap (disjoint groups for `GroupKFold`), target-derived features (recomputed
+per-fold from training indices only), and ID-like columns (dropped). The
+validator runs an independent strict re-audit to confirm the modeler's CV was
+not optimistic.
+
+---
+
 ## 7. Imbalanced Classification
 
 When the minority class fraction falls below 10% (`IMBALANCE_THRESHOLD = 0.10` in
