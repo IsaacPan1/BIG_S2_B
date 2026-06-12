@@ -1,11 +1,6 @@
 # Award B — Autonomous Data Analysis Pipeline
 
-This repository is an autonomous data analysis pipeline for a blind tabular
-forecasting competition. When an evaluator drops an unknown dataset into `data/`
-and prompts **"Do the data analysis"** (or any equivalent phrasing), this pipeline
-must run without any human intervention, produce a valid `submission.csv` at the
-repo root, and produce a `report.pdf` summarising the methodology and results —
-all within **2 hours wall-clock** and **1,000,000 tokens** (input + output combined).
+Blind tabular forecasting pipeline. On trigger phrase, run without human intervention to produce `submission.csv` and `report.pdf` within **2 hours wall-clock** and **1,000,000 tokens** (input + output combined).
 
 ---
 
@@ -31,10 +26,11 @@ Do not ask clarifying questions. Do not wait. Begin at Step 1 of the workflow.
 | Wall-clock budget | 2 hours from first tool call |
 | Token budget | 1,000,000 (input + output, all agents combined) |
 | Model | claude-sonnet-4-6 only |
-| External data | None — no downloads, no web search |
+| External data | None — no downloads, no web search, no pretrained model fetches at runtime |
 | Human intervention | None after the initial prompt |
 | GPU | Not available — CPU-only training |
 | Submission | **Must always be written**, even on failure |
+| Network access | Prohibited — no `web_search`, `web_fetch`, external APIs, or data beyond `data/` |
 
 ---
 
@@ -47,26 +43,11 @@ non-empty and sensible before continuing.
 
 ### Sub-agent completion contract (read before invoking any stage)
 
-**MARKER IS AUTHORITATIVE — ABSENCE ≠ FAILURE.**
-A sub-agent is COMPLETE when and only when its `*_was_here.txt` marker file exists.
-If the marker is absent, the sub-agent is either STILL RUNNING or genuinely failed —
-these are two different states and must NOT be conflated. Absence of the marker is NOT
-proof of failure. Do NOT re-invoke a sub-agent solely because its outputs are not yet
-present.
+**MARKER IS AUTHORITATIVE — ABSENCE ≠ FAILURE.** A sub-agent is COMPLETE when its `*_was_here.txt` marker file exists. Absence means STILL RUNNING or genuinely failed — two different states, must NOT be conflated. Do NOT re-invoke solely because outputs are not yet present.
 
-**NEVER DOUBLE-INVOKE.**
-Before invoking any sub-agent, check whether its marker already exists OR whether a
-process for it is already running. NEVER launch a second instance of a sub-agent while
-a prior instance may still be running — concurrent writes to the same `reports/` files
-corrupt outputs. If a stage appears stalled, wait; do not relaunch.
+**NEVER DOUBLE-INVOKE.** Before invoking any sub-agent, check whether its marker already exists OR a process for it is already running. NEVER launch a second instance while a prior one may still be running — concurrent writes to `reports/` corrupt outputs. If a stage appears stalled, wait; do not relaunch.
 
-**HOW TO DISTINGUISH 'STILL RUNNING' FROM 'FAILED'.**
-The only valid failure signal is: the process has EXITED (with any exit code) AND the
-marker file is still absent after exit. Re-invocation or fallback logic is permitted ONLY
-in that genuine-failure state — never on a not-yet-present check during an active run.
-
-**Expected wall-clock durations per stage** (the marker will be absent throughout this
-window during normal operation — this is expected, not a failure):
+**HOW TO DISTINGUISH 'STILL RUNNING' FROM 'FAILED'.** The only valid failure signal: process has EXITED (any exit code) AND marker is still absent after exit. Re-invocation or fallback logic is permitted ONLY in that genuine-failure state — never on a not-yet-present check during an active run.
 
 | Stage | Typical duration | Outer budget |
 |-------|-----------------|--------------|
@@ -75,20 +56,11 @@ window during normal operation — this is expected, not a failure):
 | validator | 3–8 min | 10 min |
 | critic | 2–5 min | 5 min |
 
-The modeler is the longest-running stage. It is normal for `reports/modeler_was_here.txt`
-to be absent for 10+ minutes after invocation while Optuna trials are running. Do not
-treat this as a failure. Poll for the marker periodically; continue waiting as long as
-the launched process is alive.
-
 ### Stage handoff contracts
 
-Every inter-stage handoff is an **artifact contract**, never a verbal one. A downstream
-sub-agent's precondition is the set of files produced by the upstream stage plus a
-small `reports/<stage>_completion.json` record (schema below). The orchestrator's
-"verify after completion" block is the gate that decides whether the next stage runs.
+Every handoff is an **artifact contract** — downstream preconditions are upstream stage files plus a completion-record; verbal handoffs are NOT permitted. The orchestrator's verify block is the gate.
 
-**Completion-record schema** — written by every sub-agent whose contract requires one
-(currently: modeler; the same schema applies to any stage that adopts the pattern):
+**Completion-record schema** (written by modeler; same schema for stages adopting the pattern):
 
 ```json
 {
@@ -106,95 +78,34 @@ small `reports/<stage>_completion.json` record (schema below). The orchestrator'
 }
 ```
 
-**Stale-marker guard.** A marker file existing is not enough — it may be left over
-from a prior pipeline run. The orchestrator's gate must verify `marker.mtime >
-dispatch_time`. Sub-agents that write a completion record must capture
-`dispatch_time` BEFORE launching the backing script.
+**Stale-marker guard:** A marker may be left from a prior run. Gates must verify `marker.mtime > dispatch_time`. Capture `dispatch_time` BEFORE launching the backing script.
 
 #### Pipeline run state — `reports/pipeline_run.json`
 
-The above completion records are **write-once** — each sub-agent writes its own
-record at the end of its work. `reports/pipeline_run.json` is the one
-**mutated-mid-run** state file: the orchestrator's run-state record. It
-turns the freshness checks, budget guard, and cycle bound from heuristic
-fallbacks (documented per-stage) into real enforcement.
+Orchestrator-owned mutable state record. Sub-agents READ; only the orchestrator WRITES.
 
-**Schema** (no other fields; this file is strictly the cross-stage state the
-orchestrator needs):
+**Schema:**
 
 ```json
 {
-  "session_start_iso":      "2026-06-08T21:01:12.540453+00:00",  // tz-aware UTC; convenience copy
-  "session_start_epoch":    1780952472.540453,                   // POSIX epoch float, UTC — primary reference
-  "total_budget_seconds":   7200,                                // 2 h, per the Hard constraints table
-  "current_modeler_run_id": null,                                // null at start; set after each modeler verify pass
-  "critic_cycle":           0,                                   // 0 at start; incremented before each retune dispatch
-  "retune_cap":             1                                    // matches critic.md contract; orchestrator-enforced
+  "session_start_iso":      "2026-06-08T21:01:12.540453+00:00",
+  "session_start_epoch":    1780952472.540453,
+  "total_budget_seconds":   7200,
+  "current_modeler_run_id": null,
+  "critic_cycle":           0,
+  "retune_cap":             1
 }
 ```
 
-**Ownership.** `pipeline_run.json` is **orchestrator-owned**. Sub-agents
-**READ** it; only the orchestrator **WRITES** it. There are no concurrent
-writers. Last-write-wins applies — but in practice, every write is a
-deliberate orchestrator action between agent dispatches.
+**Write points** (`session_start_*`, `total_budget_seconds`, `retune_cap` are write-once at Step 0):
 
-**Write semantics.** The file mutates at four well-defined points:
+| When | Field updated | Value |
+|------|--------------|-------|
+| Step 0 — CREATE (overwrite unconditionally if prior file exists) | all fields | fresh session values |
+| Step 3 verify passes — initial pass AND retune pass | `current_modeler_run_id` | `modeler_completion.json["modeler_run_id"]` |
+| Step 3.6 retune branch BEFORE dispatch | `critic_cycle` | incremented (+1, written to disk before re-dispatch) |
 
-1. **CREATE / OVERWRITE at pipeline start (Step 0).** Initialize a fresh
-   record with `session_start_iso` / `session_start_epoch` set from
-   `datetime.now(timezone.utc)`, `total_budget_seconds = 7200`,
-   `current_modeler_run_id = null`, `critic_cycle = 0`, `retune_cap = 1`.
-   **If a `pipeline_run.json` already exists from a prior run, OVERWRITE it
-   — never reuse.** Reusing a leftover record is the stale-state hole: it
-   would silently validate prior-run completion records as fresh. Overwrite
-   unconditionally.
-2. **UPDATE `current_modeler_run_id` after Step 3 modeler verify passes
-   (initial pass).** Copy
-   `modeler_completion.json["modeler_run_id"]` into
-   `pipeline_run.json["current_modeler_run_id"]`. Do this only after the
-   Step 3 artifact gate has passed.
-3. **UPDATE `critic_cycle` in the Step 3.6 retune branch — BEFORE
-   dispatching the retune modeler pass.** Increment `critic_cycle` and
-   persist BEFORE re-invoking the modeler. The cap check and budget guard
-   run against the post-increment value. You cannot afford to start a
-   retune cycle you can't finish in budget — check before dispatch, never
-   after.
-4. **UPDATE `current_modeler_run_id` after Step 3 modeler verify passes
-   (retune pass).** Same as (2). The field always tracks the **latest**
-   modeler pass; freshness checks downstream point at the most recent run.
-
-`session_start_*`, `total_budget_seconds`, and `retune_cap` are written
-once at Step 0 and never modified.
-
-**Enforcement this record powers** (each replacing a previously
-heuristic-only check; the strict path is now wired through every downstream
-agent contract — validator, critic, submission_writer, report_writer all
-read `pipeline_run.json` directly in their precondition gates and BLOCK on
-mismatch; the orchestrator-side Step 3.x verify gates re-run the check
-independently):
-
-| Concern | Old fallback | Strict enforcement via pipeline_run.json |
-|---|---|---|
-| Freshness | submission_writer.md / report_writer.md / critic.md 3 h mtime window | every downstream completion record's `modeler_run_id` must equal `pipeline_run.current_modeler_run_id` |
-| Budget guard | critic.md "< 25 min" heuristic guess | `remaining = session_start_epoch + total_budget_seconds − now` — a real number |
-| Cycle cap | Step 3.6 narrative "Maximum one retune cycle per pipeline run" | `critic_cycle < retune_cap`, checked at orchestrator before dispatching a retune |
-
-**Producer → artifact → consumer table**
-
-| Producer | Artifact | Consumer | Precondition for consumer |
-|---|---|---|---|
-| modeler | `reports/model_results.json` | validator, critic, report_writer | exists, non-empty, parses as JSON |
-| modeler | `reports/predictions.csv` | submission_writer, critic, report_writer | exists, non-empty, row count == `n_val_rows`, `predicted_target` has no NaN |
-| modeler | `reports/oof_predictions.csv` | validator, critic | exists, non-empty |
-| modeler | `reports/modeler_was_here.txt` | orchestrator | exists, `mtime > dispatch_time` |
-| modeler | `reports/modeler_completion.json` | validator, orchestrator | exists, `status == "ok"` |
-| orchestrator | `reports/pipeline_run.json` | validator, critic, submission_writer, report_writer | exists (created at Step 0); every downstream agent compares its upstream `modeler_run_id` against `current_modeler_run_id` in Step 1 and BLOCKs on mismatch; critic also reads `session_start_epoch` for the budget guard and `critic_cycle` for the cycle counter |
-
-The validator's precondition is the full set of modeler artifacts above
-(`status == "ok"` plus the four named files). Verbal-only handoffs are NOT
-permitted; if a downstream stage cannot find its required artifacts, it must
-FAIL its own gate and not invent fallbacks based on the subagent's narrative
-report.
+**Enforcement:** `remaining_budget = session_start_epoch + total_budget_seconds − now()` (budget guard in Step 3.6); `critic_cycle < retune_cap` (cycle cap); every downstream `modeler_run_id` must equal `current_modeler_run_id` (freshness — checked by validator, critic, submission_writer, report_writer).
 
 ### Step 0 — preflight check + initialize `reports/pipeline_run.json` (ALWAYS first concrete action)
 
@@ -302,35 +213,13 @@ Log the fallback in stdout and continue to the modeler with whatever feature fil
 orchestrator's own Bash tool call. Do NOT invoke the `modeler` sub-agent via
 the Task tool. Do NOT use `run_in_background`. Do NOT use trailing `&`,
 `nohup`, `Start-Process -NoWait`, PowerShell jobs, or any other detach /
-backgrounding mechanism.**
-
-**Why the contract changed.** The previous Task-subagent dispatch path has
-failed five consecutive runs in two characteristic ways: (a) the subagent
-returned before `run_modeler.py` finished, leaving the verify gate to fire
-against half-written artifacts; and (b) the subagent backgrounded the
-training script and exited, leaving an orphaned Python worker (the "zombie"
-process) consuming the next ~hour of CPU outside the orchestrator's
-process tree. Both failure modes share the same root cause: the
-orchestrator was not the direct parent of the training process and had no
-synchronous wait on its exit. The subagent path is therefore removed from
-the contract. The orchestrator now invokes the training script directly
-and owns the wait.
+backgrounding mechanism.** (Task-tool dispatch previously caused orphaned processes and half-written artifacts.)
 
 **Two structural invariants this enforces — neither can orphan:**
 1. The orchestrator's tool call is the direct parent of `run_modeler.py`.
    No `Agent` / `Task` indirection sits between them.
 2. The orchestrator's tool call does not return until the child exits.
    No background flag, no detachment, no polling loop racing the child.
-
-Together they guarantee that when control returns to the Step 3 verify
-gate, all modeler work is fully done: either the script wrote its
-artifacts and exited 0, or it crashed with a non-zero exit code. There is
-no "still running" branch to wait on, no marker-absence race, and no
-orphaned worker behind the scenes.
-
-This is the longest-running stage — Optuna hyperparameter tuning typically
-takes 8–15 minutes — so the single blocking Bash call is expected to sit
-open for that long. That is the correct behavior, not a hang.
 
 - Reads: `reports/schema_analysis.md`, `reports/features.json`,
          `data/features_train.parquet`, `data/features_val.parquet`
@@ -489,10 +378,7 @@ block submission regardless of verdict. This stage typically takes 3–8 minutes
 see the Sub-agent completion contract above — do NOT re-invoke if the marker
 has not yet appeared.
 
-**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** — same
-convention as Step 3: Python `datetime.datetime.now(datetime.timezone.utc)` →
-ISO + epoch-float pair; record both. NEVER reparse a naive ISO string with
-`datetime.fromisoformat(...).timestamp()` later.
+**Capture `dispatch_time` as UTC ISO + epoch-float pair BEFORE invoking — same convention as Step 3.**
 
 ```
 Use the validator sub-agent to audit the modeler's CV integrity.
@@ -551,8 +437,7 @@ Invoke the critic sub-agent via the Task tool. This stage typically takes
 if the marker has not yet appeared. Do NOT generate critic review inline;
 always delegate to the critic sub-agent.
 
-**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
-same convention as Step 3.
+**Capture `dispatch_time` as UTC ISO + epoch-float pair BEFORE invoking — same convention as Step 3.**
 
 ```
 Use the critic sub-agent to review the validator output and modeler predictions.
@@ -605,8 +490,7 @@ AND a minimal `reports/critic_review.json` with `status="accepted"` +
 per "never blocks submission". **NEVER trigger the retune loop on a
 gate-fail.**
 
-**Status branch** (on full gate pass) — REPLACES the previous
-"Retune-vs-proceed decision" placement; the gate runs FIRST, the branch
+**Status branch** (on full gate pass) — the gate runs FIRST; the branch
 consumes its outcome:
 
 **`status == "ok"`** → proceed to Step 4.
@@ -663,8 +547,7 @@ always reaches submission_writer regardless of which branch fires.
 Invoke the submission_writer sub-agent via the Task tool. Do NOT write
 `submission.csv` inline — always delegate to the submission_writer sub-agent.
 
-**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
-same convention as Step 3.
+**Capture `dispatch_time` as UTC ISO + epoch-float pair BEFORE invoking — same convention as Step 3.**
 
 ```
 Use the submission_writer sub-agent to validate and write submission.csv.
@@ -728,8 +611,7 @@ values may be wrong, but the submission is well-formed:
 Invoke the report_writer sub-agent via the Task tool. Do NOT generate
 `report.pdf` inline — always delegate to the report_writer sub-agent.
 
-**Capture `dispatch_time` tz-aware UTC BEFORE invoking the sub-agent** —
-same convention as Step 3.
+**Capture `dispatch_time` as UTC ISO + epoch-float pair BEFORE invoking — same convention as Step 3.**
 
 ```
 Use the report_writer sub-agent to produce report.pdf.
@@ -788,49 +670,12 @@ genuinely missing system-wide.
 | submission_writer | 10 min | Should be fast; escalate if it stalls |
 | report_writer | 20 min | Reduce to text-only PDF if time is short |
 | Buffer | 15 min | Reserved for retries and fallback logic |
-| **Total** | **170 min** | Sum of outer ceilings (modeler bumped to 90 min). Typical wall-clock is well under this — measured modeler runs ~46–58 min, not 90. Phases must compress if falling behind the 120-minute wall-clock limit; the 90-min modeler ceiling is a kill-switch, not a target |
-
-If critic triggers a retune, modeler + validator + critic re-run, adding ~75 minutes. Subsequent phases must reduce to their fallback variants if this happens.
+| **Total** | **170 min** | Typical modeler runs ~46–58 min, not 90. Phases compress if behind 120-min wall-clock limit; 90-min modeler ceiling is a kill-switch, not a target. If critic triggers a retune, modeler + validator + critic re-run (~75 min); subsequent phases must use fallback variants. |
 
 **Self-pacing rule**: After each phase, estimate remaining wall-clock time.
 If ≥ 75 % of the token budget or time budget is consumed and fewer than
 two phases are complete, switch all remaining phases to their simplest
 fallback variants immediately.
-
----
-
-## Tools available
-
-| Tool | Invoked by | Usage |
-|------|------------|-------|
-| `tools/profile_data.py` | schema_analyst | Profiles a data directory; outputs `reports/profile.json` with problem type, group/time/target columns, per-column stats, KS shift flags, and image detection. Run with `--data-dir data/ --output reports/profile.json`. |
-| `tools/feature_engineering.py` | feature_engineer | Dataset-agnostic panel feature engineering. Reads `reports/profile.json` for schema; adapts lag/rolling depths to available training history. Writes `data/features_train.parquet`, `data/features_val.parquet`, `reports/features.json`, `reports/feature_engineer_was_here.txt`. |
-| `tools/run_modeler.py` | modeler | CatBoost training (sole predictor) with walk-forward 80/20 holdout, Optuna hyperparameter tuning, and boundary reflection. Trains a Ridge diagnostic baseline for OOF MAE comparison and top linear coefficients (not in submission). Writes `reports/model_results.json`, `reports/predictions.csv`, `reports/oof_predictions.csv`, `reports/modeler_was_here.txt`. |
-| `tools/validate.py` | validator | CV integrity and leakage audit. Computes purged walk-forward MAE and compares to reported CV MAE. Writes `reports/validator_review.json` (including `fold_maes`, `fold_train_sizes`); calls `tools/gap_attribution.py` internally. Run with `--repo-root PATH`. |
-| `tools/gap_attribution.py` | validator (auto) | Dataset-agnostic OOF→strict CV gap attribution. Reads `fold_maes`/`fold_train_sizes` from `validator_review.json`; classifies gap as CV_SCHEME (scheme pessimism) or REAL_DIVERGENCE; appends `gap_attribution` block to `validator_review.json`. No model training. |
-| `tools/family_ablation.py` | critic (auto) | Leave-one-family-out strict-CV ablation using `feature_families` from `features.json`. Budget-gated (skips if time insufficient). Flags families as NET-HARMFUL if `strict_mae_without + margin < strict_mae_full` where `margin = max(3*seed_std, 0.005)`. Writes `reports/family_ablation.json`. **DIAGNOSTIC ONLY** — results are recorded for analysis but the critic must NOT automatically drop families or trigger a retune based on `net_harmful_families` unless the `auto_drop_harmful_families` flag is explicitly enabled (default: off). |
-| `tools/run_critic.py` | critic | 5-check quality review covering CV gap (with gap-attribution downgrade), prediction bias/variance, feature concentration, walk-forward plausibility, and prediction sanity. Invokes `family_ablation.py`. Writes `reports/critic_review.json`, `reports/critic_was_here.txt`, and optionally `reports/critic_retune_requested.json`. |
-| `tools/build_submission.py` | submission_writer | Validates predictions against `data/sample_submission.csv` and writes `submission.csv` at the repo root. Renames `predicted_target` to the actual target column name. Run with `--repo-root PATH`. |
-| `tools/generate_report.py` | report_writer | Assembles `report.pdf` from `reports/` artefacts using reportlab. Includes methodology, feature importance, prediction diagnostics, and limitations sections. |
-
----
-
-## File contracts between agents
-
-| Agent | Reads | Writes |
-|-------|-------|--------|
-| `orchestrator` (this CLAUDE.md, not a sub-agent) | — | `reports/pipeline_run.json` — created at Step 0, mutated at Step 3 verify (post-pass: `current_modeler_run_id` updated) and Step 3.6 retune dispatch (pre-dispatch: `critic_cycle` incremented). Read by critic, submission_writer, report_writer. See "Stage handoff contracts → Pipeline run state". |
-| `schema_analyst` | `data/`, `data/DATA_DESCRIPTION.md` | `reports/profile.json`, `reports/schema_analysis.md`, `reports/schema_analyst_was_here.txt` |
-| `feature_engineer` | `reports/schema_analysis.md`, `reports/profile.json`, `data/` | `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` |
-| `modeler` | `reports/schema_analysis.md`, `reports/features.json`, `data/features_train.parquet`, `data/features_val.parquet` | `reports/model_results.json` (includes `feature_importance_all`, `oof_mae`), `reports/predictions.csv` (columns: `row_id`, identifier cols, `predicted_target`), `reports/oof_predictions.csv` (columns: identifier cols, `fold`, `predicted_target`), `reports/modeler_was_here.txt`, `reports/modeler_completion.json` (status / dispatch_time / exit_code / artifact paths — see Stage handoff contracts) |
-| `validator` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/profile.json`, `reports/model_results.json`, `reports/features.json`, `data/features_train.parquet`, `reports/oof_predictions.csv` (opt), `reports/schema_analysis.md` (opt) | `reports/validator_review.json` (includes `fold_maes`, `fold_train_sizes`, `gap_attribution` block), `reports/validator_was_here.txt`, `reports/validator_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts) |
-| `critic` | `reports/modeler_completion.json` (precondition + freshness source), `reports/pipeline_run.json` (cycle counter + freshness target), `reports/validator_review.json` (reads `gap_attribution`), `reports/model_results.json`, `reports/predictions.csv`, `reports/features.json`, `reports/profile.json`, `data/features_train.parquet` | `reports/critic_review.json` (includes `gap_attribution_used`, `family_ablation`), `reports/critic_was_here.txt`, `reports/critic_completion.json` (EXTENDED status ∈ {ok, failed, blocked, retune_requested} / dispatch_time / exit_code / artifact paths / modeler_run_id / cycle / retune_reason — see Stage handoff contracts and critic.md), `reports/family_ablation.json` (via ablation tool), optionally `reports/critic_retune_requested.json` (may include `net_harmful_families`) and `reports/critic_retune_attempted.txt` |
-| `submission_writer` | `reports/modeler_completion.json` (precondition: `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/predictions.csv`, `data/DATA_DESCRIPTION.md`, `data/sample_submission.csv` | `submission.csv` (repo root), `reports/submission_summary.json`, `reports/submission_writer_was_here.txt`, `reports/submission_writer_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts) — renames `predicted_target` → actual target column name from `DATA_DESCRIPTION.md` |
-| `report_writer` | `reports/modeler_completion.json`, `reports/validator_completion.json`, `reports/submission_writer_completion.json` (union of upstream completion records; all must satisfy `status == "ok"`), `reports/pipeline_run.json` (freshness), `reports/` (all files), `data/DATA_DESCRIPTION.md` | `report.pdf` (repo root), `reports/report_writer_was_here.txt`, `reports/report_writer_completion.json` (status ∈ {ok, failed, blocked} / dispatch_time / exit_code / artifact paths / modeler_run_id — see Stage handoff contracts), optional `.png` charts |
-
-All inter-agent communication happens through files. Agents do not call each other
-directly. The orchestrator (this CLAUDE.md) is responsible for sequencing and
-passing the right context to each sub-agent invocation.
 
 ---
 
@@ -903,61 +748,14 @@ Non-fatal. Write a minimal report directly.
 
 ---
 
-
-## Network and external resources policy
-
-This agent performs analysis ONLY on the data provided in data/. 
-The agent must NOT:
-- Use web_search, web_fetch, or any network access during analysis
-- Load pretrained models from external sources at runtime
-- Download datasets, even if the rules technically permit network 
-  access
-- Use any information about the problem domain beyond what is 
-  stated in data/DATA_DESCRIPTION.md
-
-All signal must be derived from computation on the provided data. 
-Sophisticated analysis (seasonality detection, distribution shift 
-testing, statistical feature engineering) is encouraged. External 
-information lookup is prohibited.
-
-This is a deliberate engineering choice for robustness and 
-transparency, beyond the minimum competition requirements.
-
----
-
-
 ## Sub-agents registered in .claude/agents/
 
-| File | Name | Status | When invoked |
-|------|------|--------|-------------|
-| `schema_analyst.md` | `schema_analyst` | **exists** | Step 1 — always, immediately |
-| `feature_engineer.md` | `feature_engineer` | **exists** | Step 2 — after schema_analyst succeeds |
-| `modeler.md` | `modeler` | **exists** | Step 3 — after feature_engineer succeeds or falls back |
-| `validator.md` | `validator` | **exists** | Step 3.5 — after modeler produces predictions; diagnostic only |
-| `critic.md` | `critic` | **exists** | Step 3.6 — after validator completes; advisory + retune; never blocks submission |
-| `submission_writer.md` | `submission_writer` | **exists** | Step 4 — after critic completes (or fails gracefully) |
-| `report_writer.md` | `report_writer` | **exists** | Step 5 — after submission.csv is written |
-
----
-
-## Remaining contract work
-
-The orchestrator-side gates, the `pipeline_run.json` run-state record, the
-`modeler_run_id` propagation chain through every completion record, AND the
-agent-side strict freshness check in every downstream precondition gate
-(validator → critic → submission_writer → report_writer) are all in place
-end-to-end. Each downstream agent reads `pipeline_run.json` directly,
-compares its upstream `modeler_run_id` against `current_modeler_run_id`,
-and BLOCKs on mismatch — no time-window or mtime heuristic remains in any
-active freshness path. The orchestrator-side Step 3.x verify gates re-run
-the same check independently as defense in depth. One documented future
-option remains, gated on coordinated tool + orchestrator changes.
-
-### Future option (NOT a known drift) — raise the retune cap to 2
-
-Tracked under `.claude/agents/critic.md` § "Future option: raising the cap
-to 2 retunes". Requires `tools/run_critic.py` sentinel → persisted-counter
-upgrade AND a corresponding orchestrator change (raise
-`pipeline_run.json["retune_cap"]` from 1 to 2 and adjust the Step 3.6
-narrative). A doc-only bump in either place desynchronises the contract
-from what is actually enforced — never do that.
+| File | Name | When invoked |
+|------|------|-------------|
+| `schema_analyst.md` | `schema_analyst` | Step 1 — always, immediately |
+| `feature_engineer.md` | `feature_engineer` | Step 2 — after schema_analyst succeeds |
+| `modeler.md` | `modeler` | Step 3 — NOT via Task tool; run `tools/run_modeler.py` directly (blocking) |
+| `validator.md` | `validator` | Step 3.5 — after modeler; diagnostic only |
+| `critic.md` | `critic` | Step 3.6 — after validator; advisory + retune; never blocks submission |
+| `submission_writer.md` | `submission_writer` | Step 4 — after critic completes (or fails gracefully) |
+| `report_writer.md` | `report_writer` | Step 5 — after submission.csv is written |
