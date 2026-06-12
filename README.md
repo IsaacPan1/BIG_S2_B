@@ -352,6 +352,106 @@ the global. The correction is applied only when weighted holdout MAE improves by
 
 ---
 
+## 6.10 Validation and Critic Quality Control
+
+Steps 3.5 and 3.6 form an independent quality-control layer. The modeler writes
+its artifacts and exits; the validator and critic then read those artifacts and
+issue verdicts the modeler never sees. Neither stage can block submission --
+their verdicts surface in the report and may trigger at most one modeler retune.
+
+### Validator -- independent CV re-audit (validate.py)
+
+The validator re-runs CatBoost using the modeler's best hyperparameters (from
+`model_results.json`) but builds its own folds from scratch, independent of the
+modeler's fold state.
+
+**Strict CV scheme** (validate.py:181-200):
+
+| Dataset structure | Scheme |
+|---|---|
+| `time_col` present | 4-fold purged+embargoed walk-forward; 2 periods purged at each boundary (`N_STRICT_FOLDS=4`, `EMBARGO_PERIODS=2`) |
+| `group_cols`, no time | GroupKFold on first group_col; folds auto-reduced to min(4, n_unique_groups) |
+| Neither | 80/20 sequential split |
+
+**Three named checks** (validate.py:330-373):
+
+| Check | Trigger | Verdict |
+|---|---|---|
+| `cv_integrity` | `(strict_mae / reported_mae - 1) > CV_GAP_CRITICAL_PCT` (0.25) | CRITICAL |
+| `cv_integrity` | same gap `> CV_GAP_WARNING_PCT` (0.10) | WARNING |
+| `cv_integrity` | classification problem | always PASS (regression-calibrated) |
+| `importance_concentration` | max feature share `> IMPORTANCE_WARNING_SHARE` (0.50) | WARNING |
+| `leakage_two_signal` | any two-signal suspect (see below) | CRITICAL |
+
+**Two-signal leakage detection** (validate.py:487-511):
+
+Leakage is flagged only when BOTH a statistical AND a structural signal fire on
+the same feature. Neither alone is sufficient (validate.py:655-660).
+
+- **Statistical signal**: importance share `>= LOO_CANDIDATE_SHARE` (0.30) AND
+  `|loo_delta| / strict_mae < LOO_STAT_SIGNAL_THRESHOLD` (0.05). Near-zero LOO
+  delta means removing the feature does not degrade strict-CV MAE -- it earns
+  its importance through a channel other than predictive generalization.
+- **Structural signal**: feature name matches any of six `STRUCTURAL_PATTERNS`
+  regexes (validate.py:53-60): `_lead_`, `_future`, `_t+N`, `_lag0`/`lag0`,
+  `_leak_`; or the target column name appears in the feature name without a
+  lag/window suffix.
+
+`suspect = (stat_signal AND struct_signal)` (validate.py:499). `leakage_two_signal`
+fires CRITICAL if any feature is suspect.
+
+**Gap attribution** (gap_attribution.py:46-140):
+
+After strict CV, `gap_attribution.py` classifies the OOF->strict gap and appends
+a `gap_attribution` block to `validator_review.json`.
+
+| Classification | Condition |
+|---|---|
+| `CV_SCHEME` | Latest fold MAE within `LATEST_FOLD_MATCH_PCT` (0.15) of reported MAE -- expanding-window scheme pessimism, not overfit |
+| `REAL_DIVERGENCE` | Latest fold MAE diverges > 15%; gap unexplained by scheme |
+| `UNKNOWN` | Fewer than 2 folds or `reported_mae = 0` |
+
+Monotonicity check: `MONOTONE_MIN_FRACTION` (0.60) of consecutive fold pairs
+(sorted by ascending training size) must show more-data->lower-MAE for
+high-confidence `CV_SCHEME`. `CV_SCHEME` also assigned when only `latest_match`
+holds, at lower confidence (gap_attribution.py:124-131).
+
+The critic consumes this: `CV_SCHEME` downgrades the validator's CRITICAL to
+WARNING and WARNING to PASS (run_critic.py:80-87).
+
+### Critic -- quality checks + retune decision (run_critic.py)
+
+The critic runs 5-6 checks (`prediction_collapse` fires for classification only),
+then accepts or requests a retune.
+
+**Six named checks** (run_critic.py:64-198):
+
+| Check | Trigger | Severity |
+|---|---|---|
+| `validator_concordance` | Validator verdict pass-through. `CV_SCHEME` downgrades CRITICAL->WARNING, WARNING->PASS. `REAL_DIVERGENCE`/`UNKNOWN`: no downgrade. | WARNING or CRITICAL |
+| `prediction_distribution` | Regression only. Mean bias `> PRED_MEAN_BIAS_CRITICAL` (0.30) of `|train_mean|` -> CRITICAL; `pred_std < PRED_STD_CRITICAL` (0.40) `* train_std` -> CRITICAL; `pred_std < PRED_STD_WARNING` (0.65) `* train_std` -> WARNING. Skipped for classification. | WARNING or CRITICAL |
+| `prediction_collapse` | Classification only. All predictions degenerate to one label (`len(unique)==1`). | WARNING |
+| `mae_plausibility` | `wf_mae < WF_MAE_SUSPICIOUS_LOW` (0.03) `* train_std` AND validator != PASS -> WARNING; `wf_mae > WF_MAE_POOR_RATIO` (0.80) `* train_std` -> WARNING. | WARNING |
+| `feature_concentration` | Top feature's share of top-10 importance `> TOP_FEATURE_SHARE_WARNING` (0.50) -> WARNING. Requires >= 10 features. | WARNING |
+| `prediction_sanity` | NaN predictions or negatives in non-negative target -> CRITICAL. `pred_max > PRED_MAX_HIGH_RATIO` (3.0) `* train_max` or `< PRED_MAX_LOW_RATIO` (0.40) `* train_max` -> WARNING. | WARNING or CRITICAL |
+
+**Acceptance rule** (run_critic.py:232-248): WARNINGs are accepted.
+`CV_GAP_CRITIC_ACCEPT = 0.15` (line 12) documents the design: the critic accepts
+the 10-25% WARNING band but not a CRITICAL gap, unless `CV_SCHEME` attribution
+suppresses it. Any CRITICAL triggers `retune_requested` -- first cycle only.
+
+**Family ablation trigger** (run_critic.py:200-230): First cycle only. Runs
+`tools/family_ablation.py` (subprocess, timeout=300s). If `net_harmful_families`
+is non-empty AND no CRITICALs are present, `retune_reason = "ablation"`. The
+CRITICAL path has priority for the single retune slot (line 240). Ablation
+failure is non-fatal.
+
+**Retune cap** (run_critic.py:24, 248): Second-cycle detection via marker
+`reports/critic_retune_attempted.txt`. On the second cycle all checks run but the
+outcome is force-accepted regardless. Cap = 1.
+
+---
+
 ## 7. Imbalanced Classification
 
 When minority class fraction falls below 10% (`IMBALANCE_THRESHOLD = 0.10`),
@@ -365,9 +465,6 @@ four stages activate:
 4. **Threshold tuning (binary only).** Sweeps thresholds on OOF class-1
    probabilities; applies the F1-optimal threshold to validation predictions only
    when OOF F1 gain >= 0.02 absolute. Multiclass uses argmax directly.
-
-The critic includes a `prediction_collapse` check (WARNING, non-blocking) when all
-classification predictions degenerate to a single class label.
 
 ---
 
