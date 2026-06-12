@@ -175,9 +175,9 @@ range, and `DATA_DESCRIPTION.md` keywords:
 | `ordinal_regression` | Integer target, few consecutive ordered values; keywords: score / rating / severity / count | CatBoostRegressor; predictions rounded to nearest valid integer | MAE |
 | `panel_forecasting` | Time axis + repeated group observations | CatBoostRegressor; walk-forward CV | MAE |
 | `binary_classification` | Exactly 2 unique target values | CatBoostClassifier, Logloss | OOF MAE (= error rate; F1 used internally for threshold tuning) |
-| `multiclass_classification` | 3â€“50 unordered unique values | CatBoostClassifier, MultiClass | OOF MAE (= error rate) |
+| `multiclass_classification` | 3-50 unordered unique values | CatBoostClassifier, MultiClass | OOF MAE (= error rate) |
 
-When ambiguous between ordinal and multiclass (integer target, 5â€“15 values), the
+When ambiguous between ordinal and multiclass (integer target, 5-15 values), the
 pipeline defaults to ordinal regression to preserve MAE-evaluable behavior.
 
 **CatBoost is the sole predictor in every submission.** A Ridge baseline runs as
@@ -191,7 +191,7 @@ a diagnostic only (logged in `model_results.json`) and never appears in
 `scheme_analysis.py` is the sole authority for the CV plan: it classifies the
 problem, selects a scheme, enumerates leakage risks, and writes a **frozen**
 `reports/cv_plan.json`. The plan is marked immutable (`frozen: true`) and no
-downstream stage may modify it — `load_cv_plan` asserts the freeze on every read.
+downstream stage may modify it - `load_cv_plan` asserts the freeze on every read.
 
 **Scheme selection by structure** (not by problem-type label):
 
@@ -200,18 +200,18 @@ downstream stage may modify it — `load_cv_plan` asserts the freeze on every read
 | Time column + group columns | `TimeSeriesExpanding` (panel forecasting) |
 | Time column only | `TimeSeriesExpanding` |
 | Group columns, no time | `GroupKFold` |
-| =2 unique target values | `StratifiedKFold` |
-| =50 unique integer values | `StratifiedKFold` |
+| <=2 unique target values | `StratifiedKFold` |
+| <=50 unique integer values | `StratifiedKFold` |
 | Otherwise | `KFold` |
 
 **Recent-vs-full drift gate (expanding vs sliding).** The default for any
 time-series problem is an expanding window (all history). The pipeline switches
 to a sliding window *only* when restricting training to recent periods
-measurably reduces the train?validation gap.
+measurably reduces the train-validation gap.
 
 The diagnostic deliberately avoids the naive approach (triggering sliding on high
 KS or adversarial-classifier AUC). On a forecasting holdout, validation is a
-future window, so those signals saturate — they read "large shift" by
+future window, so those signals saturate - they read "large shift" by
 construction whether or not recency would help, and would pick sliding almost
 always, discarding history for no gain. Instead, the gate computes a
 **standardized mean shift** (an effect size that does not saturate) per numeric
@@ -219,12 +219,12 @@ covariate, comparing full-train-vs-val against recent-train-vs-val, and measures
 whether the recent window actually narrows the distance.
 
 Sliding is selected **only when all three conditions hold**:
-- `frac_improved = 0.60` — share of features whose gap shrinks with recency (primary gate)
-- `rel = 0.25` — relative mean improvement (secondary gate)
-- `n_features_scanned = 12` — evidence-breadth floor
+- `frac_improved = 0.60` - share of features whose gap shrinks with recency (primary gate)
+- `rel = 0.25` - relative mean improvement (secondary gate)
+- `n_features_scanned = 12` - evidence-breadth floor
 
-Any failure — including a non-runnable diagnostic, too few periods, or no time
-axis — falls back to expanding. Sliding is never the default; it must be
+Any failure - including a non-runnable diagnostic, too few periods, or no time
+axis - falls back to expanding. Sliding is never the default; it must be
 affirmatively justified. (Seasonality and time-index features are excluded from
 the scan, since they separate train from val by construction rather than by drift.)
 
@@ -245,21 +245,21 @@ Stages 1-3 (detection, class weights, and probability averaging) apply to both b
 and multiclass classification. Stage 4 (threshold tuning) is binary-only - multiclass
 uses argmax on the averaged probability arrays directly and receives no threshold sweep.
 
-**Stage 1 -” Detection** (`1acf5e2`). `profile_data.py` computes `min_class_fraction`
+**Stage 1 - Detection** (`1acf5e2`). `profile_data.py` computes `min_class_fraction`
 across all target classes and sets `is_imbalanced = True` in `profile.json["target_chars"]`.
 No model changes at this stage - detection only.
 
-**Stage 2 -” Class weights** (`09daf31`). The modeler reads `is_imbalanced` from
+**Stage 2 - Class weights** (`09daf31`). The modeler reads `is_imbalanced` from
 `profile.json`. When true and the subtype is classification, `auto_class_weights = "Balanced"`
 is set on every CatBoost fit: training folds, Optuna inner folds, walk-forward probe,
 and the seed ensemble production pass.
 
-**Stage 3 -” Probability averaging** (`d453055`). For classification subtypes, the
+**Stage 3 - Probability averaging** (`d453055`). For classification subtypes, the
 seed ensemble averages class probability arrays (`predict_proba`) across seeds before
 taking argmax, rather than majority-voting hard labels. This preserves probability
 calibration and reduces per-seed variance before the argmax step.
 
-**Stage 4 -” Threshold tuning** (`1e7f9af`). For binary classification, the modeler
+**Stage 4 - Threshold tuning** (`1e7f9af`). For binary classification, the modeler
 sweeps thresholds on OOF class-1 probabilities and selects the F1-optimal threshold.
 The tuned threshold is applied to validation predictions **only** if the OOF F1 gain
 meets a minimum floor (`THRESHOLD_TUNE_MIN_F1_GAIN = 0.02` absolute F1 improvement
@@ -343,14 +343,14 @@ never blocks submission.
 > **Note.** The `schema_analyst` fatal path fires only when the agent cannot produce
 > a valid `profile.json` at all. If `profile_data.py` encounters a target-detection
 > failure internally, it defaults to `continuous_regression` and continues writing a
-> complete `profile.json` - the fatal orchestrator path does not fire (see Â§4.3).
+> complete `profile.json` - the fatal orchestrator path does not fire (see Section 4.3).
 
 ### Code-level defensive rails
 
 **Memory / feature-budget gate.** Before building large covariate families,
 `feature_engineering.py` estimates column/cell counts and free RAM (via `psutil`).
-If over 2×10? cells, 1,000 extra columns, or under 2 GB free, those families are
-skipped and only base features are computed. Logged under `features.json ? feature_budget`.
+If over 2e9 cells, 1,000 extra columns, or under 2 GB free, those families are
+skipped and only base features are computed. Logged under `features.json -> feature_budget`.
 
 **Two-phase ID column detection** (`e4bf090`). Exact name-match for common ID column
 names runs before the dtype-gated near-unique scan. Prevents false-positive ID
@@ -361,7 +361,7 @@ blocked before reaching CatBoost's categorical encoder, preventing encoding erro
 on columns that look like row identifiers.
 
 **Content-first file routing.** A CSV with the target column and <50% nulls is
-classified as train; all-null target ? submission template. Filename keywords are
+classified as train; all-null target -> submission template. Filename keywords are
 fallback only. A second-pass content swap corrects mislabeled splits.
 
 **Forecasting-section suppression** (`e5e3b27`). The report omits the forecasting
@@ -436,7 +436,7 @@ datasets with marginal benefit.
 ## 12. Limitations
 
 **Distribution shift.** OOF and strict-CV MAE are within-training-distribution
-estimates. Under severe trainâ†’val shift (high adversarial validation AUC), true test
+estimates. Under severe train-val shift (high adversarial validation AUC), true test
 error can exceed these by an amount no within-training CV can quantify. Shift-aware
 weighting and level correction partially compensate but are bounded heuristics.
 
