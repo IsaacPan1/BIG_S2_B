@@ -116,13 +116,6 @@ fallback only.
 2. Column shared between training data and the submission template.
 3. Heuristic scan of column names and dtype.
 
-If target detection fails inside `profile_data.py`, the profiler defaults the
-problem subtype to `continuous_regression` and continues - it does **not** abort
-or write a fallback submission. The fatal-failure branch (baseline submission +
-minimal report + stop) fires only if `schema_analyst` cannot produce a valid
-`profile.json` at all; that path is handled by the orchestrator per the CLAUDE.md
-"schema_analyst fails" section.
-
 ---
 
 ## 5. Pipeline Stages
@@ -141,26 +134,18 @@ process is still alive is NOT a failure** - it means the stage is in progress.
 | 4 | `submission_writer` | Task sub-agent | `reports/submission_writer_was_here.txt` |
 | 5 | `report_writer` | Task sub-agent | `reports/report_writer_was_here.txt` |
 
-**Why Step 3 is a direct subprocess, not a Task sub-agent.** Prior sub-agent
-dispatches for the modeler failed in two characteristic ways: (a) the sub-agent
-returned before `run_modeler.py` finished, so the verify gate fired against
-half-written artifacts; (b) the sub-agent backgrounded the training script and
-exited, leaving an orphaned Python worker consuming CPU outside the orchestrator's
-process tree for up to an hour. Both failures share the same root cause - the
-orchestrator was not the direct parent and had no synchronous wait on the child's
-exit. The direct-subprocess contract fixes this: the orchestrator's Bash tool call
-is the direct parent and blocks until the child exits, so when control returns to
-the verify gate, all modeler work is fully done.
+**Why Step 3 is a direct subprocess.** Prior sub-agent dispatch caused the verify
+gate to fire against half-written artifacts (agent returned before the script
+finished) and left orphaned training processes running outside the orchestrator's
+process tree. The direct subprocess makes the orchestrator the synchronous parent:
+control returns only after the child has fully exited.
 
 **Step 3.6 retune.** The critic may request at most one retune cycle (cap = 1,
 enforced via `pipeline_run.json["retune_cap"]`). If triggered and both the cycle
-cap and a 25-minute budget guard pass, the orchestrator re-runs the modeler (same
-direct-subprocess contract), validator, and critic before continuing to Step 4.
-
-**Step 0** initializes a fresh `pipeline_run.json` at the start of every run,
-overwriting any leftover record from a prior run. This file tracks session start
-time, budget, modeler run ID, and critic cycle count - it is the orchestrator's
-authoritative run-state record.
+cap and a 25-minute budget guard pass, the modeler, validator, and critic re-run
+before proceeding to Step 4. **Step 0** initializes a fresh `pipeline_run.json`
+(session start time, budget, modeler run ID, critic cycle count), overwriting any
+leftover record.
 
 ---
 
@@ -218,10 +203,7 @@ always, discarding history for no gain. Instead, the gate computes a
 covariate, comparing full-train-vs-val against recent-train-vs-val, and measures
 whether the recent window actually narrows the distance.
 
-Sliding is selected **only when all three conditions hold**:
-- `frac_improved = 0.60` - share of features whose gap shrinks with recency (primary gate)
-- `rel = 0.25` - relative mean improvement (secondary gate)
-- `n_features_scanned = 12` - evidence-breadth floor
+Sliding requires all three: `frac_improved >= 0.60` (share of features whose gap narrows with recency), `rel >= 0.25` (relative gap improvement), `n_features_scanned >= 12` (minimum evidence breadth).
 
 Any failure - including a non-runnable diagnostic, too few periods, or no time
 axis - falls back to expanding. Sliding is never the default; it must be
@@ -237,67 +219,168 @@ not optimistic.
 
 ---
 
+## 6.6 Feature Families
+
+`feature_engineering.py` organizes features into named families registered via
+`_reg()`. Family membership is recorded in `reports/features.json` and consumed by
+`family_ablation.py` (in the critic stage) for leave-one-family-out diagnostics.
+
+**Panel path** (activated when `time_col` is present):
+
+| Family | Contents |
+|--------|----------|
+| `group_encodings` | Label encoding of each group column |
+| `seasonality` | Fourier sin/cos at 1 and 2 cycles of the detected period; sub-year harmonics when granularity supports them |
+| `relative_time` | Relative temporal position within the full time range (`{time_col}_rel_pos`) |
+| `group_baselines` | Per-group mean/std of the target at hour-of-day or day-of-week resolution (hourly/daily only) |
+| `time_derived` | Time-column cycle index, quarter, month, linear trend |
+| `date_features` | Calendar features (month_of_year, quarter_of_year, is_quarter_start) when a JSON codebook resolves opaque IDs to real dates |
+| `lags` | AR lags of the target: core [1,2,3,4] always; long [8,12,26] and extended [52] when history allows (lag_k requires k+4 periods per group) |
+| `rolling_mean` | Rolling mean of the target: core windows [4,8]; long [13,26] when history allows |
+| `rolling_std` | Rolling std of the target, same windows as `rolling_mean` |
+| `cov_lags` | One-period lag of each numeric covariate |
+| `cov_deltas` | Period-over-period first difference of each numeric covariate |
+| `cov_rolls` | Four-period rolling mean of each numeric covariate |
+| `cov_rolls_ext` | Extended rolling windows (8, 13, 26-period) per covariate -- budget-gated |
+| `cov_ratios` | Pair ratios within covariate prefix groups -- budget-gated |
+| `cov_entropy` | Shannon entropy across covariate prefix groups -- budget-gated |
+| `interactions` | Domain interactions (e.g. temperature^2) |
+| `horizon` | Step-ahead distance from the last known observation |
+| `covariates` | Raw numeric covariate pass-through |
+| `image_features` | 21-23 spatial statistics per matched image sidecar (when present) |
+
+**Cross-sectional path** (no `time_col`): registers `group_encodings`,
+`interactions` (polynomial terms, domain composites, log1p transforms),
+`time_derived` (age-derived flags when an "age" column exists), `covariates`,
+`horizon` (constant 0), and `image_features` when sidecars are detected.
+
+**Budget gate.** Before the expansive families (`cov_rolls_ext`, `cov_ratios`,
+`cov_group_stats`, `slope_features`, `cov_entropy`), three checks run: extra
+columns > 1,000; cells > 2e9; free RAM < 2.0 GB. Any trigger skips all five;
+reason logged under `features.json -> feature_budget`.
+
+**Image features.** When `.png` sidecars are present, `_extract_img_features()`
+computes 21-23 spatial statistics: intensity moments, per-quadrant mean/std,
+center-vs-edge ratio, brightness distribution, RGB color variance
+(grayscale: 21; RGB: 23). No CNN or semantic embeddings.
+
+---
+
+## 6.7 Modeler Internals
+
+### Scored-category filter
+
+`run_modeler.py` Step 2.5 reads `data/sample_submission.csv` and detects "scored
+filters": columns whose distinct submission values are a **strict proper subset**
+of their training values. The decision metric (OOF MAE, Optuna objective, transform
+A/B) is restricted to those scored rows; training still uses all rows. Results
+logged in `model_results.json` under `scored_filters` and
+`per_scored_category_oof_mae`.
+
+### Transform auto-selection
+
+The target transform is chosen by a data-driven A/B over three candidates
+(`_TRANSFORM_CANDIDATES = ("none", "sqrt", "log1p")`). One CatBoost probe per
+candidate runs on the walk-forward 80/20 split; predictions are inverse-mapped to
+raw space before scoring. The winner has the lowest **scored WF MAE** (stored in
+`model_results.json` as `transform_selection.chosen`). Target skewness is logged
+but does not drive the choice -- optimizing de-skewing is not the same as
+optimizing the scored metric. Classification always uses `"none"` and skips the
+A/B. Manual override: `--transform={none,sqrt,log1p}`.
+
+### 5-seed ensemble
+
+The production model retrains with seeds `[42, 7, 123, 2024, 999]`
+(`FINAL_RETRAIN_SEEDS`). Outer-fold CV uses a 3-seed subset `(42, 7, 123)`
+(`OUTER_FOLD_FINAL_SEEDS`). Aggregation is `np.mean` by default; the critic's
+retune path can request `np.median` (stored as `oof_per_seed.agg`). For
+classification, the ensemble averages probability arrays before argmax.
+
+### Adversarial weighting
+
+`feature_engineering.py` trains a 5-fold CatBoost classifier (train=1, val=0) on
+numeric covariates. OOF AUC < 0.55 -- no weights. AUC >= 0.55: weights =
+`clip(1 - P(train | row), 0.1, 10.0)` normalized to mean 1.0, stored as
+`adversarial_weights` in `data/features_train.parquet`. Consumed at three points:
+(1) transform A/B probe fits; (2) every CatBoost fit in nested CV and final
+retrain; (3) WF-split residual weighting in level correction (Section 6.9).
+
+---
+
+## 6.8 Multi-Ruler MAE Design
+
+The pipeline uses five distinct MAE estimates that serve different purposes.
+Using a single estimate for all decisions would conflate optimization pressure
+with evaluation quality.
+
+| Estimate | Stored in | What it drives |
+|----------|-----------|----------------|
+| `oof_mae` (scored OOF) | `model_results.json` | Optuna objective; critic/validator benchmark; the pipeline's primary reported metric |
+| `oof_mae_all_categories` | `model_results.json` | Diagnostic -- shows gap between scored subset and full population |
+| `walk_forward_mae_scored` (`probe_mae_80_20_scored`) | `model_results.json` | Transform A/B winner selection; never reported as the pipeline's final score |
+| `lag_forecasting.recursive_holdout_mae` | `model_results.json` | Recursive vs imputation method selection (Section 6.9) |
+| `strict_cv_mae` | `validator_review.json` | Independent re-run by the validator (no modeler artifacts); audits OOF for optimism; gap > 25% triggers CRITICAL |
+
+---
+
+## 6.9 Forecast Method and Level Correction
+
+### Recursive vs imputation method selection
+
+For `panel_forecasting` datasets, Step 12 of `run_modeler.py` compares two
+strategies on the walk-forward holdout:
+
+- **Imputation**: last known target used as constant lag seed for all steps.
+- **Recursive**: each prediction fed forward as the lag for the next step.
+
+Both run in full. Recursive is chosen only when valid **and** lower scored
+holdout MAE. Per-step MAE stored in `lag_forecasting` under
+`per_step_mae_recursive` / `per_step_mae_imputation`; method in
+`lag_forecasting.method_used`.
+
+### Level correction (post-hoc bias adjustment)
+
+After the final ensemble is assembled, a bias estimate is computed from the
+walk-forward **probe** model's residuals (not the 5-seed production model, to
+avoid in-sample collapse). Residuals are weighted by `adversarial_weights` from
+the WF split to focus on validation-like rows. Per-group estimates are used when
+a group has >= 30 WF holdout rows (`MIN_GROUP_HOLDOUT = 30`), shrunk toward the
+global with lambda = 0.5 (`BIAS_CORRECTION_LAMBDA`); smaller groups fall back to
+the global. The correction is applied only when weighted holdout MAE improves by
+> 1.5% of baseline (`BIAS_CORRECTION_REL_MARGIN = 0.015`). Outcome stored in
+`model_results.json` under `level_correction`. Skipped for classification.
+
+---
+
 ## 7. Imbalanced Classification
 
-When the minority class fraction falls below 10% (`IMBALANCE_THRESHOLD = 0.10` in
-`tools/profile_data.py`), the pipeline activates a four-stage handling sequence.
-Stages 1-3 (detection, class weights, and probability averaging) apply to both binary
-and multiclass classification. Stage 4 (threshold tuning) is binary-only - multiclass
-uses argmax on the averaged probability arrays directly and receives no threshold sweep.
+When minority class fraction falls below 10% (`IMBALANCE_THRESHOLD = 0.10`),
+four stages activate:
 
-**Stage 1 - Detection** (`1acf5e2`). `profile_data.py` computes `min_class_fraction`
-across all target classes and sets `is_imbalanced = True` in `profile.json["target_chars"]`.
-No model changes at this stage - detection only.
+1. **Detection.** `profile_data.py` sets `is_imbalanced = True` in `profile.json`.
+2. **Class weights.** `auto_class_weights = "Balanced"` on every CatBoost fit
+   (training folds, Optuna inner folds, production retrain).
+3. **Probability averaging.** The seed ensemble averages class probability arrays
+   before argmax rather than majority-voting hard labels.
+4. **Threshold tuning (binary only).** Sweeps thresholds on OOF class-1
+   probabilities; applies the F1-optimal threshold to validation predictions only
+   when OOF F1 gain >= 0.02 absolute. Multiclass uses argmax directly.
 
-**Stage 2 - Class weights** (`09daf31`). The modeler reads `is_imbalanced` from
-`profile.json`. When true and the subtype is classification, `auto_class_weights = "Balanced"`
-is set on every CatBoost fit: training folds, Optuna inner folds, walk-forward probe,
-and the seed ensemble production pass.
-
-**Stage 3 - Probability averaging** (`d453055`). For classification subtypes, the
-seed ensemble averages class probability arrays (`predict_proba`) across seeds before
-taking argmax, rather than majority-voting hard labels. This preserves probability
-calibration and reduces per-seed variance before the argmax step.
-
-**Stage 4 - Threshold tuning** (`1e7f9af`). For binary classification, the modeler
-sweeps thresholds on OOF class-1 probabilities and selects the F1-optimal threshold.
-The tuned threshold is applied to validation predictions **only** if the OOF F1 gain
-meets a minimum floor (`THRESHOLD_TUNE_MIN_F1_GAIN = 0.02` absolute F1 improvement
-over the default threshold of 0.5). If the gain is below this floor, the default
-threshold is kept. Threshold tuning is binary-only; multiclass uses argmax directly.
-
-**Safety check** (`253a692`). The critic includes a `prediction_collapse` check: if
-all validation predictions degenerate to a single class label, it emits a WARNING
-(non-blocking - submission proceeds). The critic's `prediction_distribution` check
-(`bdc92a7`) is suppressed for classification subtypes because its gap threshold is
-calibrated for regression MAE distributions and is not meaningful for class-label
-or probability outputs.
+The critic includes a `prediction_collapse` check (WARNING, non-blocking) when all
+classification predictions degenerate to a single class label.
 
 ---
 
 ## 8. Hard Constraints
 
-| Constraint | Value | Source |
-|------------|-------|--------|
-| Wall-clock budget | 2 hours | CLAUDE.md hard constraints table |
-| Token budget | 1,000,000 input + output combined, all agents | CLAUDE.md hard constraints table |
-| GPU | Not available - CPU only | CLAUDE.md hard constraints table |
-| External data | None - no downloads, no web search, no API calls, no pretrained weights | CLAUDE.md network policy |
-| Retune cap | 1 retune cycle maximum per pipeline run | CLAUDE.md; `pipeline_run.json["retune_cap"] = 1` |
-| Submission | Must always be written, even on failure | CLAUDE.md hard constraints table |
-
-**Per-stage time ceilings** (from CLAUDE.md time budget table):
-
-| Stage | Ceiling | Notes |
-|-------|---------|-------|
-| `schema_analyst` | 5 min | Non-negotiable |
-| `feature_engineer` | 15 min | |
-| Modeler | 90 min | Subprocess hard kill ceiling; measured typical run ~46-58 min |
-| `validator` | 10 min | Diagnostic; never blocks |
-| `critic` | 5 min | Advisory; never blocks |
-| `submission_writer` | 10 min | |
-| `report_writer` | 20 min | |
-| Buffer | 15 min | For retries and fallback logic |
+| Constraint | Value |
+|------------|-------|
+| Wall-clock budget | 2 hours |
+| Token budget | 1,000,000 input + output combined, all agents |
+| GPU | Not available - CPU only |
+| External data | None - no downloads, no web search, no API calls, no pretrained weights |
+| Retune cap | 1 retune cycle maximum per pipeline run |
+| Submission | Must always be written, even on failure |
 
 ---
 
@@ -328,8 +411,6 @@ by git.
 
 ### Per-stage failure handling
 
-Failure behavior per CLAUDE.md:
-
 | Stage fails | Severity | Orchestrator action |
 |-------------|----------|---------------------|
 | `schema_analyst` | **Fatal** | Write baseline submission (group-mean if target identifiable, else zeros matching sample shape) + minimal one-page `report.pdf`. Stop. |
@@ -340,127 +421,51 @@ Failure behavior per CLAUDE.md:
 The validator and critic are diagnostic-only - their failure or an adverse verdict
 never blocks submission.
 
-> **Note.** The `schema_analyst` fatal path fires only when the agent cannot produce
-> a valid `profile.json` at all. If `profile_data.py` encounters a target-detection
-> failure internally, it defaults to `continuous_regression` and continues writing a
-> complete `profile.json` - the fatal orchestrator path does not fire (see Section 4.3).
-
 ### Code-level defensive rails
 
-**Memory / feature-budget gate.** Before building large covariate families,
-`feature_engineering.py` estimates column/cell counts and free RAM (via `psutil`).
-If over 2e9 cells, 1,000 extra columns, or under 2 GB free, those families are
-skipped and only base features are computed. Logged under `features.json -> feature_budget`.
+**Memory / feature-budget gate.** Before building the five expansive covariate
+families, `feature_engineering.py` checks projected column count, cell count, and
+available RAM (thresholds: > 1,000 columns; > 2e9 cells; < 2.0 GB free). Any
+trigger skips all five families and logs the reason under
+`features.json -> feature_budget`.
 
-**Two-phase ID column detection** (`e4bf090`). Exact name-match for common ID column
-names runs before the dtype-gated near-unique scan. Prevents false-positive ID
-classification on meaningful integer columns that happen to be high-cardinality.
-
-**dtype-gate for CatBoost encoding** (`ce8ee6e`). ID-like integer columns are
-blocked before reaching CatBoost's categorical encoder, preventing encoding errors
-on columns that look like row identifiers.
-
-**Content-first file routing.** A CSV with the target column and <50% nulls is
-classified as train; all-null target -> submission template. Filename keywords are
-fallback only. A second-pass content swap corrects mislabeled splits.
-
-**Forecasting-section suppression** (`e5e3b27`). The report omits the forecasting
-diagnostics section when no time axis is detected, preventing misleading output on
-non-temporal datasets.
-
-**Submission round-trip audit.** `build_submission.py` verifies every row in
-`sample_submission.csv` maps to a real prediction via the composite business key
-before writing. NaN predictions fall back to training mean with a logged warning
-(`a49dee4` handles the edge case where the composite key is empty).
+**Additional edge-case protections.** Two-phase ID detection (name-match then
+dtype-gated near-unique scan); dtype-gate blocking ID-like integers from the
+categorical encoder; content-first file routing (non-null target = train;
+all-null = template; second-pass swap for mislabeled splits); submission
+round-trip audit verifying every `row_id` maps to a real prediction.
 
 ---
 
 ## 11. Recent Changes
 
-Commits from the `custom-cv` branch head (newest first). Hashes from
-`git log --oneline origin/custom-cv..HEAD`.
-
-**Imbalanced classification - 4-stage implementation**
-`1acf5e2` `09daf31` `d453055` `1e7f9af`
-
-End-to-end handling for class-imbalanced datasets. Detection at the 10% minority-
-class-fraction threshold; `auto_class_weights = "Balanced"` applied to all CatBoost
-fits; seed ensemble averages probabilities before argmax; OOF-optimized threshold
-applied to binary predictions only when F1 gain >= 0.02.
-
-`253a692` - **Critic: single-class collapse guard.** Adds a `prediction_collapse`
-WARNING check (non-blocking) when all classification predictions degenerate to one
-class label.
-
-`bdc92a7` - **Critic: suppress regression-calibrated distribution check for
-classification.** The `prediction_distribution` gap threshold is calibrated for MAE
-distributions; suppressed for classification subtypes where it is not meaningful.
-
-`38ba55d` - **Full classification routing.** `CatBoostClassifier` with Logloss /
-MultiClass loss selection, F1/accuracy metric reporting, and label-set validation in
-the submission writer.
-
-`e4bf090` - **Profiler: two-phase id_col detection.** Exact name-match before
-dtype-gated near-unique scan; prevents false-positive ID classification.
-
-`bee6414` - **Profiler: reconcile `problem_type` with subtype classifier.** Ensures
-the top-level `problem_type` field is consistent with the subtype classifier for
-numeric binary targets (a `{0,1}` integer target is classified as
-`binary_classification`, not `ordinal_regression`).
-
-`ce8ee6e` - **dtype-gate: guard ID-like integer columns before CatBoost encoding.**
-Prevents encoding errors on high-cardinality integer columns that reach the
-categorical pipeline.
-
-`a49dee4` - **Submission: handle empty composite key in round-trip audit.** When no
-group or time columns form the composite key, falls back to row-index matching with
-an explicit log instead of silently skipping the audit.
-
-`8190bde` - **Report: derive CV-decision narrative from profile structure.** The CV
-narrative in `report.pdf` is generated at report time from `profile.json` and
-`cv_plan.json` rather than from hardcoded panel text that became stale across runs.
-
-`e5e3b27` - **Report: suppress forecasting section when no time axis present.**
-Prevents misleading forecasting diagnostics in reports for non-temporal datasets.
-
-`3cae09b` - **Shift-aware post-hoc level correction.** Optional bias adjustment
-weighted by adversarial validation density ratio; applied to regression predictions
-only if it reduces weighted holdout MAE beyond a relative margin gate.
-
-`7281b7e` - **Revert IS density ratio sharpening.** Reverts `f33ff71` (tempered IS
-density ratio for adversarial weighting) - introduced instability on low-shift
-datasets with marginal benefit.
+See `git log --oneline` for full history. The `custom-cv` branch adds the CV
+scheme analysis and drift gate (Section 6.5), the 16-family feature engineering
+framework (Section 6.6), shift-aware level correction (Section 6.9), and full
+classification routing with 4-stage imbalance handling (Section 7).
 
 ---
 
 ## 12. Limitations
 
 **Distribution shift.** OOF and strict-CV MAE are within-training-distribution
-estimates. Under severe train-val shift (high adversarial validation AUC), true test
-error can exceed these by an amount no within-training CV can quantify. Shift-aware
-weighting and level correction partially compensate but are bounded heuristics.
+estimates. Under severe train-val shift (high adversarial validation AUC), true
+test error can exceed these by an amount no within-training CV can quantify.
+Shift-aware weighting and level correction partially compensate but are bounded
+heuristics.
 
-**Single model family.** No cross-family ensembling; variance reduction is the
-5-seed CatBoost ensemble plus target-transform selection and recursive-vs-static
-method selection.
+**Single model family.** No cross-family ensembling; variance reduction comes
+from the 5-seed CatBoost ensemble, target-transform selection, and
+recursive-vs-imputation method selection.
 
 **Long-horizon compounding.** Recursive forecasting reduces but cannot eliminate
-error accumulation over many steps. OOF and strict-CV do not reveal it because lags
-are known in training folds.
+error accumulation over many steps. OOF and strict-CV do not reveal it because
+lags are known in training folds.
 
-**File layout detection.** Only three layout conventions are auto-detected. Unusual
-file structures fall back to heuristics that may misclassify train vs validation.
+**File layout detection.** Only three layout conventions are auto-detected.
+Unusual file structures fall back to heuristics that may misclassify train vs
+validation.
 
-**Imbalanced multiclass threshold tuning.** Stage 4 threshold tuning is binary
-classification only. Multiclass uses argmax directly on averaged probabilities.
-
-**Image features.** When image sidecars are present, 23 hand-crafted spatial
-statistics are computed via PIL/numpy - not deep-learning embeddings. Semantic
-content (object recognition) requires CNN weights and a GPU, which are out of scope.
-
-**Retune cap.** At most one critic-triggered retune cycle per pipeline run. A
-dataset requiring multiple retuning passes will not benefit from them.
-
-**Ordinal rounding.** Ordinal regression predictions are rounded to the nearest
-valid integer using an OOF-optimized offset. Works well for dense integer ranges;
-may degrade on sparse or irregular ordinal sets.
+**Image features.** When image sidecars are present, 21-23 spatial statistics
+are computed via PIL/numpy (see Section 6.6). No CNN or GPU required; semantic
+content is not captured.
